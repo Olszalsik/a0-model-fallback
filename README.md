@@ -13,7 +13,7 @@ of hard-stopping. It also hardens the surrounding pieces that break under load:
 the utility-model outer timeout, the WebUI extension polling storm, the memory
 plugin's recall task, and the langchain v0→v1 import gap.
 
-**Version:** 2.6.1 · **Self-contained:** no official agent-zero file is modified ·
+**Version:** 2.6.2 · **Self-contained:** no official agent-zero file is modified ·
 **Configurable:** per-project and per-agent
 
 ---
@@ -47,6 +47,7 @@ two `Agent.*` monkey-patches.
 
 | Version | Feature |
 |---|---|
+| **v2.6.2** | **Router capacity class** — `omniroute/*` (self-healing gateways) get no cooldown on 429 and a tiny `router_cooldown_s` (default 5s) on 5xx, and are exempt from primary-skip escalation, so the cascade retries the router within seconds instead of locking it out for minutes. OpenRouter stays `free_per_minute`. |
 | **v2.6** | **Adaptive fallback cascade** — per-candidate warm/cold timeouts, per-provider capacity inference, stagnation backoff, no-preempt of cancelled-but-healthy calls, cross-agent healthy-label reset. See [below](#the-v26-adaptive-cascade). |
 | v2.5.2 | Rate-limit cooldown tuning (no-`Retry-After` 429s) + cross-agent healthy-label reset. |
 | v2.5.1 | Primary-skip-after-N-strikes: escalate the primary's cooldown after 2 consecutive failures so the cascade routes around a hung primary instead of paying the full timeout tax every cycle. |
@@ -73,8 +74,11 @@ Five phases, all wired into **both** the utility and chat cascades:
 
 2. **Per-provider capacity inference** (`_classify_capacity`). Distinguishes
    `concurrent-paid` (local `ollama/*` — a 429 is a competing agent, so no
-   cooldown is written and the primary-skip escalation is skipped), `unlimited-paid`
-   (`a0_venice/*`), and `free-per-minute` (everything else). Busy ≠ broken.
+   cooldown is written and the primary-skip escalation is skipped), `router`
+   (`omniroute/*` — a self-healing gateway that re-routes the next call, so a
+   429 skips cooldown and a 5xx gets a tiny `router_cooldown_s`; v2.6.2),
+   `unlimited-paid` (`a0_venice/*`), and `free-per-minute` (everything else).
+   Busy ≠ broken.
 
 3. **Stagnation backoff.** When `cycle_stagnation_threshold` consecutive full
    cycles complete with zero successes (every model still in cooldown), the
@@ -140,6 +144,7 @@ supported; the settings surface lives under the `agent` and `developer` sections
 | `primary_skip_strikes` | `2` | Consecutive primary failures before escalation. |
 | `primary_skip_cooldown_s` | `120` | Escalated primary cooldown. |
 | `rate_limit_no_retry_after_cooldown_s` | `30` | Cooldown for a 429 with no `Retry-After`. Clamped [10, 3600]. |
+| `router_cooldown_s` | `5` | 5xx/transient cooldown for `router` labels (`omniroute/*`). Clamped [0, 60]; `0` retries now. (v2.6.2) |
 | `health_horizon_s` | `60` | Cross-agent healthy-label horizon. `0` disables. |
 | `cycle_stagnation_factor` / `cycle_stagnation_threshold` | `1.5` / `2` | Stagnation backoff. `factor=1.0` disables. |
 | `force_chat_completions_api_bases` | `["ollama.com"]` | Proactively force `/v1/chat/completions` for these upstreams (Responses 5xx). |

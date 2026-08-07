@@ -955,6 +955,70 @@ contain `warm_timeout_s`/`warm_window_s`; pre-fix it did not). Verified the
 test fails on the pre-fix backup and passes post-fix. Backup:
 `fallback.py.before-v2.6.1-chat-warm.bak`.
 
+### v2.6.2 — Router capacity class (2026-08-08)
+
+**Problem.** OmniRoute (`omniroute/*`) is a local Docker gateway that routes
+one request across 230+ upstream LLM providers with a 4-tier internal
+fallback (Sub → Key → Cheap → Free). `_classify_capacity` was classifying
+`omniroute/*` as `free_per_minute` (the conservative default for unknown
+providers), so a 429/5xx from the gateway got the same cooldown treatment
+as a single free-tier endpoint: a propagated `Retry-After` (≤ 3600s), a
+401/403 (300s), or a no-`Retry-After` 429 (`rate_limit_no_retry_after_cooldown_s`).
+But OmniRoute is **self-healing** — a 429/5xx usually means one upstream
+tier failed and the gateway re-routes the *next* request to a healthy tier.
+Any real cooldown over-locks it; the user saw the router get needlessly
+stuck in cooldown mode when it could have served the next call.
+
+**Fix — a new `router` capacity class.** `_classify_capacity` now returns
+`"router"` for labels whose provider is in the hardcoded set
+`_DEFAULT_ROUTER_PROVIDERS = ("omniroute",)` (case-insensitive, checked
+before the final `free_per_minute` fallthrough). A new helper
+`_capacity_skips_cooldown(label)` returns
+`_classify_capacity(label) in ("concurrent_paid", "router")` and replaces
+the three previous `== "concurrent_paid"` skip checks (the 429 branch in
+`_handle_error_cooldown`, and the two `_maybe_extend_primary_cooldown`
+primary-skip sites). So for a `router` label:
+
+- a **429** writes **no cooldown** and returns `False` (the gateway re-routes
+  on the next cascade pass — mirrors the existing `concurrent_paid` /
+  local-ollama skip);
+- a **5xx/transient** error writes a short `router_cooldown_s` (read from
+  config, default 5s, clamped to `[0, 60]` and bypassing the 30s floor) via a
+  new branch in `_handle_error_cooldown`'s transient tail — enough to space
+  out a 5xx storm without locking the router out for the 60-120s a normal
+  endpoint would get; `0` retries immediately;
+- the **primary-skip escalation** is skipped (a router failing is not a
+  signal to escalate a 2-min cooldown onto the primary — the primary itself
+  is fine; the router just re-routes).
+
+**Why `omniroute` only, not `openrouter`.** OpenRouter serves a *specific*
+requested model — a 429 on `openrouter/x:free` is a real free-tier rate
+limit on that model, not a self-healing re-route. It stays
+`free_per_minute` (the existing `test_capacity_v26.py` assertions at lines
+142 and 252 encode this and still pass). OmniRoute's 4-tier auto-fallback is
+the distinguishing property: the gateway, not the caller, picks the
+upstream per request. A provider enters the `router` class only when the
+gateway is the unit that self-heals. If a future gateway needs the same
+treatment, add it to `_DEFAULT_ROUTER_PROVIDERS` (a config-driven
+`router_providers` list is intentionally deferred — the hardcoded set keeps
+`_classify_capacity` a pure function over the label).
+
+**Config.** New top-level knob in `default_config.yaml`:
+
+| Knob | Default | Effect |
+|---|---|---|
+| `router_cooldown_s` | 5 | 5xx/transient cooldown for `router` labels; clamped `[0, 60]`; `0` retries immediately |
+
+**Tests.** `tests/test_router_capacity.py` — 7 tests: `omniroute/*`
+classifies as `router` (incl. 3-segment labels + case-insensitivity);
+`openrouter/*` stays `free_per_minute` (over-classification guard);
+`_capacity_skips_cooldown` True for `ollama/*` + `omniroute/*`, False
+otherwise; a fake 429 on `omniroute/auto` writes no cooldown (returns
+`False`); a fake 500 on `omniroute/auto` writes `router_cooldown_s` (≤ 60s,
+not the 120s default); and a 500 on `nvidia_nim/*` still gets the normal
+120s transient cooldown (the router short-cooldown does not leak). Full
+suite (159 tests) green. Backup: `fallback.py.before-v2.6.2-router.bak`.
+
 ### v2.6 configuration knobs
 
 | Knob | Default | Phase | Effect |
@@ -969,6 +1033,7 @@ test fails on the pre-fix backup and passes post-fix. Backup:
 | `primary_skip_enabled` | true | 5 | master toggle for primary-skip escalation (incl. Phase 5) |
 | `primary_skip_strikes` | 2 | 5 | consecutive primary failures to escalate |
 | `primary_skip_cooldown_s` | 120 | 5 | escalation cooldown for a hung primary |
+| `router_cooldown_s` | 5 | 2 | 5xx/transient cooldown for `router` labels (v2.6.2); clamped `[0,60]`; `0` retries now |
 
 Phase 2 (`_classify_capacity`) and Phase 4 (the CancelledError-vs-TimeoutError
 split) have **no config toggle** — they are inherent behaviors of the cascade,
@@ -986,7 +1051,8 @@ label prefix; to revert Phase 4, restore the legacy cleanup-on-cancel branch.
   (Phase 4 touches the inner cascade only).
 - Tests: `test_warm_timeout_v26.py`, `test_capacity_v26.py`,
   `test_adaptive_sleep_v26.py`, `test_no_preempt_v26.py`,
-  `test_primary_skip_v26.py`, `test_chat_warm_wiring_v26.py` (v2.6.1).
+  `test_primary_skip_v26.py`, `test_chat_warm_wiring_v26.py` (v2.6.1),
+  `test_router_capacity.py` (v2.6.2).
 
 ### When to disable a v2.6 feature
 
@@ -1002,3 +1068,8 @@ label prefix; to revert Phase 4, restore the legacy cleanup-on-cancel branch.
   independently on the skip-cooldown path, not only inside Phase 5.)
 - **Capacity inference (Phase 2) / no-preempt (Phase 4):** no toggle —
   inherent behavior.
+- **Router 5xx spacing (v2.6.2):** `router_cooldown_s: 0` — a 5xx on an
+  `omniroute/*` label retries immediately (no spacing). The 429-skip and
+  primary-skip exemption for `router` labels are inherent (there is no knob
+  to put a router into normal cooldown treatment — change the label prefix
+  or remove it from `_DEFAULT_ROUTER_PROVIDERS`).

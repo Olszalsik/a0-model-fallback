@@ -185,6 +185,17 @@ rate_limit_no_retry_after_cooldown_s: 30
 # (clamped to a minimum of 5s at runtime).
 health_horizon_s: 60
 
+# --- v2.6.2 Router capacity class (omniroute/*) ---------------------------
+# OmniRoute fronts many upstreams and rotates automatically (4-tier internal
+# fallback); a 429/5xx from the gateway does NOT mean the underlying model is
+# broken -- the next call re-routes to a healthy tier. A 429 skips cooldown
+# entirely (the router is retried on the next cascade pass). A 5xx/transient
+# error gets this short spacing so we don't hammer a 5xx storm but retry
+# within seconds instead of the 60-120s a normal endpoint would get. Clamped
+# to [0, 60] at runtime. Set to 0 to skip the 5xx cooldown entirely (retry
+# immediately).
+router_cooldown_s: 5
+
 # --- v2.6 Cascade per-call timeouts (added 2026-07-28) -------------------
 # First call to a label (within `cascade_warm_window_s`) gets the legacy
 # `fallback_utility_timeout_s` / `fallback_timeout_s` (the cold default).

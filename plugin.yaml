@@ -36,14 +36,23 @@ description: >
   cascade had them at fallback.py:1153-1158; the chat cascade omitted them),
   which left the chat warm/cold path unbound -- a NameError on chat
   candidates with no user TIMEOUT kwarg, or a silently-dead warm path when
-  one was set. See AGENTS.md "v2.6 -- Adaptive fallback cascade".
+  one was set. (v2.6.2) a new ``router`` capacity class for self-healing
+  gateways (omniroute/*): a 429 skips cooldown entirely and a 5xx/transient
+  gets a tiny ``router_cooldown_s`` (default 5s, not the 60-120s a normal
+  endpoint gets), and router labels are exempt from primary-skip escalation
+  -- so the cascade retries the router within seconds instead of locking it
+  out for minutes. OpenRouter is intentionally NOT a router (it serves a
+  specific requested model; a 429 on a free model is a real free-tier
+  limit) and stays ``free_per_minute``. See AGENTS.md "v2.6.2 -- Router
+  capacity class".
+  See AGENTS.md "v2.6 -- Adaptive fallback cascade".
   Note: the v2.2 standalone event-loop housekeeping loop (coroutine
   sweep + WebSocket keepalive pulse + stats tick) and the v2.3 second
   WebSocket pulse path that lived inside it were removed in v2.5; the
   ``housekeeping_enabled`` and ``second_pulse_path_enabled`` keys are
   still accepted for back-compat but are no-ops at runtime.
   Self-contained plugin; no official file is modified.
-version: 2.6.1
+version: 2.6.2
 settings_sections:
   - agent
   - developer

@@ -765,16 +765,37 @@ def _maybe_clear_cooldown_for_healthy_label(agent, label: str) -> bool:
 #   - ``a0_venice/*`` → ``unlimited_paid``. Venice's daily credit window
 #     is generous, but a quota-exhaustion 429 still means we're done for
 #     now. Conservative 30s cooldown per the user's 2026-07-28 call.
+#   - ``omniroute/*`` → ``router`` (added v2.6.2). OmniRoute is a
+#     self-healing gateway that re-routes the next request to a healthy
+#     upstream tier, so a 429/5xx does NOT mean the model is broken.
+#     429 skips cooldown entirely; 5xx/transient gets a short
+#     ``router_cooldown_s`` (default 5s). Primary-skip escalation is
+#     skipped (see ``_capacity_skips_cooldown``).
 #   - Anything else (including 3-segment labels like
 #     ``nvidia_nim/stepfun-ai/step-3.7-flash``) → ``free_per_minute``.
 #     Safe default: a 429 on an unknown provider means back off and
 #     retry; better to over-cooldown than to hammer a metered endpoint.
 #
 # This is a pure function over the label string. No config block, no
-# module-level state. Test: test_capacity_v26.py.
+# module-level state. Test: test_capacity_v26.py, test_router_capacity.py.
+# ``router`` is added in v2.6.2; the cooldown-skip helper
+# ``_capacity_skips_cooldown`` centralizes the "no cooldown / no
+# primary-skip escalation" policy for ``concurrent_paid`` + ``router``.
+
+# v2.6.2: providers whose failures do NOT indicate a broken model. A
+# self-healing router (OmniRoute) re-routes the next request to a healthy
+# upstream, so any real cooldown over-locks it. 429 skips cooldown
+# entirely; 5xx/transient gets ``_DEFAULT_ROUTER_COOLDOWN_S``.
+# (OpenRouter is NOT a router here: it serves a specific requested model
+# and a 429 on ``openrouter/x:free`` is a real free-tier limit, so it
+# stays ``free_per_minute``.)
+_DEFAULT_ROUTER_PROVIDERS = ("omniroute",)
+_DEFAULT_ROUTER_COOLDOWN_S = 5.0
+
+
 def _classify_capacity(label: str) -> str:
     """Return one of ``concurrent_paid``, ``unlimited_paid``,
-    ``free_per_minute``. Unknown providers default to
+    ``router``, ``free_per_minute``. Unknown providers default to
     ``free_per_minute`` (conservative)."""
     provider = label.split("/", 1)[0].lower() if "/" in label else ""
     # Local ollama is truly concurrent (many parallel requests to
@@ -786,10 +807,24 @@ def _classify_capacity(label: str) -> str:
         return "free_per_minute"
     if provider == "a0_venice":
         return "unlimited_paid"
-    # nvidia_nim, openrouter, groq, mistral, cohere, together_ai,
+    # v2.6.2: self-healing routers. OmniRoute fronts 230+ providers with
+    # a 4-tier internal fallback (Sub -> Key -> Cheap -> Free). A 429/5xx
+    # from the router usually means ONE upstream tier failed — the next
+    # call re-routes, so don't lock it out.
+    if provider in _DEFAULT_ROUTER_PROVIDERS:
+        return "router"
+    # nvidia_nim, groq, mistral, cohere, together_ai,
     # together, deepseek, anthropic, google, openai, etc. — all metered
     # or rate-limited at the per-minute granularity.
     return "free_per_minute"
+
+
+def _capacity_skips_cooldown(label: str) -> bool:
+    """True for capacity classes that should NOT get a 429 cooldown and
+    should NOT trigger primary-skip escalation: ``concurrent_paid``
+    (local ollama — a 429 is a competing agent) and ``router``
+    (self-healing gateways — the next call re-routes)."""
+    return _classify_capacity(label) in ("concurrent_paid", "router")
 
 
 def _handle_error_cooldown(e, label, model_cooldowns, agent):
@@ -833,12 +868,14 @@ def _handle_error_cooldown(e, label, model_cooldowns, agent):
             status_code = 429
         # v2.6: Phase 2 — per-provider capacity inference. For
         # ``concurrent_paid`` (local ollama), a 429 means a competing
-        # agent is holding the slot; release in seconds. Don't poison
-        # the chat cascade or other utility callers with a cooldown —
-        # just skip without writing anything to ``store``. The
-        # ``_last_skip_log_until`` dedupe (see below) will still rate-
-        # limit the "skipping" log line.
-        if _classify_capacity(label) == "concurrent_paid":
+        # agent is holding the slot; release in seconds. For ``router``
+        # (omniroute/*), a 429 means one upstream tier
+        # failed and the gateway re-routes the next call — also skip.
+        # Don't poison the chat cascade or other utility callers with a
+        # cooldown — just skip without writing anything to ``store``.
+        # The ``_last_skip_log_until`` dedupe (see below) will still
+        # rate-limit the "skipping" log line.
+        if _capacity_skips_cooldown(label):
             return False
         retry_after = extract_retry_after_seconds(e)
         if retry_after and retry_after > 0:
@@ -898,6 +935,25 @@ def _handle_error_cooldown(e, label, model_cooldowns, agent):
 
     # Transient / unknown error -> short cooldown so we don't hammer a flaky
     # endpoint but also don't lock it out for 24h.
+    # v2.6.2: ``router`` labels (omniroute/*) re-route on the
+    # next call, so use a tiny ``router_cooldown_s`` (default 5s) — bypassing
+    # the 30s floor — to space out a 5xx storm without locking the router
+    # out for the 60-120s a normal endpoint would get.
+    if _classify_capacity(label) == "router":
+        try:
+            dur = float(
+                _get_plugin_cfg(agent).get(
+                    "router_cooldown_s", _DEFAULT_ROUTER_COOLDOWN_S,
+                )
+            )
+        except Exception:
+            dur = _DEFAULT_ROUTER_COOLDOWN_S
+        dur = max(0.0, min(dur, 60.0))
+        if dur > 0.0:
+            store[label] = time.monotonic() + dur
+            _record_last_status(agent, store, label, status_code)
+            _save_cooldown_store(agent, store)
+        return True
     dur = _cooldown_seconds_for_status(status_code, e)
     # Don't apply cooldowns shorter than 30s -- they'd be cleared by the
     # attempt_delay anyway, and writing them just adds IO overhead.
@@ -1316,13 +1372,14 @@ async def _patched_call_utility_model(
         if idx != 0:
             return
         # v2.6: Phase 2 — per-provider capacity inference. For
-        # ``concurrent_paid`` (local ollama), a primary 429 means a
-        # competing agent is holding the slot — release in seconds.
-        # Never escalate the primary-skip cooldown for these; the slot
-        # will free up before our next cycle. Skip before the Phase 5
-        # healthy-label check so a peer success doesn't trigger a
-        # counter reset that would later be wasted by a 30s escalation.
-        if _classify_capacity(label) == "concurrent_paid":
+        # ``concurrent_paid`` (local ollama) and ``router``
+        # (omniroute/*), a primary 429 does not mean the
+        # model is broken — the slot frees in seconds (ollama) or the
+        # next call re-routes (routers). Never escalate the primary-skip
+        # cooldown for these. Skip before the Phase 5 healthy-label
+        # check so a peer success doesn't trigger a counter reset that
+        # would later be wasted by a 30s escalation.
+        if _capacity_skips_cooldown(label):
             return
         # v2.6: Phase 5 short-circuit. _maybe_clear_cooldown_for_healthy_label
         # already enforces the only-cleared-never-overwritten invariant
@@ -2002,13 +2059,14 @@ async def _patched_call_chat_model(
         if idx != 0:
             return
         # v2.6: Phase 2 — per-provider capacity inference. For
-        # ``concurrent_paid`` (local ollama), a primary 429 means a
-        # competing agent is holding the slot — release in seconds.
-        # Never escalate the primary-skip cooldown for these; the slot
-        # will free up before our next cycle. Skip before the Phase 5
-        # healthy-label check so a peer success doesn't trigger a
-        # counter reset that would later be wasted by a 30s escalation.
-        if _classify_capacity(label) == "concurrent_paid":
+        # ``concurrent_paid`` (local ollama) and ``router``
+        # (omniroute/*), a primary 429 does not mean the
+        # model is broken — the slot frees in seconds (ollama) or the
+        # next call re-routes (routers). Never escalate the primary-skip
+        # cooldown for these. Skip before the Phase 5 healthy-label
+        # check so a peer success doesn't trigger a counter reset that
+        # would later be wasted by a 30s escalation.
+        if _capacity_skips_cooldown(label):
             return
         # v2.6: Phase 5 short-circuit. _maybe_clear_cooldown_for_healthy_label
         # already enforces the only-cleared-never-overwritten invariant
