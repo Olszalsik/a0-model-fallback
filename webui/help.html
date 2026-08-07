@@ -1,0 +1,637 @@
+<html>
+<head>
+  <title>Model Fallback &mdash; user manual</title>
+</head>
+
+<body>
+  <div class="help-content">
+
+    <div class="help-header">
+      <span class="material-symbols-outlined">sync</span>
+      <span>Model Fallback System &mdash; user manual</span>
+    </div>
+
+    <div class="help-intro">
+      The Model Fallback System grew from a v2.0 cascade (rotate
+      through fallback models when one fails) into a v2.5 resilience
+      layer that also keeps the WebUI and event loop healthy. This
+      page is the user manual &mdash; it explains each piece in plain
+      English and tells you when (if ever) to disable it.
+    </div>
+
+    <div class="help-toc">
+      <a href="#overview">1. Overview</a>
+      <a href="#cascade">2. The model cascade (v2.0&ndash;v2.4)</a>
+      <a href="#features">3. Resilience features (v2.2&ndash;v2.4)</a>
+      <a href="#toggles">4. Per-feature toggles</a>
+      <a href="#when-to-disable">5. When to disable a feature</a>
+      <a href="#migration">6. Migration (upstream adds the equivalent)</a>
+      <a href="#observability">7. Observability &mdash; the stats endpoint</a>
+    </div>
+
+    <!-- =========================================================== -->
+    <div class="help-section" id="overview">
+      <h3>1. Overview</h3>
+      <p>
+        What you get out of the box:
+      </p>
+      <ul>
+        <li><strong>Multi-cycle model rotation</strong> with cooldown
+          and per-session permanent-failure tracking. If your primary
+          model hits a 429, the cascade moves to the next fallback; if
+          it hits a 401/402/404, the cascade marks it broken for the
+          session and skips it on every later cycle.</li>
+        <li><strong>WebUI resilience</strong>: a TTL cache + circuit
+          breaker on the extensions lookup that throttles the
+          150&nbsp;ms polling storm.</li>
+        <li><strong>LLM error handling</strong>: a hard cap on hung
+          utility calls, an opt-in history trim for
+          <code>ContextOverflow</code> spirals, and a langchain
+          v0&nbsp;&rarr;&nbsp;v1 import shim for v1-only docker images.</li>
+      </ul>
+      <p>
+        v2.5 note: the standalone event-loop housekeeping loop
+        (coroutine sweep + WebSocket keepalive pulse + stats tick)
+        was removed &mdash; it was implemented the same day it
+        shipped, never tested, and manifested as a per-minute
+        <code>housekeeping loop not alive</code> respawn log line
+        with no user-visible benefit. The
+        <code>housekeeping_enabled</code> and
+        <code>second_pulse_path_enabled</code> settings are still
+        accepted for back-compat but are no-ops.
+      </p>
+      <p>
+        Every resilience feature can be toggled OFF independently.
+        The defaults are conservative; turn things ON only if you
+        see the symptoms the feature is designed to fix.
+      </p>
+    </div>
+
+    <!-- =========================================================== -->
+    <div class="help-section" id="cascade">
+      <h3>2. The model cascade (v2.0&ndash;v2.4)</h3>
+      <p>
+        When a model call fails, the cascade tries the next fallback
+        instead of giving up. The system classifies errors into:
+      </p>
+      <ul>
+        <li><strong>Rate Limits (429)</strong> &mdash; the model is
+          placed on cooldown using the server's
+          <code>Retry-After</code> header. The cascade skips it
+          until the cooldown expires.</li>
+        <li><strong>Auth Failures (401/403)</strong> &mdash; permanent
+          skip for the entire session.</li>
+        <li><strong>Credit Depletion (402)</strong> &mdash; permanent
+          skip for the entire session.</li>
+        <li><strong>Model Not Found (404)</strong> &mdash; permanent
+          skip for the entire session.</li>
+        <li><strong>Context Overflow</strong> &mdash; detected from
+          the error message, permanent skip for the session.</li>
+        <li><strong>Invalid JSON</strong> &mdash; triggers rotation
+          to the next model (the agent retries with a different
+          parser path).</li>
+        <li><strong>Timeouts</strong> &mdash; retried with the next
+          model after a brief delay (the
+          <em>Utility-model timeout guard</em> sets the hard cap).</li>
+      </ul>
+      <h4>Settings in this section</h4>
+      <ul>
+        <li><strong>Chat Model Timeout</strong> (default 300s) &mdash;
+          per-request timeout for chat calls. The cascade
+          counts each request, not the whole cascade.</li>
+        <li><strong>Utility Model Timeout</strong> (default 300s)
+          &mdash; per-request timeout for utility calls. Note that
+          the <em>Utility-model timeout guard</em> (below) sets a
+          second, outer cap; both apply.</li>
+        <li><strong>Inter-Model Delay</strong> (default 2s) &mdash;
+          pause between fallback attempts.</li>
+        <li><strong>Max Cycles</strong> (1&ndash;10, default 4) &mdash;
+          how many full passes through the fallback list before
+          the agent gives up.</li>
+        <li><strong>Cycle Delay</strong> (default 5s) &mdash; pause
+          between cycles.</li>
+      </ul>
+      <h4>Recommended presets</h4>
+      <div class="recommendation">
+        <div class="rec-label">Fast</div>
+        <div class="rec-settings">2 cycles, 3s delay, 120s timeout</div>
+        <div class="rec-use">Good for testing with few fallbacks</div>
+      </div>
+      <div class="recommendation">
+        <div class="rec-label">Balanced</div>
+        <div class="rec-settings">4 cycles, 5s delay, 300s timeout</div>
+        <div class="rec-use">Recommended for most use cases</div>
+      </div>
+      <div class="recommendation">
+        <div class="rec-label">Thorough</div>
+        <div class="rec-settings">4 cycles, 10s delay, 600s timeout</div>
+        <div class="rec-use">Best for production with many fallbacks</div>
+      </div>
+    </div>
+
+    <!-- =========================================================== -->
+    <div class="help-section" id="features">
+      <h3>3. Resilience features (v2.2&ndash;v2.4)</h3>
+      <p>
+        Six independent pieces. Each one targets a specific failure
+        mode in the WebUI / event-loop / LLM stack. The pieces share
+        no state with each other and can be toggled ON / OFF
+        independently.
+      </p>
+
+      <h4>3.1 Utility-model timeout guard <span class="version-badge-inline">v2.2</span></h4>
+      <p>
+        <strong>Symptom it fixes:</strong> a hung utility call
+        (typically a slow ollama model on CPU) blocks the agent loop
+        indefinitely. The cascade's per-request timeout fires after
+        300s, but the agent has already given up; you see a frozen
+        WebUI.
+      </p>
+      <p>
+        <strong>What it does:</strong> wraps
+        <code>Agent.call_utility_model</code> in
+        <code>asyncio.wait_for(...)</code> with a hard cap
+        (<code>max_wait_s</code>, default 120s). On timeout, the
+        inner litellm coroutine is best-effort closed (via the
+        <code>memory_hardening</code> plugin) and a
+        <code>RepairableException("utility_model_timeout")</code> is
+        raised so the LLM is told the utility failed.
+      </p>
+      <p>
+        <strong>Default:</strong> ON.
+      </p>
+
+      <h4>3.2 Event-loop housekeeping
+        <span class="version-badge-inline">v2.2</span>
+        <span class="version-badge-inline" style="background: rgba(180, 60, 60, 0.25);">REMOVED in v2.5</span>
+      </h4>
+      <p>
+        <strong>Removed in v2.5.</strong> The standalone
+        <code>while True</code> housekeeping loop (coroutine sweep,
+        WebSocket keepalive pulse, stats tick) and its job_loop
+        safety net were deleted. The loop was a same-day fix that
+        shipped before being tested, and the only symptom it ever
+        produced in practice was a per-minute
+        <code>housekeeping loop not alive, respawning</code> log
+        line with no user-visible benefit. The
+        <code>housekeeping_enabled</code> and
+        <code>second_pulse_path_enabled</code> settings are still
+        accepted in <code>default_config.yaml</code> for
+        back-compat with hand-edited configs, but the toggle
+        resolver treats them as no-ops and the runtime ignores
+        them.
+      </p>
+      <p>
+        If a future agent-zero update ships an equivalent
+        housekeeping loop, you can leave both keys at their
+        default (<code>false</code>) and let the upstream one do
+        the work. No migration step is required.
+      </p>
+
+      <h4>3.3 WebUI extensions cache <span class="version-badge-inline">v2.2</span></h4>
+      <p>
+        <strong>Symptom it fixes:</strong> the WebUI calls
+        <code>/api/load_webui_extensions</code> whenever Alpine
+        re-renders an extension point. During page lifecycle
+        (init, settings open, plugin toggle, project switch) this
+        can fire 10+ times per second, and each call walks every
+        plugin's <code>extensions/webui/</code> folder via
+        <code>files.find_existing_paths_by_pattern</code>. With a
+        slow filesystem mount you get a positive-feedback storm
+        &mdash; the user sees it as "the WebUI is hanging."
+      </p>
+      <p>
+        <strong>What it does:</strong>
+      </p>
+      <ul>
+        <li><strong>TTL cache</strong> (default 2s) &mdash; at most
+          one filesystem walk per 2s, identical responses served
+          from RAM. Auto-busts on the extension watchdog
+          (plugin enable/disable, file edit) so user-visible
+          state stays fresh.</li>
+        <li><strong>Circuit breaker</strong> (default: open after
+          5 errors in 10s, recover after 30s) &mdash; when the
+          filesystem is slow enough that
+          <code>get_webui_extensions</code> itself raises, the
+          breaker opens and the wrapper returns <code>[]</code>
+          immediately for <code>recovery_s</code> seconds. Keeps
+          the WebUI responsive even when the framework's FS
+          layer is wedged.</li>
+      </ul>
+      <p>
+        <strong>Default:</strong> ON.
+      </p>
+
+      <h4>3.4 Context-size guard <span class="version-badge-inline">v2.3</span></h4>
+      <p>
+        <strong>Symptom it fixes:</strong> when the agent's
+        conversation grows past the utility model's context window,
+        every utility candidate returns
+        <code>ContextOverflow</code>. The cascade can't recover
+        from this in a single cycle because the chat history is
+        already too long.
+      </p>
+      <p>
+        <strong>What it does:</strong> at
+        <code>message_loop_prompts_after</code> it counts the
+        total characters in
+        <code>loop_data.history_output</code>. If the total
+        exceeds <code>max_chars</code> (default 50000), the
+        oldest messages are dropped until the budget is met, with
+        a one-liner notice injected so the LLM knows the early
+        turns were trimmed.
+      </p>
+      <p>
+        <strong>Default:</strong> OFF. Trimming can confuse the
+        LLM (it loses the early conversation), so this is
+        opt-in. Enable when you see cascading
+        <code>ContextOverflow</code> errors across all utility
+        candidates in a single cycle.
+      </p>
+
+      <h4>3.5 LangChain v0 &rarr; v1 import shim <span class="version-badge-inline">v2.4</span></h4>
+      <p>
+        <strong>Symptom it fixes:</strong>
+        <code>ModuleNotFoundError: No module named 'langchain.prompts'</code>
+        on langchain-v1-only docker images. The codebase still
+        uses the v0 import path in
+        <code>helpers/call_llm.py</code>; the v1 release moved
+        that module to <code>langchain_core.prompts</code>.
+      </p>
+      <p>
+        <strong>What it does:</strong> at <code>agent_init</code>
+        time, registers <code>langchain_core.prompts</code> under
+        the legacy <code>langchain.prompts</code> path (and
+        <code>langchain_core.messages</code> under
+        <code>langchain.schema</code>) via
+        <code>sys.modules</code>. The shim is a no-op on
+        langchain v0.x installs (the legacy module is already in
+        <code>sys.modules</code> and we leave it alone). A
+        sentinel attribute marks the shim so uninstall is clean.
+      </p>
+      <p>
+        <strong>Default:</strong> ON.
+      </p>
+    </div>
+
+    <!-- =========================================================== -->
+    <div class="help-section" id="toggles">
+      <h3>4. Per-feature toggles</h3>
+      <p>
+        Each feature has a top-level boolean on
+        <code>context.settings</code>:
+      </p>
+      <table class="toggle-table">
+        <thead>
+          <tr><th>Setting key</th><th>Default</th><th>Effect when OFF</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>utility_timeout_guard_enabled</code></td>
+            <td>true</td>
+            <td>Utility call falls back to the cascade's
+              per-request timeout (300s). Hung calls can freeze
+              the loop longer.</td>
+          </tr>
+          <tr>
+            <td><code>housekeeping_enabled</code>
+              <span class="version-badge-inline" style="background: rgba(180, 60, 60, 0.25);">REMOVED</span></td>
+            <td>false</td>
+            <td>Setting is accepted for back-compat but is a
+              no-op. The standalone housekeeping loop was
+              deleted in v2.5; the job_loop safety net
+              respawn logic was also removed.</td>
+          </tr>
+          <tr>
+            <td><code>second_pulse_path_enabled</code>
+              <span class="version-badge-inline" style="background: rgba(180, 60, 60, 0.25);">REMOVED</span></td>
+            <td>false</td>
+            <td>Setting is accepted for back-compat but is a
+              no-op. The second <code>socketio.emit</code> pulse
+              path was removed together with the housekeeping
+              loop in v2.5.</td>
+          </tr>
+          <tr>
+            <td><code>webui_extensions_cache_enabled</code></td>
+            <td>true</td>
+            <td><code>get_webui_extensions</code> is called
+              directly. Polling storm returns on slow mounts.</td>
+          </tr>
+          <tr>
+            <td><code>context_size_guard_enabled</code></td>
+            <td>false</td>
+            <td>History is not trimmed. <code>ContextOverflow</code>
+              spirals must be fixed by other means (a smaller
+              model, shorter conversation).</td>
+          </tr>
+          <tr>
+            <td><code>langchain_compat_enabled</code></td>
+            <td>true</td>
+            <td>Shim is not installed. v0-style imports fail
+              with <code>ModuleNotFoundError</code> on v1-only
+              images.</td>
+          </tr>
+        </tbody>
+      </table>
+      <p>
+        Toggling the cache / shim / utility-timeout features
+        takes effect on the next server start (the install hooks
+        run at boot). Toggling the context-size-guard takes
+        effect on the next agent turn (the hook re-resolves the
+        config per call). The housekeeping and second-pulse-path
+        toggles are no-ops in v2.5 (the underlying loop is gone)
+        but the keys are still accepted on save.
+      </p>
+      <p>
+        The settings round-trip through
+        <code>helpers.plugins.get_plugin_config</code>, which
+        respects the framework's per-project / per-agent /
+        global resolution chain. The
+        <code>config.json</code> you see in the project
+        directory is the persisted form.
+      </p>
+    </div>
+
+    <!-- =========================================================== -->
+    <div class="help-section" id="when-to-disable">
+      <h3>5. When to disable a feature</h3>
+
+      <h4>Disable the utility-model timeout guard if:</h4>
+      <ul>
+        <li>You see <code>RepairableException("utility_model_timeout")</code>
+          in the agent log on a model that is actually producing
+          slow but correct output (raise <code>max_wait_s</code>
+          instead).</li>
+        <li>You use a non-ollama utility model with a known slow
+          first-byte time (raise the cap, or disable).</li>
+      </ul>
+
+      <h4>Disable the WebUI extensions cache if:</h4>
+      <ul>
+        <li>You develop a plugin and need zero-delay feedback
+          when you save a file. The 2s TTL will hide edits for
+          up to 2 seconds. The auto-bust on file-watch should
+          catch most cases; if it doesn't, disable the cache
+          during plugin development and re-enable when done.</li>
+      </ul>
+
+      <h4>Disable the context-size guard if:</h4>
+      <ul>
+        <li>You see the LLM forgetting early instructions after
+          a trim. The notice injection helps but is not a
+          substitute for an actually-fitting context. The right
+          fix is usually a larger model window or a shorter
+          conversation.</li>
+      </ul>
+
+      <h4>Disable the langchain shim if:</h4>
+      <ul>
+        <li>You are on langchain v0.x and the shim causes
+          surprising behavior (it shouldn't &mdash; the shim is
+          a no-op when the v0 module is already in
+          <code>sys.modules</code>). Disable to remove the
+          indirection.</li>
+      </ul>
+    </div>
+
+    <!-- =========================================================== -->
+    <div class="help-section" id="migration">
+      <h3>6. Migration (upstream adds the equivalent)</h3>
+      <p>
+        If a future agent-zero release ships its own equivalent of
+        one of these features, the recommended migration is:
+      </p>
+      <ol>
+        <li>Toggle OFF the matching feature in this plugin.</li>
+        <li>Restart the server.</li>
+        <li>Confirm the upstream equivalent is active (e.g. the
+          new keepalive ping in the server logs).</li>
+        <li>If the migration is permanent, the corresponding
+          helper file can be deleted:
+          <ul>
+            <li><code>helpers/utility_timeout.py</code></li>
+            <li><code>helpers/webui_extensions_cache.py</code></li>
+            <li><code>helpers/langchain_compat.py</code></li>
+            <li>the context-size-guard extension
+              (<code>extensions/python/message_loop_prompts_after/_10_context_size_guard.py</code>)</li>
+          </ul>
+        </li>
+      </ol>
+      <p>
+        Migration notes are also in
+        <code>AGENTS.md</code> under each feature's section.
+      </p>
+    </div>
+
+    <!-- =========================================================== -->
+    <div class="help-section" id="observability">
+      <h3>7. Observability &mdash; the stats endpoint</h3>
+      <p>
+        Read-only counters are exposed at
+        <code>GET /api/plugins/_model_fallback/stats</code>:
+      </p>
+      <pre class="example-flow">{
+  "version": "2.5.0",
+  "utility_timeout": {
+    "calls_total": 89,
+    "timeouts_total": 3,
+    "max_observed_wait_s": 67.2
+  },
+  "extensions_cache": {
+    "hits": 1842,
+    "misses": 312,
+    "circuit_open": false,
+    "hit_rate": 0.855
+  },
+  "context_size_guard": {
+    "trims": 0,
+    "messages_dropped": 0
+  },
+  "langchain_compat": {
+    "installed": true,
+    "shims": {
+      "langchain.prompts": true,
+      "langchain.schema": false
+    }
+  }
+}</pre>
+      <p>
+        The endpoint inherits the framework's
+        <code>requires_auth=True</code> &mdash; the WebUI's
+        logged-in session passes that transparently. The
+        endpoint is read-only; no POST/PUT.
+      </p>
+    </div>
+
+  </div>
+</body>
+
+<style>
+  .help-content {
+    max-height: 70vh;
+    overflow-y: auto;
+    padding: 8px 0;
+  }
+
+  .help-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 1.2rem;
+    font-weight: 600;
+    padding-bottom: 16px;
+    border-bottom: 1px solid var(--color-border);
+    margin-bottom: 16px;
+  }
+
+  .help-intro {
+    background: rgba(80, 120, 180, 0.10);
+    border: 1px solid rgba(80, 160, 200, 0.25);
+    border-radius: 8px;
+    padding: 12px 14px;
+    margin-bottom: 20px;
+    font-size: 0.88rem;
+    line-height: 1.5;
+    color: var(--color-text-secondary);
+  }
+
+  .help-toc {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-bottom: 24px;
+    padding: 12px 16px;
+    background: var(--color-input);
+    border: 1px solid var(--color-border);
+    border-radius: 8px;
+  }
+
+  .help-toc a {
+    font-size: 0.85rem;
+    color: var(--color-primary);
+    text-decoration: none;
+    padding: 2px 0;
+  }
+
+  .help-toc a:hover {
+    text-decoration: underline;
+  }
+
+  .help-section {
+    margin-bottom: 24px;
+  }
+
+  .help-section h3 {
+    font-size: 1rem;
+    font-weight: 600;
+    margin-bottom: 10px;
+    color: var(--color-text);
+    border-bottom: 1px solid var(--color-border);
+    padding-bottom: 6px;
+  }
+
+  .help-section h4 {
+    font-size: 0.92rem;
+    font-weight: 600;
+    margin-top: 16px;
+    margin-bottom: 6px;
+    color: var(--color-text);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .version-badge-inline {
+    background: rgba(120, 120, 120, 0.18);
+    color: var(--color-text-muted);
+    font-size: 0.65rem;
+    font-weight: 600;
+    padding: 2px 6px;
+    border-radius: 4px;
+    letter-spacing: 0.04em;
+  }
+
+  .help-section p,
+  .help-section ul,
+  .help-section ol {
+    font-size: 0.85rem;
+    line-height: 1.5;
+    color: var(--color-text-secondary);
+  }
+
+  .help-section ul,
+  .help-section ol {
+    margin: 4px 0 8px 0;
+    padding-left: 22px;
+  }
+
+  .help-section li {
+    margin-bottom: 4px;
+  }
+
+  .toggle-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 8px 0;
+    font-size: 0.82rem;
+  }
+
+  .toggle-table th,
+  .toggle-table td {
+    text-align: left;
+    padding: 6px 8px;
+    border: 1px solid var(--color-border);
+    vertical-align: top;
+  }
+
+  .toggle-table th {
+    background: var(--color-input);
+    color: var(--color-text);
+    font-weight: 600;
+  }
+
+  .toggle-table td code {
+    font-size: 0.78rem;
+  }
+
+  .recommendation {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 12px;
+    border: 1px solid var(--color-border);
+    border-radius: 8px;
+    margin-bottom: 8px;
+  }
+
+  .rec-label {
+    font-weight: 600;
+    font-size: 0.85rem;
+    min-width: 70px;
+  }
+
+  .rec-settings {
+    font-size: 0.85rem;
+    color: var(--color-text-secondary);
+    flex: 1;
+  }
+
+  .rec-use {
+    font-size: 0.75rem;
+    color: var(--color-text-secondary);
+  }
+
+  .example-flow {
+    background: var(--color-surface);
+    border: 1px solid var(--color-border);
+    border-radius: 6px;
+    padding: 12px;
+    font-family: monospace;
+    font-size: 0.8rem;
+    line-height: 1.6;
+    white-space: pre-wrap;
+    margin: 0;
+  }
+</style>
+</body>
+</html>

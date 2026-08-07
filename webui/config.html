@@ -1,0 +1,554 @@
+<body>
+  <div x-data x-init="await $store.modelFallback.ensureLoaded(); context.title = 'Model Fallback';">
+    <div class="fallback-config">
+
+      <!-- Header with Help Button -->
+      <div class="config-header">
+        <div class="header-title">
+          <span class="material-symbols-outlined">sync</span>
+          <span>Model Fallback System</span>
+        </div>
+        <button class="icon-button" @click="$store.modelFallback.openHelp()" title="How does this work?">
+          <span class="material-symbols-outlined">help</span>
+        </button>
+      </div>
+
+      <div class="config-description">
+        Configure the multi-cycle fallback system for robust model switching when rate limits or errors occur.
+      </div>
+
+      <!-- Timeout Settings -->
+      <div class="settings-section">
+        <div class="section-title">⏱ Timeouts</div>
+        <div class="section-description">
+          How long to wait for a model response before switching to the next fallback. Increase for slow models (low TPS) or large responses.
+        </div>
+
+        <div class="field">
+          <div class="field-label">
+            <div class="field-title">Chat Model Timeout (seconds)</div>
+            <div class="field-description">Timeout for chat model requests. Default: 300s (5 min).</div>
+          </div>
+          <div class="field-control">
+            <input type="number"
+                   class="text-input"
+                   min="30"
+                   max="600"
+                   step="10"
+                   x-model="context.settings.fallback_timeout_s"
+                   :value="$store.modelFallback.normalizeSettings(context.settings).timeout_s" />
+          </div>
+        </div>
+
+        <div class="field">
+          <div class="field-label">
+            <div class="field-title">Utility Model Timeout (seconds)</div>
+            <div class="field-description">Timeout for utility model requests (memory, prompts). Default: 300s (5 min).</div>
+          </div>
+          <div class="field-control">
+            <input type="number"
+                   class="text-input"
+                   min="30"
+                   max="600"
+                   step="10"
+                   x-model="context.settings.fallback_utility_timeout_s"
+                   :value="$store.modelFallback.normalizeSettings(context.settings).utility_timeout_s" />
+          </div>
+        </div>
+
+        <div class="field">
+          <div class="field-label">
+            <div class="field-title">Inter-Model Delay (seconds)</div>
+            <div class="field-description">Brief pause between fallback attempts to avoid hammering. Default: 2s.</div>
+          </div>
+          <div class="field-control">
+            <input type="number"
+                   class="text-input"
+                   min="0"
+                   max="30"
+                   step="0.5"
+                   x-model="context.settings.fallback_attempt_delay"
+                   :value="$store.modelFallback.normalizeSettings(context.settings).attempt_delay" />
+          </div>
+        </div>
+      </div>
+
+      <!-- Fallback Cycles -->
+      <div class="settings-section">
+        <div class="section-title">🔄 Fallback Cycles</div>
+        <div class="section-description">
+          Number of complete cycles through all fallback models before giving up. Each cycle attempts all configured fallbacks once.
+        </div>
+
+        <div class="field">
+          <div class="field-label">
+            <div class="field-title">Max Cycles (1-10)</div>
+            <div class="field-description">How many full cycles through the fallback list.</div>
+          </div>
+          <div class="field-control">
+            <input type="number"
+                   class="text-input"
+                   min="1"
+                   max="10"
+                   x-model="context.settings.fallback_max_cycles"
+                   :value="$store.modelFallback.normalizeSettings(context.settings).max_cycles" />
+          </div>
+        </div>
+
+        <div class="field">
+          <div class="field-label">
+            <div class="field-title">Cycle Delay (seconds)</div>
+            <div class="field-description">Wait time between full cycles when all models failed.</div>
+          </div>
+          <div class="field-control">
+            <input type="number"
+                   class="text-input"
+                   min="0"
+                   max="120"
+                   step="1"
+                   x-model="context.settings.fallback_cycle_delay"
+                   :value="$store.modelFallback.normalizeSettings(context.settings).cycle_delay" />
+          </div>
+        </div>
+      </div>
+
+      <!-- Resilience Features (v2.5) -->
+      <div class="settings-section">
+        <div class="section-title">🛡 Resilience features
+          <button class="info-button" @click="$store.modelFallback.openHelp()" title="Open the user manual" style="margin-left: 6px; vertical-align: middle;">
+            <span class="material-symbols-outlined" style="font-size: 1rem;">menu_book</span>
+          </button>
+        </div>
+        <div class="section-description">
+          Each piece is independent. Turn OFF what you don't need —
+          a future agent-zero update may ship an equivalent and you
+          can disable our version to avoid the double-fix. Per-feature
+          detail is in the user manual (book icon above).
+        </div>
+
+        <div class="toggle-row">
+          <label class="toggle">
+            <input type="checkbox"
+                   x-model="context.settings.utility_timeout_guard_enabled"
+                   :checked="$store.modelFallback.isEnabled(context.settings, 'utility_timeout_guard')" />
+            <span class="toggle-slider"></span>
+          </label>
+          <div class="toggle-label">
+            <div class="field-title">Utility-model timeout guard
+              <span class="version-badge">v2.2</span>
+            </div>
+            <div class="field-description">
+              Caps a hung utility call (typically ollama on CPU) at
+              <strong>max_wait_s</strong> (default 120s) so the agent
+              loop never freezes indefinitely. On timeout, the LLM is
+              told the utility failed and can rephrase or skip.
+            </div>
+          </div>
+        </div>
+
+        <div class="toggle-row">
+          <label class="toggle">
+            <input type="checkbox"
+                   x-model="context.settings.webui_extensions_cache_enabled"
+                   :checked="$store.modelFallback.isEnabled(context.settings, 'webui_extensions_cache')" />
+            <span class="toggle-slider"></span>
+          </label>
+          <div class="toggle-label">
+            <div class="field-title">WebUI extensions cache
+              <span class="version-badge">v2.2</span>
+            </div>
+            <div class="field-description">
+              2s TTL cache + circuit breaker on
+              <code>get_webui_extensions</code>. Breaks the 150ms
+              polling storm during page lifecycle and short-circuits
+              to <code>[]</code> when the framework's filesystem
+              layer raises repeatedly (slow mount). Auto-busts on
+              plugin enable/disable.
+            </div>
+          </div>
+        </div>
+
+        <div class="toggle-row">
+          <label class="toggle">
+            <input type="checkbox"
+                   x-model="context.settings.context_size_guard_enabled"
+                   :checked="$store.modelFallback.isEnabled(context.settings, 'context_size_guard')" />
+            <span class="toggle-slider"></span>
+          </label>
+          <div class="toggle-label">
+            <div class="field-title">Context-size guard (opt-in)
+              <span class="version-badge">v2.3</span>
+            </div>
+            <div class="field-description">
+              Trims the oldest messages in
+              <code>loop_data.history_output</code> when total chars
+              exceed <strong>max_chars</strong> (default 50000).
+              Enable only if you see the cascade hit
+              <em>ContextOverflow</em> on every utility candidate
+              in a single cycle. Trimming can confuse the LLM if
+              the early conversation mattered.
+            </div>
+          </div>
+        </div>
+
+        <div class="toggle-row">
+          <label class="toggle">
+            <input type="checkbox"
+                   x-model="context.settings.langchain_compat_enabled"
+                   :checked="$store.modelFallback.isEnabled(context.settings, 'langchain_compat')" />
+            <span class="toggle-slider"></span>
+          </label>
+          <div class="toggle-label">
+            <div class="field-title">LangChain v0 → v1 import shim
+              <span class="version-badge">v2.4</span>
+            </div>
+            <div class="field-description">
+              Maps <code>langchain.prompts</code> /
+              <code>langchain.schema</code> to
+              <code>langchain_core</code> via <code>sys.modules</code>
+              at agent_init. Fixes
+              <code>ModuleNotFoundError: langchain.prompts</code>
+              on langchain-v1-only docker images. No-op on
+              langchain v0.x installs.
+            </div>
+          </div>
+        </div>
+
+        <div class="advanced-disclosure" x-data="{ open: false }">
+          <button type="button" class="disclosure-toggle" @click="open = !open">
+            <span x-text="open ? '▾' : '▸'"></span>
+            Show advanced settings
+            <span style="opacity: 0.6; font-weight: normal;">
+              (per-feature timeouts, intervals, thresholds)
+            </span>
+          </button>
+          <div x-show="open" x-cloak style="margin-top: 12px;">
+            <p style="opacity: 0.7; font-size: 0.78rem; margin: 0 0 8px 0;">
+              The advanced knobs below edit the nested
+              <code>&lt;piece&gt;.&lt;key&gt;</code> sections of
+              <code>default_config.yaml</code>. Use only if you
+              understand the trade-off; the defaults are
+              conservative.
+            </p>
+            <p style="opacity: 0.7; font-size: 0.78rem; margin: 0 0 8px 0;">
+              Most of these are read at server boot. Changing them
+              here requires a restart.
+            </p>
+            <ul style="font-size: 0.8rem; line-height: 1.6; margin: 0; padding-left: 18px;">
+              <li><code>utility_timeout_guard.max_wait_s</code> (default 120) — hard cap on a single utility call.</li>
+              <li><code>utility_timeout_guard.jitter_s</code> (default 1.0) — random spread so concurrent agents don't lockstep.</li>
+              <li><code>webui_extensions_cache.ttl_s</code> (default 2.0) — cache freshness window.</li>
+              <li><code>webui_extensions_cache.circuit_breaker_threshold</code> (default 5) — errors in window before breaker opens.</li>
+              <li><code>context_size_guard.max_chars</code> (default 50000) — trim threshold when enabled.</li>
+              <li><code>context_size_guard.min_messages</code> (default 2) — never trim below this count.</li>
+            </ul>
+            <p style="opacity: 0.7; font-size: 0.78rem; margin: 12px 0 0 0;">
+              v2.5: the standalone event-loop housekeeping loop and
+              the second WebSocket pulse path were removed. The
+              <code>housekeeping:</code> and
+              <code>second_pulse_path_enabled</code> config keys
+              are still accepted for back-compat but are no-ops.
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Quick Presets -->
+      <div class="settings-section">
+        <div class="section-title">⚡ Quick Presets</div>
+
+        <div class="preset-buttons">
+          <button class="preset-button" @click="context.settings.fallback_max_cycles = 2; context.settings.fallback_cycle_delay = 3; context.settings.fallback_timeout_s = 120; context.settings.fallback_utility_timeout_s = 120; context.settings.fallback_attempt_delay = 1;">
+            <span class="preset-label">Fast</span>
+            <span class="preset-desc">2 cycles, 3s, 120s timeout</span>
+          </button>
+          <button class="preset-button" @click="context.settings.fallback_max_cycles = 4; context.settings.fallback_cycle_delay = 5; context.settings.fallback_timeout_s = 300; context.settings.fallback_utility_timeout_s = 300; context.settings.fallback_attempt_delay = 2;">
+            <span class="preset-label">Balanced</span>
+            <span class="preset-desc">4 cycles, 5s, 300s timeout</span>
+          </button>
+          <button class="preset-button" @click="context.settings.fallback_max_cycles = 4; context.settings.fallback_cycle_delay = 10; context.settings.fallback_timeout_s = 600; context.settings.fallback_utility_timeout_s = 600; context.settings.fallback_attempt_delay = 5;">
+            <span class="preset-label">Thorough</span>
+            <span class="preset-desc">4 cycles, 10s, 600s timeout</span>
+          </button>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+<style>
+  .fallback-config {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+    padding: 8px 0;
+  }
+
+  .config-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--color-border);
+  }
+
+  .header-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 1.1rem;
+    font-weight: 600;
+  }
+
+  .header-title .material-symbols-outlined {
+    font-size: 1.3rem;
+  }
+
+  .icon-button {
+    background: var(--color-input);
+    border: 1px solid var(--color-border);
+    border-radius: 6px;
+    padding: 6px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.15s;
+    color: var(--color-text);
+  }
+
+  .icon-button:hover {
+    background: var(--color-background-hover);
+  }
+
+  .config-description {
+    color: var(--color-text-muted);
+    font-size: 0.85rem;
+    line-height: 1.4;
+  }
+
+  .settings-section {
+    border: 1px solid var(--color-border);
+    border-radius: 8px;
+    padding: 16px;
+  }
+
+  .section-title {
+    font-size: 0.95rem;
+    font-weight: 600;
+    margin-bottom: 8px;
+  }
+
+  .section-description {
+    color: var(--color-text-muted);
+    font-size: 0.8rem;
+    margin-bottom: 12px;
+  }
+
+  .field {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 0;
+    border-top: 1px solid var(--color-border);
+  }
+
+  .field:first-child {
+    border-top: none;
+  }
+
+  .field-label {
+    flex: 1;
+  }
+
+  .field-title {
+    font-size: 0.88rem;
+    font-weight: 500;
+  }
+
+  .field-description {
+    color: var(--color-text-muted);
+    font-size: 0.75rem;
+    margin-top: 2px;
+  }
+
+  .field-control {
+    margin-left: 16px;
+  }
+
+  .text-input {
+    width: 80px;
+    padding: 6px 10px;
+    border: 1px solid var(--color-border);
+    border-radius: 6px;
+    background: var(--color-input);
+    color: var(--color-text);
+    font-size: 0.88rem;
+    text-align: right;
+  }
+
+  .text-input:focus {
+    outline: none;
+    border-color: var(--color-primary);
+  }
+
+  .preset-buttons {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .preset-button {
+    flex: 1;
+    min-width: 100px;
+    padding: 10px 12px;
+    border: 1px solid var(--color-border);
+    border-radius: 8px;
+    background: var(--color-input);
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+    transition: all 0.15s;
+    color: var(--color-text);
+  }
+
+  .preset-button:hover {
+    background: var(--color-background-hover);
+    border-color: var(--color-primary);
+  }
+
+  .preset-label {
+    font-size: 0.85rem;
+    font-weight: 500;
+  }
+
+  .preset-desc {
+    font-size: 0.7rem;
+    color: var(--color-text-muted);
+  }
+
+  .toggle-row {
+    display: flex;
+    gap: 12px;
+    align-items: flex-start;
+    padding: 10px 0;
+    border-top: 1px solid var(--color-border);
+  }
+
+  .toggle-row:first-of-type {
+    border-top: none;
+  }
+
+  .toggle-row-indented {
+    margin-left: 28px;
+    border-top: 1px dashed var(--color-border);
+  }
+
+  .toggle {
+    position: relative;
+    display: inline-block;
+    width: 38px;
+    height: 22px;
+    flex-shrink: 0;
+    margin-top: 2px;
+  }
+
+  .toggle input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+  }
+
+  .toggle-slider {
+    position: absolute;
+    inset: 0;
+    background: var(--color-input);
+    border: 1px solid var(--color-border);
+    border-radius: 11px;
+    transition: background 0.15s, border-color 0.15s;
+    cursor: pointer;
+  }
+
+  .toggle-slider::before {
+    content: '';
+    position: absolute;
+    left: 2px;
+    top: 2px;
+    width: 16px;
+    height: 16px;
+    background: var(--color-text);
+    border-radius: 50%;
+    transition: transform 0.15s;
+  }
+
+  .toggle input:checked + .toggle-slider {
+    background: var(--color-primary);
+    border-color: var(--color-primary);
+  }
+
+  .toggle input:checked + .toggle-slider::before {
+    transform: translateX(16px);
+    background: white;
+  }
+
+  .toggle-label {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .toggle-label .field-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .version-badge {
+    background: rgba(120, 120, 120, 0.18);
+    color: var(--color-text-muted);
+    font-size: 0.65rem;
+    font-weight: 600;
+    padding: 2px 6px;
+    border-radius: 4px;
+    letter-spacing: 0.04em;
+  }
+
+  .info-button {
+    background: transparent;
+    border: 1px solid var(--color-border);
+    border-radius: 4px;
+    padding: 2px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    color: var(--color-text-muted);
+  }
+
+  .info-button:hover {
+    background: var(--color-background-hover);
+    color: var(--color-text);
+  }
+
+  .advanced-disclosure {
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid var(--color-border);
+  }
+
+  .disclosure-toggle {
+    background: transparent;
+    border: none;
+    color: var(--color-primary);
+    cursor: pointer;
+    font-size: 0.85rem;
+    font-weight: 500;
+    padding: 4px 0;
+  }
+
+  .disclosure-toggle:hover {
+    text-decoration: underline;
+  }
+</style>
+</body>
+</html>

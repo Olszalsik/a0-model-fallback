@@ -1,0 +1,51 @@
+name: _model_fallback
+title: Model Fallback System
+description: >
+  Enhanced multi-cycle fallback system with rate limit evasion, permanent
+  failure detection, intelligent cooldown management for chat and utility
+  models, memory plugin resilience, (v2.2) UI resilience: outer timeout
+  guard on call_utility_model plus TTL cache + circuit breaker on the
+  get_webui_extensions polling storm, (v2.3) opt-in chat history trim
+  when the prompt exceeds max_chars, (v2.4) a langchain v0 -> v1 import
+  compatibility shim (default ON) so the v0-style imports in
+  helpers/call_llm.py resolve on langchain v1-only docker images,
+  (v2.5) per-feature WebUI toggles plus a user manual so each piece can
+  be turned OFF independently as upstream agent-zero adds equivalents,
+  and (v2.5.1) defensive validation in build_fallback_wrapper that
+  raises TypeError when a fallback spec's `model` key is not a string
+  (e.g. a list-of-dict from a hand-edited preset), plus a clear label
+  in _get_model_label so the per-attempt log no longer dumps a Python
+  repr of the malformed value. The contract is documented in
+  AGENTS.md "Fallback spec format validation (added 2026-07-21)".
+  (v2.6) adaptive fallback cascade: per-candidate warm/cold timeouts
+  (cascade_warm_timeout_s / cascade_warm_window_s) so a label that
+  succeeded recently gets a short warm ceiling instead of the full cold
+  default; per-provider capacity inference (_classify_capacity)
+  distinguishing concurrent-paid (local ollama/* -- a 429 is a competing
+  agent, so no cooldown is written and the primary-skip escalation is
+  skipped), unlimited-paid (a0_venice/*), and free-per-minute (everything
+  else); stagnation-based cycle-sleep amplification
+  (cycle_stagnation_factor / cycle_stagnation_threshold) during sustained
+  zero-success outages, with one log line per outage; a
+  CancelledError-vs-TimeoutError split in the inner cascade so an
+  externally-cancelled healthy call is not preempted (the outer guard is
+  unchanged); and a cross-agent healthy-label reset wired into the
+  primary-skip escalation so a peer agent's recent success resets stale
+  local strikes. (v2.6.1) fix the chat cascade's missing
+  cascade_warm_timeout_s / cascade_warm_window_s config reads (the utility
+  cascade had them at fallback.py:1153-1158; the chat cascade omitted them),
+  which left the chat warm/cold path unbound -- a NameError on chat
+  candidates with no user TIMEOUT kwarg, or a silently-dead warm path when
+  one was set. See AGENTS.md "v2.6 -- Adaptive fallback cascade".
+  Note: the v2.2 standalone event-loop housekeeping loop (coroutine
+  sweep + WebSocket keepalive pulse + stats tick) and the v2.3 second
+  WebSocket pulse path that lived inside it were removed in v2.5; the
+  ``housekeeping_enabled`` and ``second_pulse_path_enabled`` keys are
+  still accepted for back-compat but are no-ops at runtime.
+  Self-contained plugin; no official file is modified.
+version: 2.6.1
+settings_sections:
+  - agent
+  - developer
+per_project_config: true
+per_agent_config: true

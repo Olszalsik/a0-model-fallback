@@ -1,0 +1,273 @@
+fallback_max_cycles: 4
+fallback_cycle_delay: 15.0
+fallback_attempt_delay: 3.0
+fallback_timeout_s: 300
+fallback_utility_timeout_s: 300
+
+# When true, if a full pass through all candidate models produces only
+# permanent failures (auth/quota/model-not-found), the plugin raises
+# extended-retry mode after the first cycle instead of cycling
+# `max_cycles` times. This avoids the "switching to [N/2]" / "cycling"
+# log spam when every configured model is broken. Set to false to keep
+# the old behavior of always exhausting max_cycles first.
+early_exit_on_all_permanent: true
+
+# Extended retry — infinite cycle for long cooldown resets (e.g. Ollama 5h rate limit, daily API credit reset).
+# After the normal attempt budget is exhausted, the plugin enters "extended retry mode":
+#   Phase A: initial_cycle_attempts → wait phase_a_delay → initial_cycle_attempts → wait phase_a_delay
+#   Phase B: wait phase_b_delay → initial_cycle_attempts → wait phase_b_delay → initial_cycle_attempts
+#   Then resets to Phase A and repeats forever.
+# Set extended_retry_enabled: false to keep the old behavior (hard stop after 60 attempts).
+extended_retry_enabled: true
+phase_a_delay_s: 900        # 15 min — covers short rate-limit windows
+phase_b_delay_s: 3600       # 60 min (1 hour cap) — covers daily credit resets / weekly limits
+initial_cycle_attempts: 20  # how many attempts in each extended cycle (3-4 normal cycles worth)
+
+# --- Responses -> chat-completions fallback (options B + D) -------------------
+# The transport defaults to /v1/responses. Some OpenAI-compatible providers
+# (notably ollama.com for ":cloud" models) 500 on /v1/responses while their
+# /v1/chat/completions works. These knobs keep the fleet resilient without
+# editing tracked files (so the fix survives agent-zero updates).
+#
+# Option B (proactive): force chat-completions for any provider in
+#   force_chat_completions_providers, any model whose name contains a pattern
+#   in force_chat_completions_patterns, or any model whose api_base contains a
+#   substring in force_chat_completions_api_bases.
+#   The api_base matcher is the reliable one: OpenAI-compatible vendors
+#   (ollama_cloud, a0_venice, openrouter, ...) all share litellm_provider
+#   "openai", and the fallback wrapper built by build_fallback_wrapper carries
+#   provider="openai" rather than the agent-zero service name, so the
+#   provider-name list cannot match fallback wrappers. api_base (e.g.
+#   "https://ollama.com/v1") is stable and present on both primary and
+#   fallback wrappers, and uniquely IDs the upstream that 500s on
+#   /v1/responses.
+# Option D (reactive): if responses_5xx_retry_enabled, a model that still 5xxs
+#   on the Responses path is retried ONCE with chat-completions, then marked
+#   sticky so all later turns force chat proactively.
+force_chat_completions_providers:
+  - ollama_cloud
+force_chat_completions_patterns:
+  - ":cloud"
+  - "ollama_cloud/"
+force_chat_completions_api_bases:
+  - "ollama.com"
+responses_5xx_retry_enabled: true
+
+# --- Memory plugin resilience (merged from memory_fix plugin v1.0.0) -----
+# Patches applied at monologue_start to prevent TimeoutError from killing
+# the agent loop when the built-in _memory plugin's recall task times out.
+# Applied silently; never crashes the agent loop from our fixes.
+memory_recall_timeout_s: 90          # was 30 in core; our patch enforces this
+memory_memorize_max_chars: 50000     # was 80000 in core; prevents utility model context overflow
+memory_recall_delayed: true          # make recall deferred so the agent doesn't block on slow searches
+memory_memorize_consolidation: false # disable to reduce memorize CPU/IO bursts
+
+# --- v2.5 WebUI feature toggles ----------------------------------------
+# Top-level on/off switches. The WebUI binds to these flat keys
+# (e.g. ``context.settings.utility_timeout_guard_enabled``). The
+# runtime helpers also still honour each piece's nested
+# ``<piece>.enabled`` for back-compat, but the WebUI surface
+# exposes only the top-level switches. See AGENTS.md "WebUI
+# configuration" for the migration story and what to do if
+# upstream agent-zero adds an equivalent to one of these.
+utility_timeout_guard_enabled: true     # v2.2 — outer timeout on call_utility_model
+# housekeeping_enabled and second_pulse_path_enabled are still
+# recognised by the toggle resolver (see helpers/toggles.py) for
+# back-compat with hand-edited configs, but the corresponding
+# extension and helper were removed in v2.5. Saving a value here
+# is harmless; nothing on the runtime side reads it.
+housekeeping_enabled: false             # v2.5 — REMOVED, kept as no-op for back-compat
+second_pulse_path_enabled: false        # v2.5 — REMOVED, kept as no-op for back-compat
+webui_extensions_cache_enabled: true    # v2.2 — TTL cache + circuit breaker on extensions lookup
+context_size_guard_enabled: false       # v2.3 — opt-in history trim on ContextOverflow spiral
+langchain_compat_enabled: true          # v2.4 — v0 -> v1 import shim (default ON)
+primary_skip_enabled: true              # v2.5.1 — escalate primary cooldown after N strikes
+
+# --- v2.2 Resilience Layer ---------------------------------------------
+# Three independent pieces; each is a no-op when ``enabled: false``.
+# See AGENTS.md for the full design and migration notes (what to do
+# if upstream agent-zero adds an equivalent feature).
+
+# Outer timeout guard on call_utility_model. Wraps the cascaded
+# method (the cascade itself stays unchanged) in
+# asyncio.wait_for so a hung utility call (typically ollama on CPU)
+# cannot freeze the agent loop indefinitely. On timeout, closes the
+# inner litellm coroutine chain via memory_hardening (best-effort,
+# lazy import) and raises RepairableException so the LLM is told the
+# utility failed.
+utility_timeout_guard:
+  enabled: true
+  default_timeout_s: 60          # was 90; lowered 2026-07-23 -- with 6
+                                 # fallback candidates the cascade can route
+                                 # around a hung primary in ~12s, so a 60s
+                                 # ceiling cuts full-cycle wall time from
+                                 # ~7 min to ~5 min on primary outages
+                                 # (e.g. 22:50:21 "consecutive=2" took
+                                 # 14+ min in the live log). Still gives
+                                 # cold-start 6x headroom (first a0_venice
+                                 # call ~10s, subsequent ~1.2s per the
+                                 # 2026-07-21 repro). Hard cap below.
+  max_wait_s: 180                # hard cap; kept at 180 even with the
+                                 # 60s default so a user override of
+                                 # default_timeout_s=120 in their preset
+                                 # isn't silently clamped (utility_timeout.py:163
+                                 # does min(max(default_to, 0), max_wait)).
+  jitter_s: 1.0                  # 0-jitter_s of random spread so concurrent agents don't lockstep
+  close_inner_on_timeout: true   # best-effort litellm-internal coroutine cleanup
+
+# --- v2.5.1 Primary-skip-after-N-strikes (added 2026-07-23) --------------
+# If the primary model (cascade candidate 0) fails ``primary_skip_strikes``
+# times in a row, the plugin escalates its cooldown to
+# ``primary_skip_cooldown_s`` so the cascade routes around it instead of
+# paying the 60s timeout tax on every cycle. Without this, a hung
+# primary produces 60s+60s+60s = 3 min of wasted wall time per cascade
+# rotation even though fallbacks [1..N-1] could return in ~12s.
+#
+# The counter resets on ANY successful call (primary recovered OR
+# fallback succeeded) -- so a single successful fallback means the
+# next primary attempt is no longer a "consecutive failure". A
+# quota-refreshed primary is naturally retried when its cooldown
+# expires; if it's still hung, the counter ticks up again and the
+# cooldown is escalated further. The escalation only ever EXTENDS the
+# cooldown (never shortens), so a 5-min rate-limit cooldown on the
+# primary isn't lost.
+#
+# This is a per-call counter (reset on every utility/chat call), not
+# a persistent one. So a container restart fully resets the
+# state -- which is correct, because the cooldown store itself is
+# in-memory.
+primary_skip_enabled: true
+primary_skip_strikes: 2
+primary_skip_cooldown_s: 120    # 2 min (lowered from 600s on 2026-07-27,
+                                # v2.5.2). 600s was over-locking the
+                                # primary when it had recovered in ~2 min,
+                                # which is the common case for short-lived
+                                # upstream hiccups. 120s still covers one
+                                # full pass through 6 candidates at 60s
+                                # timeout each (6 min) for a genuinely
+                                # hung primary, but routes around a
+                                # temporarily-hung primary within one
+                                # cascade rotation.
+
+# --- v2.5.2 Rate-limit cooldown tuning (added 2026-07-27) -----------------
+# When a rate-limit error (HTTP 429) has no Retry-After header (e.g.
+# NVIDIA NIM's plain {"status":429,"title":"Too Many Requests"}), the
+# plugin uses this cooldown duration instead of guessing. Was hardcoded
+# 300s (5 min) in v2.5.1; lowered default to 30s because free-tier
+# endpoints (NVIDIA NIM, OpenRouter free models, a0_venice, etc.) recover
+# in 20-40s in practice. The 300s default was over-locking healthy
+# endpoints after a single shared-agent 429 -- a cascade sharing the
+# process with multiple agents would lock out all candidates within a
+# few cycles because every concurrent agent's first failure set a
+# 5-min cooldown on a different endpoint.
+#
+# Raise this back up if your provider really does need the longer wait.
+# Clamped to [10s, 3600s] at runtime.
+rate_limit_no_retry_after_cooldown_s: 30
+
+# --- v2.5.2 Cross-agent healthy-label reset (added 2026-07-27) ----------
+# When any agent's cascade succeeds on a model label, that label is
+# marked "healthy" for `health_horizon_s`. Other agents' cooldowns for
+# the same label are eligible to be cleared (only-cleared, never
+# overwritten) on their next cascade iteration. Fixes the multi-agent
+# case where one agent's rate-limit cooldown was locking out other
+# agents that needed the same endpoint right now.
+#
+# Only-cleared-never-overwritten invariant: if a fresh "broken" cooldown
+# for `label` exists from a different agent within the horizon, the
+# broken signal wins. The healthy signal just means the cascade retries
+# `label` sooner once that active cooldown expires -- it does NOT
+# shorten the cooldown. See fallback.py:_maybe_clear_cooldown_for_healthy_label.
+#
+# The horizon is short (60s) so a stale "healthy" signal cannot
+# override a fresh "broken" cooldown from a different agent, but long
+# enough to span at least one cascade cycle. Set to 0 to disable
+# (clamped to a minimum of 5s at runtime).
+health_horizon_s: 60
+
+# --- v2.6 Cascade per-call timeouts (added 2026-07-28) -------------------
+# First call to a label (within `cascade_warm_window_s`) gets the legacy
+# `fallback_utility_timeout_s` / `fallback_timeout_s` (the cold default).
+# Subsequent calls within the window get `cascade_warm_timeout_s`. User-
+# set `TIMEOUT=` on the model kwarg still wins (legacy contract).
+#
+# Why: cloud providers return warm calls in ~1.2s (a0_venice) or 2-5s
+# (nvidia_nim). A flat 90-300s timeout on a warm call wastes up to 4
+# minutes per candidate when several are hung. The warm shortcut catches
+# these fast-path cases while leaving the cold path intact for genuine
+# cold starts (DNS, auth, first-byte).
+#
+# `cascade_warm_window_s: 600` (10 min) is a deliberate margin over the
+# 5-min `health_horizon_s` — a label that succeeded once within the
+# last 10 min is overwhelmingly likely to still be warm, but if it
+# genuinely cooled off (provider outage, network blip), the next call
+# just falls back to the cold default. Set warm_window=0 to disable.
+cascade_warm_timeout_s: 20
+cascade_warm_window_s: 600
+
+# --- v2.6 Cascade stagnation amplification (added 2026-07-28) -----------------
+# When `cycle_stagnation_threshold` consecutive full cycles complete
+# without ANY candidate succeeding (every model still in cooldown),
+# multiply the cycle sleep by `cycle_stagnation_factor` to give upstreams
+# more time to recover from quota exhaustion. One log line per stagnation
+# event, not per cycle. The amplified sleep still respects the
+# `max_cycle_delay_s` cap. Set factor=1.0 to disable amplification.
+cycle_stagnation_factor: 1.5
+cycle_stagnation_threshold: 2
+
+# The standalone event-loop housekeeping loop was removed in v2.5
+# (it was a same-day fix that turned into a per-minute respawn log
+# line with no user-visible benefit). The ``housekeeping:`` block
+# is kept below for back-compat -- existing configs that reference
+# it still parse -- but the values are ignored at runtime.
+housekeeping:
+  enabled: false
+  sweep_interval_s: 60.0
+  pulse_interval_s: 25.0
+  stats_interval_s: 60.0
+  stale_threshold_s: 120.0       # ignored; no loop exists to respawn
+
+# TTL cache + circuit breaker on helpers.extension.get_webui_extensions.
+# The 2s TTL breaks the 150ms polling storm the WebUI can produce
+# during page lifecycle. The circuit breaker returns [] immediately
+# when get_webui_extensions itself raises more than ``threshold``
+# times in ``window_s`` -- keeps the WebUI responsive even when the
+# framework's FS layer is slow.
+webui_extensions_cache:
+  enabled: true
+  ttl_s: 2.0
+  circuit_breaker_enabled: true
+  circuit_breaker_window_s: 10.0
+  circuit_breaker_threshold: 5
+  circuit_breaker_recovery_s: 30.0
+
+# --- v2.3 Context Size Guard (opt-in) ------------------------------------
+# Trim ``loop_data.history_output`` at message_loop_prompts_after
+# when the total char count exceeds ``max_chars``. Prevents the
+# "every utility model returns ContextOverflow" death spiral that
+# the cascade can't recover from in a single cycle.
+#
+# Default ``enabled: false`` because aggressive trimming can confuse
+# the LLM (it loses the early conversation). Enable when you see
+# cascading ContextOverflow errors across all utility candidates;
+# the 50000 char default is conservative (~12.5k tokens, well
+# within 32k context).
+context_size_guard:
+  enabled: false
+  max_chars: 50000
+  min_messages: 2  # never trim below this; the LLM needs the last turn
+
+# --- v2.4 LangChain v1 Import Compatibility (default ON) -----------------
+# Shim ``langchain.prompts`` and ``langchain.schema`` (v0 paths)
+# to their langchain_core v1 homes via sys.modules at agent_init.
+# Fixes ``ModuleNotFoundError: No module named 'langchain.prompts'``
+# in docker images that only ship langchain v1.
+#
+# This is part of the LLM-error-handling surface (v0/v1 interface
+# mismatch surfaces as a fatal import error that no cascade can
+# recover from), so it lives in this plugin. Default ON because
+# v0.x users (who already have the real modules) get a no-op
+# install: the shim is skipped when the legacy name is already in
+# sys.modules without our sentinel.
+langchain_compat:
+  enabled: true

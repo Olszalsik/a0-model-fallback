@@ -1,0 +1,24 @@
+# --- Personal / local instance state (never publish) -----------------------
+# Per-install runtime config; defaults ship as default_config.yaml.
+config.json
+config.json.before-*.bak
+
+# Local pre-edit backups.
+*.bak
+*.before-*.bak
+
+# Runtime toggle / disabled-flag state.
+.toggle-*
+
+# --- Python -----------------------------------------------------------------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# --- Test / tool caches -----------------------------------------------------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
