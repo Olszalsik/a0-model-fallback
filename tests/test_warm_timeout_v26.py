@@ -34,6 +34,7 @@ if str(REPO_ROOT) not in sys.path:
 from usr.plugins._model_fallback import fallback as _fb_mod
 from usr.plugins._model_fallback.fallback import (
     _resolve_per_call_timeout,
+    _evict_warm_on_timeout,
     _DEFAULT_CASCADE_WARM_TIMEOUT_S,
     _DEFAULT_CASCADE_WARM_WINDOW_S,
 )
@@ -176,3 +177,81 @@ def test_module_defaults_match_plan():
     documented (locked 2026-07-28)."""
     assert _DEFAULT_CASCADE_WARM_TIMEOUT_S == 20.0
     assert _DEFAULT_CASCADE_WARM_WINDOW_S == 600.0
+
+
+# --- fix A: evict warm label on timeout -------------------------------------
+# A genuine timeout means the warm label is no longer fast. The cascade
+# handlers call _evict_warm_on_timeout(exc, label) so the next attempt
+# resolves to the cold base timeout instead of looping on the 20s warm
+# ceiling. These tests exercise the helper directly; the cascade-level
+# behavior (warn line + _handle_error_cooldown) is covered by the
+# integration paths in test_no_preempt_v26.py / test_utility_timeout_floor.py.
+
+import asyncio
+
+
+def test_fixA_timeout_evicts_warm_label():
+    """A genuine asyncio.TimeoutError evicts the label, so the next
+    _resolve_per_call_timeout returns the cold base timeout."""
+    warm_dict = _warm_labels()
+    label = "test-fixA-timeout"
+    warm_dict[label] = time.monotonic()  # currently warm
+    _evict_warm_on_timeout(asyncio.TimeoutError(), label)
+    assert label not in warm_dict, "genuine timeout must evict the warm label"
+    base = 90.0
+    assert _resolve_per_call_timeout(label, base, 20.0, 600.0) == base, (
+        "after eviction the next call must use the cold base timeout"
+    )
+
+
+def test_fixA_builtin_timeout_also_evicts():
+    """The handlers also catch the builtin TimeoutError (alias of
+    asyncio.TimeoutError on 3.11+). It is a genuine timeout, not an
+    external cancel, so it must evict too."""
+    warm_dict = _warm_labels()
+    label = "test-fixA-builtin-timeout"
+    warm_dict[label] = time.monotonic()
+    _evict_warm_on_timeout(TimeoutError(), label)
+    assert label not in warm_dict
+
+
+def test_fixA_cancelled_does_not_evict_warm_label():
+    """An external asyncio.CancelledError is a healthy call that was
+    cancelled by the outer guard / shutdown -- NOT a slow call. The
+    handler must NOT evict, so the next call still gets the warm timeout
+    (don't penalize a healthy model for an external cancel)."""
+    warm_dict = _warm_labels()
+    label = "test-fixA-cancelled"
+    warm_dict[label] = time.monotonic()
+    _evict_warm_on_timeout(asyncio.CancelledError(), label)
+    assert label in warm_dict, "external cancel must NOT evict the warm label"
+    assert _resolve_per_call_timeout(label, 90.0, 20.0, 600.0) == 20.0, (
+        "after an external cancel the next call must stay warm"
+    )
+
+
+def test_fixA_evict_missing_label_is_safe():
+    """Evicting a label that was never warm (cold call timed out on its
+    first attempt) must be a no-op, not an error."""
+    warm_dict = _warm_labels()
+    label = "test-fixA-missing"
+    warm_dict.pop(label, None)
+    # Must not raise.
+    _evict_warm_on_timeout(asyncio.TimeoutError(), label)
+    assert label not in warm_dict
+
+
+def test_fixA_router_resolved_label_is_evicted_too():
+    """Regression guard for the omniroute case: an omniroute call resolves
+    to an ``openai/...`` model_name (omniroute registers as
+    litellm_provider=openai), so _classify_capacity returns
+    free_per_minute and the v2.6.3 router exemption does NOT fire for it.
+    Fix A is label-agnostic -- it evicts on timeout regardless of the
+    label's capacity class, so the loop is still broken for this label."""
+    warm_dict = _warm_labels()
+    # The resolved label that actually appears in the timeout warn line.
+    label = "openai/auto/best-coding-fast"
+    warm_dict[label] = time.monotonic()
+    _evict_warm_on_timeout(asyncio.TimeoutError(), label)
+    assert label not in warm_dict
+    assert _resolve_per_call_timeout(label, 90.0, 20.0, 600.0) == 90.0

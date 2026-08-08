@@ -219,6 +219,31 @@ def _resolve_per_call_timeout(
     return base_timeout_s
 
 
+def _evict_warm_on_timeout(exc, label: str) -> None:
+    """fix A: drop `label` from the warm-fast-path cache on a genuine
+    timeout so the next attempt gets the cold ``base_timeout_s`` instead
+    of looping on the short warm ceiling (``warm_timeout_s``, default
+    20s) + cycle delay.
+
+    ``_WARM_LABELS`` is only ever WRITTEN on success (utility :1653,
+    chat :2285) and was never cleared on failure, so a degraded-but-warm
+    model retried at 20s indefinitely until the 600s warm window expired
+    -- the 20s+10s "lag loop". Evicting on timeout closes the loop and is
+    label-agnostic: it works regardless of how ``_classify_capacity``
+    classifies the (possibly router-resolved) label, so it covers labels
+    the v2.6.3 router exemption misses (e.g. an omniroute call that
+    resolves to an ``openai/...`` model_name and classifies as
+    ``free_per_minute``).
+
+    Skip on external ``asyncio.CancelledError``: the call was healthy and
+    externally cancelled (outer guard / container shutdown), not slow --
+    evicting would wrongly penalize the next call with a cold timeout.
+    """
+    if isinstance(exc, asyncio.CancelledError):
+        return
+    _WARM_LABELS.pop(label, None)
+
+
 def _get_cooldown_store(agent) -> dict:
     """Return the in-memory cooldown dict for an agent, seeding from
     agent.data on first use after a process restart -- BUT only if the
@@ -1776,6 +1801,10 @@ async def _patched_call_utility_model(
             warn = f"Utility model [{idx}] timed out after {int(effective_timeout_s)}s: {label}"
             self.context.log.log("warning", content=warn)
             PrintStyle(font_color="orange", padding=True).print(warn)
+            # fix A: evict the warm label so the retry uses the cold
+            # timeout instead of looping on the 20s warm ceiling. See
+            # _evict_warm_on_timeout for the full rationale.
+            _evict_warm_on_timeout(e, label)
             _handle_error_cooldown(e, label, model_cooldowns, self)
             # v2.5.1: track consecutive primary failures. If [0] has just
             # timed out, escalate its cooldown so the cascade routes around
@@ -2387,6 +2416,10 @@ async def _patched_call_chat_model(
             warn = f"Chat model [{idx}] timed out after {int(effective_timeout_s)}s: {label}"
             self.context.log.log("warning", content=warn)
             PrintStyle(font_color="orange", padding=True).print(warn)
+            # fix A: evict the warm label so the retry uses the cold
+            # timeout instead of the 20s warm ceiling (see the utility
+            # timeout handler + _evict_warm_on_timeout for the rationale).
+            _evict_warm_on_timeout(e, label)
             _handle_error_cooldown(e, label, model_cooldowns, self)
             # Timeouts are transient.
 
