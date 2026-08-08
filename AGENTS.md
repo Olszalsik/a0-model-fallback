@@ -1019,11 +1019,44 @@ not the 120s default); and a 500 on `nvidia_nim/*` still gets the normal
 120s transient cooldown (the router short-cooldown does not leak). Full
 suite (159 tests) green. Backup: `fallback.py.before-v2.6.2-router.bak`.
 
+### v2.6.3 — Router warm-timeout exemption (2026-08-08)
+
+**Problem.** The v2.6 cascade gives a "warm" label (used within
+`cascade_warm_window_s`, default 600s) a short per-call ceiling of
+`cascade_warm_timeout_s` (default 20s). That ceiling assumes a fast warm
+cloud call (~1-5s). OmniRoute (`omniroute/*`) is a self-healing gateway
+that routes one request across 230+ upstream tiers, often *free* coding
+providers; a routed free call can take far longer than 20s even when the
+gateway is "warm". With the "free coding fast" presets (`2 Agent` →
+`auto/coding:free`, `Drága` → `auto/best-coding-fast`) using OmniRoute
+as the *utility* model, the 20s warm ceiling was timing the utility
+call out after exactly 20s.
+
+**Fix.** `_resolve_per_call_timeout` (fallback.py) is now capacity-aware:
+`router`-class labels (the A1 `router` capacity class — `omniroute/*`)
+skip the warm fast-path and always get the cold `base_timeout_s` ceiling
+(`fallback_utility_timeout_s` / `fallback_timeout_s`, default 300s).
+Fast routed calls still return fast (the ceiling only bites on slow
+calls); slow routed free-tier calls get the headroom they need. The
+user-set `TIMEOUT=` model kwarg still wins (legacy contract, unchanged).
+
+**Why not raise `cascade_warm_timeout_s` globally.** That would weaken
+the fast-path for every fast warm provider (a0_venice ~1.2s, nvidia_nim
+2-5s), letting hung warm calls waste minutes. A capacity-targeted
+exemption keeps the 20s fast-path for providers it fits and gives
+routers the cold ceiling.
+
+**Tests.** `tests/test_router_capacity.py` — +3 tests (10 total): a warm
+`omniroute/auto` returns the cold base (300s, not 20s); a warm
+non-router (`a0_venice/*`) still returns the 20s warm timeout (fast-path
+intact); a cold label returns the base (unchanged). Full suite (162
+tests) green. Backup: `fallback.py.before-warm-router.bak`.
+
 ### v2.6 configuration knobs
 
 | Knob | Default | Phase | Effect |
 |---|---|---|---|
-| `cascade_warm_timeout_s` | 20 | 1 | warm-call timeout ceiling |
+| `cascade_warm_timeout_s` | 20 | 1 | warm-call timeout ceiling (router labels exempt since v2.6.3 — use the cold base) |
 | `cascade_warm_window_s` | 600 | 1 | how long a label stays "warm"; 0 disables warm/cold |
 | `cycle_stagnation_factor` | 1.5 | 3 | sleep multiplier at stagnation; 1.0 disables |
 | `cycle_stagnation_threshold` | 2 | 3 | consecutive zero-success cycles to trigger amplification |

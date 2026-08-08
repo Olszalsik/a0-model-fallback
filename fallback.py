@@ -192,9 +192,22 @@ def _resolve_per_call_timeout(
     window) get `base_timeout_s`. The user-set TIMEOUT= model kwarg is
     handled at the call site, not here — this helper is only invoked
     after the kwarg has already been checked (so a user kwarg wins
-    regardless of warm state).
+    regardless of warm state). Router-class labels (omniroute/*) always
+    get the cold ``base_timeout_s`` -- see the note in the body.
     """
     try:
+        # v2.6.3: router-class labels (omniroute/* -- self-healing gateways
+        # that front many upstreams, often free/slow tiers) skip the
+        # aggressive warm fast-path. The 20s warm timeout assumes a fast
+        # warm cloud call (~1-5s); a router routing free coding providers
+        # can take far longer even when "warm", and the 20s ceiling was
+        # timing out the OmniRoute utility model (e.g. auto/coding:free,
+        # auto/best-coding-fast) in the "free coding fast" presets.
+        # Routers get the cold ``base_timeout_s`` ceiling -- fast calls
+        # still return fast; slow routed calls get the headroom they need.
+        # See A1 router capacity class + cascade_warm_timeout_s.
+        if _classify_capacity(label) == "router":
+            return base_timeout_s
         last_warm_at = _WARM_LABELS.get(label, 0.0)
         if time.monotonic() - last_warm_at < warm_window_s:
             return warm_timeout_s

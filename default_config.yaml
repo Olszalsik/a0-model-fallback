@@ -213,6 +213,13 @@ router_cooldown_s: 5
 # last 10 min is overwhelmingly likely to still be warm, but if it
 # genuinely cooled off (provider outage, network blip), the next call
 # just falls back to the cold default. Set warm_window=0 to disable.
+#
+# v2.6.3: router-class labels (omniroute/* — see `router_cooldown_s` below)
+# are EXEMPT from the warm fast-path: they always use the cold base
+# ceiling. A self-healing gateway routing free/slow upstream tiers is
+# not a fast warm cloud call, and the 20s warm ceiling was timing out
+# the OmniRoute utility model (auto/coding:free etc.). Fast routed calls
+# still return fast; the ceiling only bites on slow calls.
 cascade_warm_timeout_s: 20
 cascade_warm_window_s: 600
 

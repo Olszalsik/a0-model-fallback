@@ -21,6 +21,10 @@ Covered:
      5s, NOT the 120s a normal 500 gets) for a 5xx on an ``omniroute/*`` label.
   6. Sanity: a 500 on a non-router label (``nvidia_nim/*``) still gets the
      normal 120s transient cooldown -- the router short-cooldown does not leak.
+  7. v2.6.3: ``_resolve_per_call_timeout`` gives a router label the cold
+     ``base_timeout_s`` even when it's "warm" -- routers fronting free/slow
+     tiers aren't fast warm cloud calls, and the 20s warm ceiling was
+     timing out the OmniRoute utility model (``auto/coding:free`` etc.).
 
 To run:
     cd /a0
@@ -249,3 +253,66 @@ def test_handle_error_500_normal_cooldown_for_non_router():
         )
     finally:
         store[("nonrouter-500",)] = {}
+
+
+# ---------------------------------------------------------------------------
+# v2.6.3: router warm-timeout exemption
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_per_call_timeout_router_uses_cold_even_when_warm():
+    """v2.6.3: a router-class label (omniroute/*) gets the cold
+    ``base_timeout_s`` even when it's "warm" -- routers fronting free/slow
+    tiers aren't fast warm cloud calls, and the 20s warm ceiling was
+    timing out the OmniRoute utility model. The warm timestamp must NOT
+    coax it into the 20s fast-path."""
+    label = "omniroute/auto"
+    saved = _fb_mod._WARM_LABELS.get(label)
+    try:
+        _fb_mod._WARM_LABELS[label] = time.monotonic()  # mark warm
+        got = _fb_mod._resolve_per_call_timeout(
+            label, base_timeout_s=300.0, warm_timeout_s=20.0, warm_window_s=600.0,
+        )
+        assert got == 300.0, (
+            f"router label must use cold base (300s) even when warm, got {got}"
+        )
+    finally:
+        if saved is None:
+            _fb_mod._WARM_LABELS.pop(label, None)
+        else:
+            _fb_mod._WARM_LABELS[label] = saved
+
+
+def test_resolve_per_call_timeout_non_router_warm_uses_warm():
+    """Sanity: a warm NON-router label still gets the short warm timeout --
+    the fast-path is intact for normal providers. Guards against the
+    router exemption accidentally disabling the warm path for everyone."""
+    label = "a0_venice/some-model"
+    saved = _fb_mod._WARM_LABELS.get(label)
+    try:
+        _fb_mod._WARM_LABELS[label] = time.monotonic()  # mark warm
+        got = _fb_mod._resolve_per_call_timeout(
+            label, base_timeout_s=300.0, warm_timeout_s=20.0, warm_window_s=600.0,
+        )
+        assert got == 20.0, (
+            f"warm non-router must use warm_timeout_s (20s), got {got}"
+        )
+    finally:
+        if saved is None:
+            _fb_mod._WARM_LABELS.pop(label, None)
+        else:
+            _fb_mod._WARM_LABELS[label] = saved
+
+
+def test_resolve_per_call_timeout_cold_label_uses_base():
+    """A label with no warm timestamp (cold) gets the base timeout --
+    unchanged legacy behavior (router exemption is warm-only)."""
+    label = "a0_venice/__never_warm_test__"
+    _fb_mod._WARM_LABELS.pop(label, None)
+    try:
+        got = _fb_mod._resolve_per_call_timeout(
+            label, base_timeout_s=300.0, warm_timeout_s=20.0, warm_window_s=600.0,
+        )
+        assert got == 300.0, f"cold label must use base (300s), got {got}"
+    finally:
+        _fb_mod._WARM_LABELS.pop(label, None)

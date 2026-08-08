@@ -45,6 +45,13 @@ description: >
   specific requested model; a 429 on a free model is a real free-tier
   limit) and stays ``free_per_minute``. See AGENTS.md "v2.6.2 -- Router
   capacity class".
+  (v2.6.3) the per-call warm/cold timeout is capacity-aware: ``router``
+  labels (omniroute/*) skip the aggressive 20s warm fast-path and use the
+  cold base ceiling, because a self-healing gateway routing free/slow
+  upstream tiers is not a fast warm cloud call -- the 20s warm ceiling
+  was timing out the OmniRoute utility model (auto/coding:free,
+  auto/best-coding-fast) in the "free coding fast" presets. See AGENTS.md
+  "v2.6.3 -- Router warm-timeout exemption".
   See AGENTS.md "v2.6 -- Adaptive fallback cascade".
   Note: the v2.2 standalone event-loop housekeeping loop (coroutine
   sweep + WebSocket keepalive pulse + stats tick) and the v2.3 second
@@ -52,7 +59,7 @@ description: >
   ``housekeeping_enabled`` and ``second_pulse_path_enabled`` keys are
   still accepted for back-compat but are no-ops at runtime.
   Self-contained plugin; no official file is modified.
-version: 2.6.2
+version: 2.6.3
 settings_sections:
   - agent
   - developer
