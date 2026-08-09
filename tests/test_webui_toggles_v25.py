@@ -13,14 +13,14 @@ These tests verify:
 * The nested section's ``enabled`` is honoured when the top-level
   key is absent.
 * The defaults match the conservative defaults documented in
-  ``AGENTS.md`` (utility_timeout_guard ON, webui_extensions_cache
-  ON, context_size_guard OFF, langchain_compat ON; the
-  ``housekeeping`` and ``second_pulse_path_enabled`` keys still
-  resolve to a default of True for back-compat but the runtime
-  ignores them — the loop was removed in v2.5).
+  ``AGENTS.md`` (utility_timeout_guard ON, context_size_guard OFF,
+  langchain_compat ON; the ``housekeeping`` and
+  ``second_pulse_path_enabled`` keys still resolve to a default of
+  True for back-compat but the runtime ignores them — the loop was
+  removed in v2.5).
 * The two helpers (per-piece toggle and second-pulse-path
   sub-toggle) have the right precedence rules.
-* Each of the 4 remaining extension-level ``_resolve_config``
+* Each of the 3 remaining extension-level ``_resolve_config``
   functions returns the early-disable dict when the toggle is OFF.
 
 The test does NOT touch the real framework; the extension
@@ -100,7 +100,6 @@ class TestResolveToggleTopLevelWins:
     @pytest.mark.parametrize("piece", [
         "utility_timeout_guard",
         "housekeeping",
-        "webui_extensions_cache",
         "context_size_guard",
         "langchain_compat",
     ])
@@ -111,7 +110,6 @@ class TestResolveToggleTopLevelWins:
     @pytest.mark.parametrize("piece", [
         "utility_timeout_guard",
         "housekeeping",
-        "webui_extensions_cache",
         "context_size_guard",
         "langchain_compat",
     ])
@@ -128,7 +126,6 @@ class TestResolveToggleFallback:
     @pytest.mark.parametrize("piece", [
         "utility_timeout_guard",
         "housekeeping",
-        "webui_extensions_cache",
         "context_size_guard",
         "langchain_compat",
     ])
@@ -139,7 +136,6 @@ class TestResolveToggleFallback:
     @pytest.mark.parametrize("piece", [
         "utility_timeout_guard",
         "housekeeping",
-        "webui_extensions_cache",
         "context_size_guard",
         "langchain_compat",
     ])
@@ -160,9 +156,6 @@ class TestResolveToggleDefaults:
 
     def test_housekeeping_default_on(self):
         assert toggles.resolve_toggle({}, "housekeeping") is True
-
-    def test_webui_extensions_cache_default_on(self):
-        assert toggles.resolve_toggle({}, "webui_extensions_cache") is True
 
     def test_context_size_guard_default_off(self):
         assert toggles.resolve_toggle({}, "context_size_guard") is False
@@ -275,18 +268,6 @@ class TestExtensionResolveConfigEarlyDisable:
             assert cfg.get("enabled") is True
             assert cfg.get("max_wait_s") == 90
             assert cfg.get("default_timeout_s") == 25
-
-    def test_webui_extensions_cache_disabled(self):
-        from usr.plugins._model_fallback.extensions.python._functions.run_ui.init_a0.start import (
-            _10_install_extensions_cache as mod,
-        )
-        with patch("helpers.plugins.get_plugin_config") as gpc:
-            gpc.return_value = {
-                "webui_extensions_cache_enabled": False,
-                "webui_extensions_cache": {"enabled": True, "ttl_s": 2.0},
-            }
-            cfg = mod._resolve_config()
-            assert cfg == {"enabled": False}
 
     def test_langchain_compat_disabled(self):
         from usr.plugins._model_fallback.extensions.python.agent_init import (

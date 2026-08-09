@@ -12,275 +12,266 @@
     </div>
 
     <div class="help-intro">
-      The Model Fallback System grew from a v2.0 cascade (rotate
-      through fallback models when one fails) into a v2.5 resilience
-      layer that also keeps the WebUI and event loop healthy. This
-      page is the user manual &mdash; it explains each piece in plain
-      English and tells you when (if ever) to disable it.
+      Agent Zero normally calls one model at a time. If that model is
+      rate-limited, times out, or errors, the run stops. The
+      <strong>Model Fallback System</strong> turns that single call into a
+      resilient rotation through your fallback candidates, then layers
+      optional "keep-alive" fixes on top so the agent loop and the WebUI
+      stay healthy under load. This page explains, in plain English, what
+      each piece does, when you'd use it, and when (if ever) to turn it off.
     </div>
 
     <div class="help-toc">
-      <a href="#overview">1. Overview</a>
-      <a href="#cascade">2. The model cascade (v2.0&ndash;v2.4)</a>
-      <a href="#features">3. Resilience features (v2.2&ndash;v2.4)</a>
-      <a href="#toggles">4. Per-feature toggles</a>
-      <a href="#when-to-disable">5. When to disable a feature</a>
-      <a href="#migration">6. Migration (upstream adds the equivalent)</a>
-      <a href="#observability">7. Observability &mdash; the stats endpoint</a>
+      <a href="#what">1. What this plugin is (and isn't)</a>
+      <a href="#how">2. How to use it</a>
+      <a href="#cascade">3. The model cascade</a>
+      <a href="#adaptive">4. The adaptive cascade (v2.6)</a>
+      <a href="#features">5. Resilience features (the toggles)</a>
+      <a href="#toggles">6. The toggle switches &amp; why they matter</a>
+      <a href="#two-layer">7. WebUI cache: where it moved (v2.6.6)</a>
+      <a href="#when-to-disable">8. When to disable a feature</a>
+      <a href="#migration">9. Migration (upstream adds the equivalent)</a>
+      <a href="#observability">10. Observability &mdash; the stats endpoint</a>
     </div>
 
     <!-- =========================================================== -->
-    <div class="help-section" id="overview">
-      <h3>1. Overview</h3>
-      <p>
-        What you get out of the box:
-      </p>
-      <ul>
-        <li><strong>Multi-cycle model rotation</strong> with cooldown
-          and per-session permanent-failure tracking. If your primary
-          model hits a 429, the cascade moves to the next fallback; if
-          it hits a 401/402/404, the cascade marks it broken for the
-          session and skips it on every later cycle.</li>
-        <li><strong>WebUI resilience</strong>: a TTL cache + circuit
-          breaker on the extensions lookup that throttles the
-          150&nbsp;ms polling storm.</li>
-        <li><strong>LLM error handling</strong>: a hard cap on hung
-          utility calls, an opt-in history trim for
-          <code>ContextOverflow</code> spirals, and a langchain
-          v0&nbsp;&rarr;&nbsp;v1 import shim for v1-only docker images.</li>
-      </ul>
-      <p>
-        v2.5 note: the standalone event-loop housekeeping loop
-        (coroutine sweep + WebSocket keepalive pulse + stats tick)
-        was removed &mdash; it was implemented the same day it
-        shipped, never tested, and manifested as a per-minute
-        <code>housekeeping loop not alive</code> respawn log line
-        with no user-visible benefit. The
-        <code>housekeeping_enabled</code> and
-        <code>second_pulse_path_enabled</code> settings are still
-        accepted for back-compat but are no-ops.
-      </p>
-      <p>
-        Every resilience feature can be toggled OFF independently.
-        The defaults are conservative; turn things ON only if you
-        see the symptoms the feature is designed to fix.
-      </p>
+    <div class="help-section" id="what">
+      <h3>1. What this plugin is (and isn't)</h3>
+      <p><strong>What it is:</strong> a self-contained resilience layer for
+        model calls. When your primary model fails, it automatically tries
+        the next one in your fallback list, manages cooldowns so a
+        rate-limited model isn't hammered, and keeps the surrounding
+        plumbing (the utility call, the memory recall task, langchain
+        imports) from freezing the agent.</p>
+      <p><strong>What it isn't:</strong> it does <em>not</em> choose your
+        models or edit your model config. It works with whatever
+        <code>FALLBACK</code> chain you already configured in Agent Zero.
+        If you have no fallback models configured, the cascade has nothing
+        to rotate to &mdash; the resilience features (timeout guard, shim)
+        still work, but the rotation part is a no-op.</p>
+      <p><strong>Self-contained:</strong> no official Agent Zero file is
+        modified. Everything is installed through Agent Zero's extension
+        hooks. Disabling the plugin (or toggling a feature off) restores
+        stock behavior.</p>
     </div>
 
     <!-- =========================================================== -->
-    <div class="help-section" id="cascade">
-      <h3>2. The model cascade (v2.0&ndash;v2.4)</h3>
-      <p>
-        When a model call fails, the cascade tries the next fallback
-        instead of giving up. The system classifies errors into:
-      </p>
+    <div class="help-section" id="how">
+      <h3>2. How to use it</h3>
+      <p>Open the plugin's settings panel (Settings &rarr; Plugins &rarr;
+        Model Fallback System &rarr; gear icon). You'll see three groups:</p>
       <ul>
-        <li><strong>Rate Limits (429)</strong> &mdash; the model is
-          placed on cooldown using the server's
-          <code>Retry-After</code> header. The cascade skips it
-          until the cooldown expires.</li>
-        <li><strong>Auth Failures (401/403)</strong> &mdash; permanent
-          skip for the entire session.</li>
-        <li><strong>Credit Depletion (402)</strong> &mdash; permanent
-          skip for the entire session.</li>
-        <li><strong>Model Not Found (404)</strong> &mdash; permanent
-          skip for the entire session.</li>
-        <li><strong>Context Overflow</strong> &mdash; detected from
-          the error message, permanent skip for the session.</li>
-        <li><strong>Invalid JSON</strong> &mdash; triggers rotation
-          to the next model (the agent retries with a different
-          parser path).</li>
-        <li><strong>Timeouts</strong> &mdash; retried with the next
-          model after a brief delay (the
-          <em>Utility-model timeout guard</em> sets the hard cap).</li>
+        <li><strong>Timeouts</strong> &mdash; how long to wait for a single
+          model response before moving on. <em>Per request</em>, not per
+          whole cascade.</li>
+        <li><strong>Fallback Cycles</strong> &mdash; how many full passes
+          through your fallback list to attempt before giving up, and the
+          pause between passes.</li>
+        <li><strong>Resilience features</strong> &mdash; independent
+          on/off switches for the optional fixes (see &sect;5). The
+          <span class="material-symbols-outlined" style="font-size:1rem;vertical-align:middle;">menu_book</span>
+          book icon reopens this page.</li>
       </ul>
-      <h4>Settings in this section</h4>
-      <ul>
-        <li><strong>Chat Model Timeout</strong> (default 300s) &mdash;
-          per-request timeout for chat calls. The cascade
-          counts each request, not the whole cascade.</li>
-        <li><strong>Utility Model Timeout</strong> (default 300s)
-          &mdash; per-request timeout for utility calls. Note that
-          the <em>Utility-model timeout guard</em> (below) sets a
-          second, outer cap; both apply.</li>
-        <li><strong>Inter-Model Delay</strong> (default 2s) &mdash;
-          pause between fallback attempts.</li>
-        <li><strong>Max Cycles</strong> (1&ndash;10, default 4) &mdash;
-          how many full passes through the fallback list before
-          the agent gives up.</li>
-        <li><strong>Cycle Delay</strong> (default 5s) &mdash; pause
-          between cycles.</li>
-      </ul>
-      <h4>Recommended presets</h4>
+      <p>Make your changes and hit <strong>Save</strong>. Most timeout /
+        cycle changes take effect on the next agent turn. The resilience
+        toggles take effect on the next server start (the install hooks
+        run at boot), except the context-size guard which re-reads its
+        config every turn.</p>
+      <h4>The quick presets</h4>
       <div class="recommendation">
         <div class="rec-label">Fast</div>
         <div class="rec-settings">2 cycles, 3s delay, 120s timeout</div>
-        <div class="rec-use">Good for testing with few fallbacks</div>
+        <div class="rec-use">Quick feedback while testing with a few fallbacks.</div>
       </div>
       <div class="recommendation">
         <div class="rec-label">Balanced</div>
         <div class="rec-settings">4 cycles, 5s delay, 300s timeout</div>
-        <div class="rec-use">Recommended for most use cases</div>
+        <div class="rec-use">Recommended for most setups.</div>
       </div>
       <div class="recommendation">
         <div class="rec-label">Thorough</div>
         <div class="rec-settings">4 cycles, 10s delay, 600s timeout</div>
-        <div class="rec-use">Best for production with many fallbacks</div>
+        <div class="rec-use">Production with many fallbacks and slow models.</div>
       </div>
+      <p class="muted-note">Note: each number field is clamped to its
+        valid range when you leave the box (blur or Enter) &mdash; e.g. a
+        timeout below 30s snaps up to 30, a max cycles above 10 snaps down
+        to 10, and an empty or non-numeric box falls back to the default.
+        The clamped value is what gets saved, so the runtime never sees an
+        out-of-range setting. (v2.6.5 fixed a bug where the box displayed
+        the clamp but saved the raw typed value.)</p>
+    </div>
+
+    <!-- =========================================================== -->
+    <div class="help-section" id="cascade">
+      <h3>3. The model cascade</h3>
+      <p>When a model call fails, the cascade tries the next fallback
+        instead of giving up. It classifies each error:</p>
+      <ul>
+        <li><strong>Rate limit (429)</strong> &mdash; the model goes on
+          cooldown using the server's <code>Retry-After</code> header (or a
+          tuned default when there is no header). The cascade skips it
+          until the cooldown expires, then retries it.</li>
+        <li><strong>Auth failure (401/403), credit depletion (402), model
+          not found (404), context overflow</strong> &mdash; marked
+          permanently broken for the session and skipped on every later
+          cycle. These won't fix themselves by retrying.</li>
+        <li><strong>Invalid JSON</strong> &mdash; rotates to the next
+          model (a different parser path is tried).</li>
+        <li><strong>Timeout / transient 5xx</strong> &mdash; retried with
+          the next model after a brief delay. The utility-model timeout
+          guard (&sect;5) sets the hard cap.</li>
+      </ul>
+      <p>If <em>every</em> candidate is permanently broken, the cascade
+        stops early instead of pointlessly cycling (the
+        <code>early_exit_on_all_permanent</code> knob). If every candidate
+        is only <em>rate-limited</em> (will recover), it enters
+        <strong>extended-retry mode</strong>: paced retry loops timed for
+        real-world reset windows (minutes to hours), so a 5-hour Ollama
+        limit or a daily credit reset doesn't hard-stop your run.</p>
+      <p>The cooldown store is in-memory and shared across agents in the
+        same process, so one agent's rate-limit doesn't silently re-fire
+        on another. A cross-agent "healthy label" signal (&sect;4) lets a
+        peer's success clear a stale cooldown sooner.</p>
+    </div>
+
+    <!-- =========================================================== -->
+    <div class="help-section" id="adaptive">
+      <h3>4. The adaptive cascade (v2.6)</h3>
+      <p>Five refinements, all wired into both the chat and utility
+        cascades:</p>
+      <ol>
+        <li><strong>Warm / cold per-call timeouts.</strong> The first call
+          to a label (within <code>cascade_warm_window_s</code>, default
+          10&nbsp;min) gets the full cold timeout. Subsequent calls within
+          the window get the short warm ceiling
+          (<code>cascade_warm_timeout_s</code>, default 20s). Cloud
+          providers return warm calls in 1&ndash;5s; a flat 300s timeout on
+          a warm call wastes minutes per candidate when several are hung.
+          A user-set <code>TIMEOUT=</code> kwarg still wins.</li>
+        <li><strong>Per-provider capacity inference.</strong> The cascade
+          classifies each label so "busy" isn't treated as "broken":
+          <ul>
+            <li><code>concurrent-paid</code> (local <code>ollama/*</code>)
+              &mdash; a 429 is a competing agent, so <em>no</em> cooldown is
+              written and primary-skip escalation is skipped.</li>
+            <li><code>router</code> (<code>omniroute/*</code>) &mdash; a
+              self-healing gateway that re-routes the next call. A 429
+              skips cooldown entirely; a 5xx gets a tiny
+              <code>router_cooldown_s</code> (default 5s). Router labels
+              are exempt from primary-skip escalation.</li>
+            <li><code>unlimited-paid</code> (<code>a0_venice/*</code>) &mdash;
+              normal cooldown handling.</li>
+            <li><code>free-per-minute</code> (everything else, incl.
+              OpenRouter free models) &mdash; a 429 is a real free-tier
+              limit; normal cooldown.</li>
+          </ul>
+        </li>
+        <li><strong>Stagnation backoff.</strong> When
+          <code>cycle_stagnation_threshold</code> consecutive full cycles
+          complete with zero successes (every model still in cooldown),
+          the cycle sleep is multiplied by <code>cycle_stagnation_factor</code>
+          to give quota-exhausted upstreams time to recover. One log line
+          per outage, not per cycle.</li>
+        <li><strong>No preempt of healthy calls.</strong> A
+          <code>CancelledError</code> (you stopped the run) is split from a
+          <code>TimeoutError</code> so an externally-cancelled but
+          otherwise-healthy call is not punished with a cooldown.</li>
+        <li><strong>Cross-agent healthy-label reset.</strong> When any
+          agent succeeds on a label, that label is marked healthy for
+          <code>health_horizon_s</code> (default 60s). Other agents'
+          cooldowns for the same label become eligible to be cleared
+          (only cleared, never overwritten) on their next cycle &mdash; so
+          one agent's rate-limit doesn't lock out a peer that needs the
+          same endpoint right now.</li>
+      </ol>
+      <p class="muted-note">v2.6.3: router-class labels
+        (<code>omniroute/*</code>) are <em>exempt</em> from the 20s warm
+        fast-path and always use the cold ceiling &mdash; a self-healing
+        gateway routing free/slow upstream tiers is not a fast warm cloud
+        call, and the 20s warm ceiling was timing out the OmniRoute
+        utility model in the "free coding fast" presets.</p>
+      <p class="muted-note">v2.6.4: when a warm call <em>does</em> time
+        out, the warm label is evicted so the retry uses the cold ceiling
+        instead of looping at the short warm timeout. Label-agnostic
+        (covers <code>omniroute/*</code> too); this is what actually
+        closes the 20s warm-loop lag.</p>
     </div>
 
     <!-- =========================================================== -->
     <div class="help-section" id="features">
-      <h3>3. Resilience features (v2.2&ndash;v2.4)</h3>
-      <p>
-        Six independent pieces. Each one targets a specific failure
-        mode in the WebUI / event-loop / LLM stack. The pieces share
-        no state with each other and can be toggled ON / OFF
-        independently.
-      </p>
+      <h3>5. Resilience features (the toggles)</h3>
+      <p>Three independent pieces, each targeting a specific failure mode.
+        They share no state and can be toggled on/off independently. The
+        defaults are conservative; turn a piece on only if you see the
+        symptom it fixes (most are already on by default).</p>
 
-      <h4>3.1 Utility-model timeout guard <span class="version-badge-inline">v2.2</span></h4>
-      <p>
-        <strong>Symptom it fixes:</strong> a hung utility call
-        (typically a slow ollama model on CPU) blocks the agent loop
-        indefinitely. The cascade's per-request timeout fires after
-        300s, but the agent has already given up; you see a frozen
-        WebUI.
-      </p>
-      <p>
-        <strong>What it does:</strong> wraps
+      <h4>5.1 Utility-model timeout guard <span class="version-badge-inline">v2.2</span></h4>
+      <p><strong>Symptom:</strong> a hung utility call (typically a slow
+        ollama model on CPU) blocks the agent loop indefinitely. The
+        cascade's per-request timeout eventually fires, but the WebUI has
+        already frozen.</p>
+      <p><strong>What it does:</strong> wraps
         <code>Agent.call_utility_model</code> in
         <code>asyncio.wait_for(...)</code> with a hard cap
-        (<code>max_wait_s</code>, default 120s). On timeout, the
-        inner litellm coroutine is best-effort closed (via the
-        <code>memory_hardening</code> plugin) and a
-        <code>RepairableException("utility_model_timeout")</code> is
-        raised so the LLM is told the utility failed.
-      </p>
-      <p>
-        <strong>Default:</strong> ON.
-      </p>
+        (<code>max_wait_s</code>, default 180s). On timeout it
+        best-effort closes the inner litellm coroutine and raises a
+        <code>RepairableException("utility_model_timeout")</code> so the
+        LLM is told the utility failed and can rephrase or skip.</p>
+      <p><strong>Default:</strong> ON.</p>
 
-      <h4>3.2 Event-loop housekeeping
+      <h4>5.2 Context-size guard <span class="version-badge-inline">v2.3</span></h4>
+      <p><strong>Symptom:</strong> when the conversation grows past the
+        utility model's context window, every utility candidate returns
+        <code>ContextOverflow</code>. The cascade can't recover in a
+        single cycle because the history is already too long.</p>
+      <p><strong>What it does:</strong> at
+        <code>message_loop_prompts_after</code>, if the total chars in
+        <code>loop_data.history_output</code> exceed
+        <code>max_chars</code> (default 50000), the oldest messages are
+        dropped until the budget is met, with a one-liner notice so the
+        LLM knows early turns were trimmed.</p>
+      <p><strong>Default:</strong> OFF. Trimming can confuse the LLM (it
+        loses the early conversation), so this is opt-in. Enable only when
+        you see cascading <code>ContextOverflow</code> across all utility
+        candidates in a single cycle.</p>
+
+      <h4>5.3 LangChain v0 &rarr; v1 import shim <span class="version-badge-inline">v2.4</span></h4>
+      <p><strong>Symptom:</strong>
+        <code>ModuleNotFoundError: No module named 'langchain.prompts'</code>
+        on langchain-v1-only Docker images. Agent Zero's
+        <code>helpers/call_llm.py</code> uses the v0 import path; langchain
+        v1 moved it to <code>langchain_core.prompts</code>.</p>
+      <p><strong>What it does:</strong> at process start / agent init,
+        registers <code>langchain_core.prompts</code> under the legacy
+        <code>langchain.prompts</code> path (and
+        <code>langchain_core.messages</code> under
+        <code>langchain.schema</code>) via <code>sys.modules</code>. A
+        no-op on langchain v0.x installs (the real module is left alone).</p>
+      <p><strong>Default:</strong> ON.</p>
+
+      <h4 class="removed">Removed: event-loop housekeeping loop
         <span class="version-badge-inline">v2.2</span>
         <span class="version-badge-inline" style="background: rgba(180, 60, 60, 0.25);">REMOVED in v2.5</span>
       </h4>
-      <p>
-        <strong>Removed in v2.5.</strong> The standalone
-        <code>while True</code> housekeeping loop (coroutine sweep,
-        WebSocket keepalive pulse, stats tick) and its job_loop
-        safety net were deleted. The loop was a same-day fix that
-        shipped before being tested, and the only symptom it ever
-        produced in practice was a per-minute
-        <code>housekeeping loop not alive, respawning</code> log
-        line with no user-visible benefit. The
+      <p>A standalone <code>while True</code> housekeeping loop (coroutine
+        sweep + WebSocket keepalive pulse + stats tick) shipped in v2.2
+        and was removed in v2.5 &mdash; it was a never-tested same-day fix
+        whose only real symptom was a per-minute
+        <code>housekeeping loop not alive, respawning</code> log line. The
         <code>housekeeping_enabled</code> and
-        <code>second_pulse_path_enabled</code> settings are still
-        accepted in <code>default_config.yaml</code> for
-        back-compat with hand-edited configs, but the toggle
-        resolver treats them as no-ops and the runtime ignores
-        them.
-      </p>
-      <p>
-        If a future agent-zero update ships an equivalent
-        housekeeping loop, you can leave both keys at their
-        default (<code>false</code>) and let the upstream one do
-        the work. No migration step is required.
-      </p>
-
-      <h4>3.3 WebUI extensions cache <span class="version-badge-inline">v2.2</span></h4>
-      <p>
-        <strong>Symptom it fixes:</strong> the WebUI calls
-        <code>/api/load_webui_extensions</code> whenever Alpine
-        re-renders an extension point. During page lifecycle
-        (init, settings open, plugin toggle, project switch) this
-        can fire 10+ times per second, and each call walks every
-        plugin's <code>extensions/webui/</code> folder via
-        <code>files.find_existing_paths_by_pattern</code>. With a
-        slow filesystem mount you get a positive-feedback storm
-        &mdash; the user sees it as "the WebUI is hanging."
-      </p>
-      <p>
-        <strong>What it does:</strong>
-      </p>
-      <ul>
-        <li><strong>TTL cache</strong> (default 2s) &mdash; at most
-          one filesystem walk per 2s, identical responses served
-          from RAM. Auto-busts on the extension watchdog
-          (plugin enable/disable, file edit) so user-visible
-          state stays fresh.</li>
-        <li><strong>Circuit breaker</strong> (default: open after
-          5 errors in 10s, recover after 30s) &mdash; when the
-          filesystem is slow enough that
-          <code>get_webui_extensions</code> itself raises, the
-          breaker opens and the wrapper returns <code>[]</code>
-          immediately for <code>recovery_s</code> seconds. Keeps
-          the WebUI responsive even when the framework's FS
-          layer is wedged.</li>
-      </ul>
-      <p>
-        <strong>Default:</strong> ON.
-      </p>
-
-      <h4>3.4 Context-size guard <span class="version-badge-inline">v2.3</span></h4>
-      <p>
-        <strong>Symptom it fixes:</strong> when the agent's
-        conversation grows past the utility model's context window,
-        every utility candidate returns
-        <code>ContextOverflow</code>. The cascade can't recover
-        from this in a single cycle because the chat history is
-        already too long.
-      </p>
-      <p>
-        <strong>What it does:</strong> at
-        <code>message_loop_prompts_after</code> it counts the
-        total characters in
-        <code>loop_data.history_output</code>. If the total
-        exceeds <code>max_chars</code> (default 50000), the
-        oldest messages are dropped until the budget is met, with
-        a one-liner notice injected so the LLM knows the early
-        turns were trimmed.
-      </p>
-      <p>
-        <strong>Default:</strong> OFF. Trimming can confuse the
-        LLM (it loses the early conversation), so this is
-        opt-in. Enable when you see cascading
-        <code>ContextOverflow</code> errors across all utility
-        candidates in a single cycle.
-      </p>
-
-      <h4>3.5 LangChain v0 &rarr; v1 import shim <span class="version-badge-inline">v2.4</span></h4>
-      <p>
-        <strong>Symptom it fixes:</strong>
-        <code>ModuleNotFoundError: No module named 'langchain.prompts'</code>
-        on langchain-v1-only docker images. The codebase still
-        uses the v0 import path in
-        <code>helpers/call_llm.py</code>; the v1 release moved
-        that module to <code>langchain_core.prompts</code>.
-      </p>
-      <p>
-        <strong>What it does:</strong> at <code>agent_init</code>
-        time, registers <code>langchain_core.prompts</code> under
-        the legacy <code>langchain.prompts</code> path (and
-        <code>langchain_core.messages</code> under
-        <code>langchain.schema</code>) via
-        <code>sys.modules</code>. The shim is a no-op on
-        langchain v0.x installs (the legacy module is already in
-        <code>sys.modules</code> and we leave it alone). A
-        sentinel attribute marks the shim so uninstall is clean.
-      </p>
-      <p>
-        <strong>Default:</strong> ON.
-      </p>
+        <code>second_pulse_path_enabled</code> keys are still accepted on
+        save for back-compat but are no-ops at runtime.</p>
     </div>
 
     <!-- =========================================================== -->
     <div class="help-section" id="toggles">
-      <h3>4. Per-feature toggles</h3>
-      <p>
-        Each feature has a top-level boolean on
-        <code>context.settings</code>:
-      </p>
+      <h3>6. The toggle switches &amp; why they matter</h3>
+      <p>Each feature has a top-level boolean on
+        <code>context.settings</code>. The switch you see is the real
+        value that gets saved &mdash; toggling and saving persists it to
+        <code>config.json</code> for the current scope (global / project /
+        agent profile).</p>
       <table class="toggle-table">
         <thead>
           <tr><th>Setting key</th><th>Default</th><th>Effect when OFF</th></tr>
@@ -289,159 +280,127 @@
           <tr>
             <td><code>utility_timeout_guard_enabled</code></td>
             <td>true</td>
-            <td>Utility call falls back to the cascade's
-              per-request timeout (300s). Hung calls can freeze
-              the loop longer.</td>
-          </tr>
-          <tr>
-            <td><code>housekeeping_enabled</code>
-              <span class="version-badge-inline" style="background: rgba(180, 60, 60, 0.25);">REMOVED</span></td>
-            <td>false</td>
-            <td>Setting is accepted for back-compat but is a
-              no-op. The standalone housekeeping loop was
-              deleted in v2.5; the job_loop safety net
-              respawn logic was also removed.</td>
-          </tr>
-          <tr>
-            <td><code>second_pulse_path_enabled</code>
-              <span class="version-badge-inline" style="background: rgba(180, 60, 60, 0.25);">REMOVED</span></td>
-            <td>false</td>
-            <td>Setting is accepted for back-compat but is a
-              no-op. The second <code>socketio.emit</code> pulse
-              path was removed together with the housekeeping
-              loop in v2.5.</td>
-          </tr>
-          <tr>
-            <td><code>webui_extensions_cache_enabled</code></td>
-            <td>true</td>
-            <td><code>get_webui_extensions</code> is called
-              directly. Polling storm returns on slow mounts.</td>
+            <td>Utility call falls back to the cascade's per-request
+              timeout. Hung calls can freeze the loop longer.</td>
           </tr>
           <tr>
             <td><code>context_size_guard_enabled</code></td>
             <td>false</td>
             <td>History is not trimmed. <code>ContextOverflow</code>
-              spirals must be fixed by other means (a smaller
-              model, shorter conversation).</td>
+              spirals must be fixed by other means (a smaller model,
+              shorter conversation).</td>
           </tr>
           <tr>
             <td><code>langchain_compat_enabled</code></td>
             <td>true</td>
-            <td>Shim is not installed. v0-style imports fail
-              with <code>ModuleNotFoundError</code> on v1-only
-              images.</td>
+            <td>Shim is not installed. v0-style imports fail with
+              <code>ModuleNotFoundError</code> on v1-only images.</td>
+          </tr>
+          <tr>
+            <td><code>housekeeping_enabled</code> /
+              <code>second_pulse_path_enabled</code>
+              <span class="version-badge-inline" style="background: rgba(180, 60, 60, 0.25);">REMOVED</span></td>
+            <td>false</td>
+            <td>Accepted on save for back-compat but no-ops at runtime
+              (the underlying loop was deleted in v2.5).</td>
           </tr>
         </tbody>
       </table>
-      <p>
-        Toggling the cache / shim / utility-timeout features
-        takes effect on the next server start (the install hooks
-        run at boot). Toggling the context-size-guard takes
-        effect on the next agent turn (the hook re-resolves the
-        config per call). The housekeeping and second-pulse-path
-        toggles are no-ops in v2.5 (the underlying loop is gone)
-        but the keys are still accepted on save.
-      </p>
-      <p>
-        The settings round-trip through
-        <code>helpers.plugins.get_plugin_config</code>, which
-        respects the framework's per-project / per-agent /
-        global resolution chain. The
-        <code>config.json</code> you see in the project
-        directory is the persisted form.
-      </p>
+      <p class="muted-note">v2.6.5 fixed a bug where the toggle switches
+        did not save: the panel previously bound each switch with both
+        <code>x-model</code> and <code>:checked</code>, an Alpine
+        anti-pattern where the one-way <code>:checked</code> fought the
+        two-way <code>x-model</code>, so a click never committed and every
+        switch reopened OFF. Switches now use <code>x-model</code> only
+        and missing keys are backfilled to their effective default on
+        open, so a default-ON feature displays ON even when the loaded
+        config predates the toggle.</p>
+    </div>
+
+    <!-- =========================================================== -->
+    <div class="help-section" id="two-layer">
+      <h3>7. WebUI cache: where it moved (v2.6.6)</h3>
+      <p>The server-side WebUI extensions cache (the 2s TTL cache +
+        non-lossy circuit breaker on <code>get_webui_extensions</code>)
+        used to live in this plugin as the
+        <code>webui_extensions_cache_enabled</code> toggle. In v2.6.6 it
+        was <strong>migrated to the <code>ui_loader_optimizer</code>
+        plugin</strong> (v3.5.0), which already owned the complementary
+        client-side <code>fetch</code> coalescing. The two layers now live
+        in one plugin and compose multiplicatively &mdash; the client
+        never sends duplicate calls, the server never re-walks the
+        filesystem for the calls that do arrive. Configure it there under
+        Settings &rarr; Developer &rarr; UI load optimizer &rarr;
+        <em>Server-side extension cache</em>.</p>
+      <p class="muted-note">If you develop a plugin and need zero-delay
+        feedback on file saves, temporarily turn off that server-side
+        cache (the 2s TTL can hide edits for up to 2s); the client
+        coalescing can stay on.</p>
     </div>
 
     <!-- =========================================================== -->
     <div class="help-section" id="when-to-disable">
-      <h3>5. When to disable a feature</h3>
+      <h3>8. When to disable a feature</h3>
 
-      <h4>Disable the utility-model timeout guard if:</h4>
+      <h4>Utility-model timeout guard</h4>
       <ul>
         <li>You see <code>RepairableException("utility_model_timeout")</code>
-          in the agent log on a model that is actually producing
-          slow but correct output (raise <code>max_wait_s</code>
-          instead).</li>
-        <li>You use a non-ollama utility model with a known slow
-          first-byte time (raise the cap, or disable).</li>
+          on a model that is actually producing slow-but-correct output.
+          Raise <code>max_wait_s</code> first; disable only if that isn't
+          enough.</li>
       </ul>
 
-      <h4>Disable the WebUI extensions cache if:</h4>
+      <h4>Context-size guard</h4>
       <ul>
-        <li>You develop a plugin and need zero-delay feedback
-          when you save a file. The 2s TTL will hide edits for
-          up to 2 seconds. The auto-bust on file-watch should
-          catch most cases; if it doesn't, disable the cache
-          during plugin development and re-enable when done.</li>
+        <li>The LLM forgets early instructions after a trim. The notice
+          injection helps but is not a substitute for an actually-fitting
+          context; the right fix is usually a larger model window or a
+          shorter conversation.</li>
       </ul>
 
-      <h4>Disable the context-size guard if:</h4>
+      <h4>LangChain shim</h4>
       <ul>
-        <li>You see the LLM forgetting early instructions after
-          a trim. The notice injection helps but is not a
-          substitute for an actually-fitting context. The right
-          fix is usually a larger model window or a shorter
-          conversation.</li>
-      </ul>
-
-      <h4>Disable the langchain shim if:</h4>
-      <ul>
-        <li>You are on langchain v0.x and the shim causes
-          surprising behavior (it shouldn't &mdash; the shim is
-          a no-op when the v0 module is already in
-          <code>sys.modules</code>). Disable to remove the
-          indirection.</li>
+        <li>You're on langchain v0.x and want to remove the indirection.
+          The shim is a no-op when the v0 module is already in
+          <code>sys.modules</code>, so this is rarely necessary.</li>
       </ul>
     </div>
 
     <!-- =========================================================== -->
     <div class="help-section" id="migration">
-      <h3>6. Migration (upstream adds the equivalent)</h3>
-      <p>
-        If a future agent-zero release ships its own equivalent of
-        one of these features, the recommended migration is:
-      </p>
+      <h3>9. Migration (upstream adds the equivalent)</h3>
+      <p>If a future Agent Zero release ships its own equivalent of one of
+        these features, the recommended migration is:</p>
       <ol>
         <li>Toggle OFF the matching feature in this plugin.</li>
         <li>Restart the server.</li>
-        <li>Confirm the upstream equivalent is active (e.g. the
-          new keepalive ping in the server logs).</li>
-        <li>If the migration is permanent, the corresponding
-          helper file can be deleted:
+        <li>Confirm the upstream equivalent is active (e.g. a new
+          keepalive ping in the server logs).</li>
+        <li>If the migration is permanent, the corresponding helper file
+          can be deleted:
           <ul>
             <li><code>helpers/utility_timeout.py</code></li>
-            <li><code>helpers/webui_extensions_cache.py</code></li>
             <li><code>helpers/langchain_compat.py</code></li>
             <li>the context-size-guard extension
               (<code>extensions/python/message_loop_prompts_after/_10_context_size_guard.py</code>)</li>
           </ul>
         </li>
       </ol>
-      <p>
-        Migration notes are also in
-        <code>AGENTS.md</code> under each feature's section.
-      </p>
+      <p>Full per-version design notes and migration guidance live in
+        <code>AGENTS.md</code>.</p>
     </div>
 
     <!-- =========================================================== -->
     <div class="help-section" id="observability">
-      <h3>7. Observability &mdash; the stats endpoint</h3>
-      <p>
-        Read-only counters are exposed at
-        <code>GET /api/plugins/_model_fallback/stats</code>:
-      </p>
+      <h3>10. Observability &mdash; the stats endpoint</h3>
+      <p>Read-only counters are exposed at
+        <code>GET /api/plugins/_model_fallback/stats</code>:</p>
       <pre class="example-flow">{
-  "version": "2.5.0",
+  "version": "2.6.6",
   "utility_timeout": {
     "calls_total": 89,
     "timeouts_total": 3,
     "max_observed_wait_s": 67.2
-  },
-  "extensions_cache": {
-    "hits": 1842,
-    "misses": 312,
-    "circuit_open": false,
-    "hit_rate": 0.855
   },
   "context_size_guard": {
     "trims": 0,
@@ -455,12 +414,9 @@
     }
   }
 }</pre>
-      <p>
-        The endpoint inherits the framework's
-        <code>requires_auth=True</code> &mdash; the WebUI's
-        logged-in session passes that transparently. The
-        endpoint is read-only; no POST/PUT.
-      </p>
+      <p>The endpoint inherits the framework's
+        <code>requires_auth=True</code> &mdash; the WebUI's logged-in
+        session passes that transparently. It is read-only; no POST/PUT.</p>
     </div>
 
   </div>
@@ -541,6 +497,10 @@
     gap: 8px;
   }
 
+  .help-section h4.removed {
+    color: var(--color-text-muted);
+  }
+
   .version-badge-inline {
     background: rgba(120, 120, 120, 0.18);
     color: var(--color-text-muted);
@@ -567,6 +527,16 @@
 
   .help-section li {
     margin-bottom: 4px;
+  }
+
+  .help-section .muted-note {
+    background: var(--color-input);
+    border: 1px solid var(--color-border);
+    border-radius: 6px;
+    padding: 8px 12px;
+    font-size: 0.8rem;
+    color: var(--color-text-muted);
+    margin-top: 10px;
   }
 
   .toggle-table {

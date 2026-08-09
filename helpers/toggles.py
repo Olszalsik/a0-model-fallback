@@ -10,9 +10,9 @@ wins** so the WebUI always reflects what the user just toggled.
 
 Why a single helper module
 --------------------------
-Four pieces read config (utility_timeout_guard, webui_extensions_cache,
-context_size_guard, langchain_compat) and each used to copy the
-same ``cfg.get("<piece>")`` pattern. With the new top-level keys,
+Three pieces read config (utility_timeout_guard, context_size_guard,
+langchain_compat) and each used to copy the same
+``cfg.get("<piece>")`` pattern. With the new top-level keys,
 the resolution order becomes:
 
     1. ``<piece>_enabled`` (top-level) — the WebUI toggle.
@@ -58,7 +58,6 @@ from typing import Any, Dict, Optional
 _PIECE_TOGGLES = {
     "utility_timeout_guard": "utility_timeout_guard_enabled",
     "housekeeping": "housekeeping_enabled",  # ignored at runtime; back-compat only
-    "webui_extensions_cache": "webui_extensions_cache_enabled",
     "context_size_guard": "context_size_guard_enabled",
     "langchain_compat": "langchain_compat_enabled",
 }
@@ -105,7 +104,6 @@ def resolve_toggle(
 _BUILTIN_DEFAULTS: Dict[str, bool] = {
     "utility_timeout_guard": True,   # ON; cascade alone is not enough for slow ollama CPU
     "housekeeping": True,            # ignored at runtime; back-compat default (no loop exists)
-    "webui_extensions_cache": True,  # ON; polling storm is the dominant WebUI freeze cause
     "context_size_guard": False,     # OFF; opt-in because aggressive trimming can confuse the LLM
     "langchain_compat": True,        # ON; shim is a no-op on langchain v0.x
 }

@@ -10,10 +10,10 @@ Responses endpoint, the cascade rotates through your fallback candidates and
 keeps the agent running. When *every* candidate is rate-limited, it enters an
 extended-retry mode paced for real-world reset windows (minutes to hours) instead
 of hard-stopping. It also hardens the surrounding pieces that break under load:
-the utility-model outer timeout, the WebUI extension polling storm, the memory
-plugin's recall task, and the langchain v0→v1 import gap.
+the utility-model outer timeout, the memory plugin's recall task, and the
+langchain v0→v1 import gap.
 
-**Version:** 2.6.2 · **Self-contained:** no official agent-zero file is modified ·
+**Version:** 2.6.6 · **Self-contained:** no official agent-zero file is modified ·
 **Configurable:** per-project and per-agent
 
 ---
@@ -33,8 +33,8 @@ the next candidate; on a permanent error (auth, quota, model-not-found) it marks
 the candidate dead for the cycle. The cooldown store is in-memory and shared
 across agents in the same process, so one agent's rate-limit doesn't silently
 re-fire on another. Everything else the plugin does — the outer timeout guard,
-the WebUI cache, the memory patches, the langchain shim, the per-feature toggles
-— is layered on top of that core cascade.
+the memory patches, the langchain shim, the per-feature toggles — is layered on
+top of that core cascade.
 
 No official agent-zero source file is edited. All behavior is installed through
 agent-zero's extension hooks (`agent_init`, `*_model_call_before`,
@@ -47,6 +47,10 @@ two `Agent.*` monkey-patches.
 
 | Version | Feature |
 |---|---|
+| **v2.6.6** | **Migrated the server-side WebUI extensions cache to `ui_loader_optimizer` v3.5.0.** The 2s TTL cache + non-lossy circuit breaker on `get_webui_extensions` (and its `webui_extensions_cache_enabled` toggle) moved to the UI Loader Optimizer plugin, which already owned the complementary client-side `fetch` coalescing — the two layers now live in one plugin. This plugin retains the utility-timeout guard, context-size guard, langchain shim, and the cascade. Removed the `webui_extensions_cache` helper, its `run_ui/init_a0/start` install hook, the `_EXTENSIONS_CACHE` counter group, and the `extensions_cache` stats block; fixed the stale hard-coded stats-endpoint version (`2.5.0` → `2.6.6`). |
+| **v2.6.5** | **Settings-panel hardening + icon.** (1) The resilience toggle switches now actually save — the panel previously bound each switch with both `x-model` and `:checked`, an Alpine anti-pattern where the one-way `:checked` fought the two-way `x-model`, so clicks never committed and every switch reopened OFF. Switches use `x-model` only and missing keys are backfilled to their effective default on open. (2) The number fields (timeouts / cycles / delays) now save the *clamped* value: previously the box displayed the clamp via `:value` while `x-model` held the raw typed value, so Save persisted e.g. `5` for a timeout that displayed `30`. The `:value` binding is replaced with an `@change` clamp that writes the bounded value back to the same key. Added a plugin-card thumbnail. Rewrote the in-app user manual. *(The non-lossy WebUI cache breaker and the `ttl_s: 0` fix shipped in this row were migrated to `ui_loader_optimizer` in v2.6.6.)* |
+| **v2.6.4** | **Warm-label eviction on timeout** — when a warm call times out, the warm label is evicted so the retry uses the cold ceiling instead of looping at the short warm timeout. Label-agnostic (covers `omniroute/*` too); closes the 20s warm-loop lag. *(Shipped in code at commit `f3f6f53`; the `plugin.yaml` manifest version had lagged at 2.6.3 and is caught up by 2.6.5.)* |
+| **v2.6.3** | **Router warm-timeout exemption** — `router`-class labels (`omniroute/*`) skip the aggressive 20s warm fast-path and use the cold base ceiling, because a self-healing gateway routing free/slow upstream tiers is not a fast warm cloud call. The 20s warm ceiling was timing out the OmniRoute utility model (`auto/coding:free`, `auto/best-coding-fast`) in the "free coding fast" presets. |
 | **v2.6.2** | **Router capacity class** — `omniroute/*` (self-healing gateways) get no cooldown on 429 and a tiny `router_cooldown_s` (default 5s) on 5xx, and are exempt from primary-skip escalation, so the cascade retries the router within seconds instead of locking it out for minutes. OpenRouter stays `free_per_minute`. |
 | **v2.6** | **Adaptive fallback cascade** — per-candidate warm/cold timeouts, per-provider capacity inference, stagnation backoff, no-preempt of cancelled-but-healthy calls, cross-agent healthy-label reset. See [below](#the-v26-adaptive-cascade). |
 | v2.5.2 | Rate-limit cooldown tuning (no-`Retry-After` 429s) + cross-agent healthy-label reset. |
@@ -54,7 +58,7 @@ two `Agent.*` monkey-patches.
 | v2.5 | Per-feature WebUI toggles + user manual; each piece can be turned OFF independently as upstream agent-zero adds equivalents. |
 | v2.4 | LangChain v0→v1 import compatibility shim (default ON) so `helpers/call_llm.py`'s v0-style imports resolve on langchain v1-only Docker images. |
 | v2.3 | Opt-in chat-history trim when the prompt exceeds `max_chars` (kills the "every utility model returns ContextOverflow" death spiral). |
-| v2.2 | Outer timeout guard on `call_utility_model` + TTL cache + circuit breaker on the `get_webui_extensions` polling storm. |
+| v2.2 | Outer timeout guard on `call_utility_model` + TTL cache + circuit breaker on the `get_webui_extensions` polling storm. *(The cache + breaker migrated to `ui_loader_optimizer` in v2.6.6; the timeout guard remains here.)* |
 | core | Multi-cycle fallback, rate-limit evasion, permanent-failure detection, cooldown management, memory-plugin resilience, Responses→chat-completions fallback. |
 
 ---
@@ -151,7 +155,6 @@ supported; the settings surface lives under the `agent` and `developer` sections
 | `responses_5xx_retry_enabled` | `true` | Reactively retry a Responses 5xx once on chat-completions, then sticky. |
 | `memory_recall_timeout_s` | `90` | Memory plugin recall timeout (core default 30). |
 | `utility_timeout_guard_enabled` | `true` | Outer timeout on `call_utility_model`. |
-| `webui_extensions_cache_enabled` | `true` | TTL cache + circuit breaker on extension lookup. |
 | `context_size_guard_enabled` | `false` | Opt-in history trim on ContextOverflow spiral. |
 | `langchain_compat_enabled` | `true` | v0→v1 import shim. |
 
@@ -177,11 +180,21 @@ The plugin ships a config panel and a user manual:
 
 - `webui/config.html` — per-feature toggles (each piece can be turned OFF).
 - `webui/help.html` — the user manual (also served as the plugin's help page).
-- `webui/fallback-store.js` — the fallback-spec editor/store front-end.
+- `webui/fallback-store.js` — the settings store front-end (toggle resolution + backfill).
+- `webui/thumbnail.png` — the plugin-card icon (generated by `scripts/gen_model_fallback_thumbnail.py`).
 
 The WebUI binds to the top-level flat keys (e.g.
-`utility_timeout_guard_enabled`); the nested per-piece `enabled` flags are still
-honoured for back-compat.
+`utility_timeout_guard_enabled`) with `x-model` only; the nested per-piece
+`enabled` flags are still honoured for back-compat. Missing top-level keys are
+backfilled to their resolved default on open (v2.6.5), so a default-ON feature
+displays ON even when the loaded config predates the toggle.
+
+> **WebUI extensions cache moved (v2.6.6):** the server-side TTL cache +
+> circuit breaker on `get_webui_extensions` used to live here as the
+> `webui_extensions_cache_enabled` toggle. It migrated to the **UI Loader
+> Optimizer** plugin (v3.5.0), which already owned the complementary
+> client-side `fetch` coalescing — the two layers now live in one plugin. See
+> `help.html` §7.
 
 ---
 

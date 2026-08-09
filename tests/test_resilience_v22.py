@@ -1,9 +1,12 @@
 """Tests for the v2.2 resilience layer of the `_model_fallback` plugin.
 
-Covers the remaining two pieces (v2.5: the third piece,
-``housekeeping``, was removed together with the loop):
+Covers the remaining piece (v2.5: the housekeeping loop and v2.6.6: the
+webui_extensions_cache were both removed/migrated):
 * utility_timeout.guarded_call (timeout, success, lazy close_inner_coro)
-* webui_extensions_cache (TTL, bust, circuit breaker)
+
+The server-side WebUI extensions cache (TTL + circuit breaker) was
+migrated to the ``ui_loader_optimizer`` plugin in v2.6.6; its tests now
+live in ``usr/plugins/ui_loader_optimizer/tests/test_extension_cache.py``.
 
 The tests do NOT touch the real framework; everything is mocked
 or run in isolation. To run:
@@ -171,127 +174,15 @@ async def test_utility_timeout_closes_inner_coro_on_timeout():
 
 
 # ---------------------------------------------------------------------------
-# Test the webui_extensions_cache
-# ---------------------------------------------------------------------------
-
-from usr.plugins._model_fallback.helpers import webui_extensions_cache  # noqa: E402
-
-
-@pytest.fixture(autouse=False)
-def _reset_cache():
-    webui_extensions_cache.reset()
-    yield
-    webui_extensions_cache.reset()
-    try:
-        webui_extensions_cache.uninstall()
-    except Exception:  # noqa: BLE001
-        pass
-
-
-def test_extensions_cache_hits_within_ttl(_reset_cache):
-    """Identical requests within the TTL window are served from the cache."""
-    cfg = webui_extensions_cache.resolve_config({
-        "enabled": True, "ttl_s": 2.0,
-        "circuit_breaker_enabled": False,
-    })
-    calls = {"n": 0}
-
-    def _original(agent, extension_point, filters):
-        calls["n"] += 1
-        return [f"ext_{calls['n']}"]
-
-    wrapper = webui_extensions_cache._build_wrapper(_original, lambda: cfg)
-    # First call -> miss
-    v1 = wrapper(None, ["page-head"], None)
-    assert v1 == ["ext_1"]
-    assert calls["n"] == 1
-    # Second call same args -> hit
-    v2 = wrapper(None, ["page-head"], None)
-    assert v2 == ["ext_1"]
-    assert calls["n"] == 1
-    snap = _stats.extensions_cache_snapshot()
-    assert snap["hits"] == 1
-    assert snap["misses"] == 1
-
-
-def test_extensions_cache_bust_invalidates(_reset_cache):
-    """``bust()`` clears the cache; the next call re-fetches."""
-    cfg = webui_extensions_cache.resolve_config({
-        "enabled": True, "ttl_s": 10.0,
-        "circuit_breaker_enabled": False,
-    })
-    calls = {"n": 0}
-
-    def _original(agent, extension_point, filters):
-        calls["n"] += 1
-        return [f"v{calls['n']}"]
-
-    wrapper = webui_extensions_cache._build_wrapper(_original, lambda: cfg)
-    wrapper(None, ["p"], None)
-    wrapper(None, ["p"], None)
-    assert calls["n"] == 1
-    webui_extensions_cache.bust()
-    wrapper(None, ["p"], None)
-    assert calls["n"] == 2
-    assert _stats.extensions_cache_snapshot()["busts"] >= 1
-
-
-def test_extensions_cache_circuit_breaker_opens_then_recovers(_reset_cache):
-    """A burst of errors opens the circuit; after recovery_s it closes."""
-    cfg = webui_extensions_cache.resolve_config({
-        "enabled": True, "ttl_s": 0.0,
-        "circuit_breaker_enabled": True,
-        "circuit_breaker_window_s": 60.0,
-        "circuit_breaker_threshold": 3,
-        "circuit_breaker_recovery_s": 0.1,  # 100ms for the test
-    })
-
-    def _original_raises(agent, extension_point, filters):
-        raise RuntimeError("fs wedged")
-
-    wrapper = webui_extensions_cache._build_wrapper(_original_raises, lambda: cfg)
-    # Three failing calls open the breaker.
-    for _ in range(3):
-        v = wrapper(None, ["p"], None)
-        assert v == []  # still returns [] (graceful)
-    snap = _stats.extensions_cache_snapshot()
-    assert snap["circuit_open_count"] >= 1
-    # The fourth call should short-circuit (no error raised this time).
-    snap_before = _stats.extensions_cache_snapshot()
-    v = wrapper(None, ["p"], None)
-    assert v == []
-    snap_after = _stats.extensions_cache_snapshot()
-    assert snap_after["circuit_short_circuits"] == snap_before["circuit_short_circuits"] + 1
-    # Wait for recovery.
-    time.sleep(0.15)
-    # Next call should hit the original again (which raises).
-    v = wrapper(None, ["p"], None)
-    assert v == []
-
-
-def test_extensions_cache_disabled_is_pass_through(_reset_cache):
-    """When disabled, the wrapper calls the original on every request."""
-    cfg = webui_extensions_cache.resolve_config({"enabled": False})
-    calls = {"n": 0}
-
-    def _original(agent, extension_point, filters):
-        calls["n"] += 1
-        return [f"v{calls['n']}"]
-
-    wrapper = webui_extensions_cache._build_wrapper(_original, lambda: cfg)
-    wrapper(None, ["p"], None)
-    wrapper(None, ["p"], None)
-    assert calls["n"] == 2
-    assert _stats.extensions_cache_snapshot()["hits"] == 0
-    assert _stats.extensions_cache_snapshot()["misses"] == 0
-
-
-# ---------------------------------------------------------------------------
 # v2.5: the standalone housekeeping loop was removed. Tests for the
 # housekeeping module (and the WS-pulse two-path code that lived in
 # it) were deleted together with the module. The stats endpoint no
 # longer exposes a ``housekeeping`` block; the contract is asserted
 # below in ``test_stats_snapshot_shape``.
+#
+# v2.6.6: the webui_extensions_cache tests were moved to
+# ``usr/plugins/ui_loader_optimizer/tests/test_extension_cache.py``
+# when the cache was migrated to that plugin.
 # ---------------------------------------------------------------------------
 
 
@@ -335,18 +226,16 @@ def test_install_utility_timeout_patch_idempotent():
 
 
 def test_stats_snapshot_shape():
-    """v2.5: only the two remaining counter groups are exposed.
-    The ``housekeeping`` group was removed together with the loop.
+    """v2.6.6: only the utility_timeout counter group remains. The
+    ``housekeeping`` group was removed in v2.5; the ``extensions_cache``
+    group was removed in v2.6.6 (cache migrated to ui_loader_optimizer).
     """
     snap_ut = _stats.utility_timeout_snapshot()
-    snap_ec = _stats.extensions_cache_snapshot()
     for key in ("calls_total", "timeouts_total", "max_observed_wait_s"):
         assert key in snap_ut, f"utility_timeout missing {key}"
-    for key in ("hits", "misses", "errors", "circuit_open", "circuit_open_count"):
-        assert key in snap_ec, f"extensions_cache missing {key}"
-    # Sanity: ``reset`` only touches the two groups that still exist.
+    # The extensions_cache accessors are gone for good.
+    assert not hasattr(_stats, "extensions_cache_snapshot")
+    # Sanity: ``reset`` only touches the group that still exists.
     _stats.reset()
     snap_ut2 = _stats.utility_timeout_snapshot()
-    snap_ec2 = _stats.extensions_cache_snapshot()
     assert snap_ut2["calls_total"] == 0
-    assert snap_ec2["hits"] == 0

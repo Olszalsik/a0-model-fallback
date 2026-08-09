@@ -103,11 +103,15 @@ async def pre_update():
 async def uninstall():
     """Plugin disable / process-shutdown hook.
 
-    v2.4 update: the resilience layer (extensions cache, utility
-    timeout monkey-patch, langchain import shim) holds process-global
-    resources that must be released on disable so a re-enable starts
-    fresh. Per-agent cooldown / retry state still survives the
-    disable/re-enable cycle by design (see the v0.x.x comment).
+    v2.4 update: the resilience layer (utility timeout monkey-patch,
+    langchain import shim) holds process-global resources that must
+    be released on disable so a re-enable starts fresh. Per-agent
+    cooldown / retry state still survives the disable/re-enable cycle
+    by design (see the v0.x.x comment).
+
+    v2.6.6 update: the server-side WebUI extensions cache was migrated
+    to the ``ui_loader_optimizer`` plugin (v3.5.0); its uninstall is
+    no longer handled here.
 
     v2.5 update: the standalone housekeeping loop and its helper
     module were removed (it was a never-tested same-day fix that
@@ -122,13 +126,6 @@ async def uninstall():
             _10_install_utility_timeout_patch,
         )
         _10_install_utility_timeout_patch.uninstall()
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        from usr.plugins._model_fallback.helpers import (
-            webui_extensions_cache,
-        )
-        webui_extensions_cache.uninstall()
     except Exception:  # noqa: BLE001
         pass
     try:

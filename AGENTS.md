@@ -29,8 +29,6 @@ cascade. They live here (not in separate plugins) so a single
 
 * v2.2 Piece 1 — outer timeout guard on `call_utility_model` (catches
   hung utility calls that the cascade's own timeout misses).
-* v2.2 Piece 2 — TTL cache + circuit breaker on `get_webui_extensions`
-  (breaks the 150ms WebUI polling storm).
 * v2.3 Piece A — opt-in context-size guard on the live
   `loop_data.history_output` (prevents the all-models-ContextOverflow
   cascade death-spiral).
@@ -244,7 +242,6 @@ catches `Exception` and no-ops).
 - Plugin config: `usr/plugins/_model_fallback/config.json`
 - Patch entrypoint: `usr/plugins/_model_fallback/extensions/python/agent_init/_00_install_fallback_patches.py`
 - v2.2 timeout guard: `extensions/python/agent_init/_10_install_utility_timeout_patch.py` + `helpers/utility_timeout.py`
-- v2.2 extensions cache: `extensions/python/_functions/run_ui/init_a0/start/_10_install_extensions_cache.py` + `helpers/webui_extensions_cache.py`
 - v2.3 context-size guard: `extensions/python/message_loop_prompts_after/_10_context_size_guard.py` (the `trim_history` function is pure and testable)
 - v2.4 langchain v1 shim: `extensions/python/agent_init/_00_install_langchain_shim.py` + `helpers/langchain_compat.py`
 - Stats endpoint: `api/stats.py` (`GET /api/plugins/_model_fallback/stats`)
@@ -261,9 +258,11 @@ Originally three new pieces added in response to a WebSocket-disconnect
 investigation (see docker log: agent idle, 8 minutes of
 "WebSocket disconnected" with no recovery). The standalone
 event-loop housekeeping loop (Piece 2 in the original design)
-was removed in v2.5; the outer timeout guard (Piece 1) and the
-WebUI extensions cache (Piece 3 in the original design, now
-Piece 2) are still here. All remaining pieces are independent
+was removed in v2.5; the WebUI extensions cache (Piece 3 in the
+original design) was migrated to the `ui_loader_optimizer` plugin
+in v2.6.6 (it now owns both the server-side cache and the
+client-side fetch coalescing). Only the outer timeout guard
+(Piece 1) remains here. All remaining pieces are independent
 toggles in `default_config.yaml`; the existing `fallback.py`
 cascade is unchanged.
 
@@ -308,42 +307,26 @@ the function is renamed, update `_install()` in
 `_10_install_utility_timeout_patch.py` accordingly. The `_utility_timeout_patched`
 sentinel prevents double-install during refactors.
 
-### Piece 2 — `get_webui_extensions` TTL cache + circuit breaker
+### Piece 2 — `get_webui_extensions` TTL cache + circuit breaker (migrated v2.6.6)
 
-**Files:** `helpers/webui_extensions_cache.py`,
-`extensions/python/_functions/run_ui/init_a0/start/_10_install_extensions_cache.py`.
-
-The `get_webui_extensions` helper is monkey-patched at `init_a0/start`
-with a 2-second TTL cache. The cache is busted by an extension watchdog
-we register (same roots as the framework's own watchdog, so plugin
-enable/disable/file-edit is reflected immediately — no stale UI).
-
-The circuit breaker is the second defensive layer. When
-`get_webui_extensions` itself raises more than
-`circuit_breaker_threshold` (default 5) times in
-`circuit_breaker_window_s` (default 10s), the breaker opens and the
-wrapper returns `[]` immediately without touching the filesystem, for
-`circuit_breaker_recovery_s` (default 30s). This keeps the WebUI
-responsive when the framework's FS layer is wedged (e.g. on a slow
-network mount).
-
-**Why we patch the helper and not the endpoint:** `ApiHandler.process`
-is **not** `@extension.extensible` in v2.5 (verified in
-`helpers/api.py:33-90`). The endpoint's only real work is
-`extension.get_webui_extensions(...)`, so caching the helper gives a
-near-instant response with no framework changes. The patch is sentinel-
-guarded so re-running `init_a0` (e.g. test harness, plugin reload)
-preserves the original reference — the wrapper stack stays at exactly
-one layer.
-
-**Migration if upstream changes:** if a future agent-zero version adds
-a built-in TTL cache to `get_webui_extensions`, set
-`webui_extensions_cache.enabled: false` and delete
-`helpers/webui_extensions_cache.py` + the `init_a0/start` hook.
-The watchdog listener that busted the cache on file-watch events
-is registered in the same `init_a0/start` extension (the
-`init_a0/end` extension is gone in v2.5 together with the
-housekeeping loop).
+> **Migrated to `ui_loader_optimizer` v3.5.0.** The 2s TTL cache +
+> non-lossy circuit breaker on `get_webui_extensions` (and its
+> `webui_extensions_cache_enabled` toggle, the
+> `helpers/webui_extensions_cache.py` module, and the
+> `run_ui/init_a0/start/_10_install_extensions_cache.py` hook) moved to
+> the UI Loader Optimizer plugin, which already owned the complementary
+> client-side `fetch` coalescing. The two layers now live in one plugin
+> and compose multiplicatively. The self-contained cache module there
+> owns its own counters + `snapshot()`; this plugin's `helpers/stats.py`
+> no longer carries an `_EXTENSIONS_CACHE` group. See
+> `usr/plugins/ui_loader_optimizer/AGENTS.md` for the current design.
+>
+> Historical note: the original implementation here was a *lossy* breaker
+> (returned `[]` on repeated FS errors); the non-lossy stale-while-error
+> behavior was added in v2.6.5 and traveled with the migration. The
+> earlier docstring's claim that the cache "auto-busts on plugin
+> enable/disable/file-edit" was inaccurate — freshness was always
+> governed by the 2s TTL; `bust()` was a manual/test hook only.
 
 ### Stats endpoint
 
@@ -351,7 +334,7 @@ housekeeping loop).
 
 ```json
 {
-  "version": "2.5.0",
+  "version": "2.6.6",
   "utility_timeout": {
     "calls_total": 89,
     "timeouts_total": 3,
@@ -360,18 +343,6 @@ housekeeping loop).
     "last_timeout_model": "gemma4:31b",
     "close_inner_attempted": 3,
     "close_inner_succeeded": 3
-  },
-  "extensions_cache": {
-    "hits": 1842,
-    "misses": 312,
-    "errors": 0,
-    "circuit_opened_at": 0.0,
-    "circuit_open_count": 0,
-    "circuit_short_circuits": 0,
-    "last_error": "",
-    "busts": 7,
-    "circuit_open": false,
-    "hit_rate": 0.855
   },
   "context_size_guard": {
     "trims": 4,
@@ -399,8 +370,6 @@ endpoint is enough for a future tile to consume.)
 | Piece | Config key | Default | Disable by |
 |---|---|---|---|
 | Utility timeout guard | `utility_timeout_guard.enabled` | `true` | set to `false` |
-| Extensions cache | `webui_extensions_cache.enabled` | `true` | set to `false` (cache becomes pass-through) |
-| Circuit breaker | `webui_extensions_cache.circuit_breaker_enabled` | `true` | set to `false` (cache still works, breaker open) |
 | Context size guard (v2.3) | `context_size_guard.enabled` | `false` | set to `true` to enable (opt-in) |
 | LangChain v1 shim (v2.4) | `langchain_compat.enabled` | `true` | set to `false` (v0 users get a no-op install, no impact) |
 
@@ -410,12 +379,11 @@ so a hand-edited config does not raise on save.
 
 Disabling any one piece does not affect the others. The framework
 re-reads the config on the next call (no restart required for
-`utility_timeout_guard`, `webui_extensions_cache`,
-`context_size_guard`, and `langchain_compat`).
+`utility_timeout_guard`, `context_size_guard`, and `langchain_compat`).
 
 ### Why this is in `_model_fallback` and not its own plugin
 
-The user preferred to keep all four pieces in the existing plugin so
+The user preferred to keep all three pieces in the existing plugin so
 a single `.toggle-0` disables everything and a single config file
 holds the knobs. The pieces fall into two groups:
 
@@ -423,10 +391,11 @@ holds the knobs. The pieces fall into two groups:
   touch the LLM-call path directly and need to know the cascade's
   internals. Splitting them out would require duplicating config
   plumbing.
-* **Cascade-adjacent** (extensions cache, langchain shim): these
-  run before or after the cascade and are loosely coupled, but the
-  user preferred single-plugin symmetry
-  over per-piece independence.
+* **Cascade-adjacent** (langchain shim): runs before or after the
+  cascade and is loosely coupled, but the user preferred
+  single-plugin symmetry over per-piece independence. (The WebUI
+  extensions cache was the fourth piece until v2.6.6, when it
+  migrated to `ui_loader_optimizer` — see the Piece 2 note above.)
 
 If a future maintainer wants to split, the migration is
 straightforward: each piece is a single helper + a single
@@ -438,9 +407,10 @@ extension hook; nothing shares state across pieces.
 * `python scripts/scan_plugin_structure.py` — must stay at 0 findings
   (or only the pre-existing non-fatal ones).
 * `usr/plugins/_model_fallback/tests/test_resilience_v22.py` —
-  unit tests for the v2.2 layer (cache circuit breaker, timeout
-  guard's `close_inner_coro` lazy import). Housekeeping tests
-  were removed in v2.5.
+  unit tests for the v2.2 layer (timeout guard's `close_inner_coro`
+  lazy import; the cache circuit-breaker tests moved to
+  `ui_loader_optimizer/tests/test_extension_cache.py` in v2.6.6).
+  Housekeeping tests were removed in v2.5.
 * `usr/plugins/_model_fallback/tests/test_context_size_guard_v23.py` —
   11 unit tests for the v2.3 context-size guard.
 * `usr/plugins/_model_fallback/tests/test_langchain_compat_v24.py` —
@@ -613,10 +583,11 @@ assert langchain_compat.already_installed_in_process()
   process marker, user-module protection, uninstall, status
   shape, fallback target, location-in-_model_fallback invariant).
 * `usr/plugins/_model_fallback/tests/test_resilience_v22.py` —
-  tests for the v2.2 layer (cache circuit breaker, timeout
-  guard's `close_inner_coro` lazy import). The two-path
-  WebSocket pulse tests were removed in v2.5 together with
-  the housekeeping module that hosted them.
+  tests for the v2.2 layer (timeout guard's `close_inner_coro`
+  lazy import; the cache circuit-breaker tests moved to
+  `ui_loader_optimizer/tests/test_extension_cache.py` in v2.6.6).
+  The two-path WebSocket pulse tests were removed in v2.5 together
+  with the housekeeping module that hosted them.
 
 ### Migration (if upstream agent-zero adds an equivalent)
 
@@ -659,7 +630,6 @@ User-facing additions in v2.5:
 | `utility_timeout_guard_enabled` | true | Outer `asyncio.wait_for` on `Agent.call_utility_model` (`max_wait_s` default 120). |
 | `housekeeping_enabled` | false (v2.5) | **No-op in v2.5** — the standalone loop was removed. The key is still accepted for back-compat. |
 | `second_pulse_path_enabled` | false (v2.5) | **No-op in v2.5** — the second `socketio.emit` path was removed with the loop. The key is still accepted for back-compat. |
-| `webui_extensions_cache_enabled` | true | 2s TTL cache + circuit breaker on `get_webui_extensions`. |
 | `context_size_guard_enabled` | false | Opt-in history trim on `ContextOverflow` spirals. |
 | `langchain_compat_enabled` | true | `langchain.prompts` / `langchain.schema` v0 -> v1 import shim. |
 
@@ -693,11 +663,20 @@ cycles" and "Quick presets" sections. Each toggle is a
 `text-input`-free checkbox with a `version-badge` (v2.2 / v2.3
 / v2.4) and a one-paragraph description. The settings bind via
 the framework's standard `x-model="context.settings.<key>"`
-pattern; `webui/fallback-store.js` exposes
-`isEnabled(settings, piece)` and
-`isSecondPulsePathEnabled(settings)` for the `:checked`
-binding so the displayed state matches the resolved
-top-level-or-nested rule.
+pattern ONLY. **v2.6.5:** the panel previously paired `x-model`
+with a one-way `:checked="$store.modelFallback.isEnabled(...)"`
+binding — an Alpine anti-pattern where `:checked` fought
+`x-model` so a click never committed and every switch reopened
+OFF. The `:checked` binding (and the `isEnabled` /
+`isSecondPulsePathEnabled` helpers it used) were removed; the
+switches now rely on `x-model` alone, and `backfillToggles` (see
+the implementation-files list below) writes the resolved
+top-level-or-nested boolean onto `context.settings` at panel
+open so a default-ON feature whose key is absent from the loaded
+config still displays ON. The number fields likewise bind
+`x-model` to the raw key and clamp on `@change` via
+`clampField` (replacing the old `:value`-to-normalized-snapshot
+binding that displayed the clamp but saved the raw value).
 
 ### Restart requirements
 
@@ -706,7 +685,6 @@ top-level-or-nested rule.
 | `utility_timeout_guard_enabled` | next `agent_init` (next agent created, or server restart) |
 | `housekeeping_enabled` | **No-op in v2.5** — the loop is gone, so restart requirement is moot. |
 | `second_pulse_path_enabled` | **No-op in v2.5** — the second pulse path is gone. |
-| `webui_extensions_cache_enabled` | next `init_a0` (server restart) |
 | `context_size_guard_enabled` | next agent turn (the hook re-resolves per call) |
 | `langchain_compat_enabled` | next `agent_init` (next agent created, or server restart) |
 
@@ -725,9 +703,12 @@ summary:
   upstream one instead.
 * **Second pulse path** — *no longer a feature in v2.5*; the
   toggle is a no-op.
-* **WebUI extensions cache** — disable during plugin
-  development if the 2s TTL hides file edits. Re-enable when
-  done.
+* **WebUI extensions cache** — *migrated to `ui_loader_optimizer`
+  in v2.6.6*; the `webui_extensions_cache_enabled` key is no
+  longer read here. To disable the 2s TTL cache during plugin
+  development (if it hides file edits), toggle
+  `extensions_cache_enabled` in the UI Loader Optimizer config
+  and re-enable when done.
 * **Context-size guard** — disable if the trim confuses the
   LLM (it forgets early instructions). Try a larger model
   window or shorter conversation instead.
@@ -743,11 +724,16 @@ summary:
   extension's `_resolve_config` to short-circuit when the
   toggle is OFF.
 * `webui/fallback-store.js` — extends the existing Alpine
-  store with `isEnabled` / `isSecondPulsePathEnabled` /
-  `applyDefaults` helpers that mirror the Python resolution
-  rules exactly. The store keeps the existing
-  `getDefaults` / `normalizeSettings` / `openHelp` surface
-  intact.
+  store with helpers that mirror the Python resolution rules:
+  `backfillToggles(settings)` (writes the resolved boolean
+  for any MISSING `*_enabled` key so `x-model` reads the
+  effective state), `clampField(settings, key, min, max,
+  fallback, asInt)` (clamps a number field in place on
+  `@change`), plus `getDefaults` / `applyDefaults` /
+  `openHelp` / `ensureLoaded`. v2.6.5 removed the now-dead
+  `isEnabled` / `isSecondPulsePathEnabled` (only the removed
+  `:checked` binding used them) and `normalizeSettings` (only
+  the removed `:value` binding used it).
 * `webui/config.html` — adds the "Resilience features"
   section (6 toggles + advanced disclosure) and a help icon
   that opens `help.html` via the existing `$store.modelFallback.openHelp()`.
@@ -801,9 +787,11 @@ one of the v2.2-v2.4 features:
 5. If the migration is permanent, the corresponding helper
    file can be deleted:
    * `helpers/utility_timeout.py`
-   * `helpers/webui_extensions_cache.py`
    * `helpers/langchain_compat.py`
    * `extensions/python/message_loop_prompts_after/_10_context_size_guard.py`
+
+   (`helpers/webui_extensions_cache.py` was already removed in
+   v2.6.6 when the cache migrated to `ui_loader_optimizer`.)
 
 (`helpers/housekeeping.py` is already gone in v2.5; the
 `init_a0/end/_20_start_housekeeping_loop` and

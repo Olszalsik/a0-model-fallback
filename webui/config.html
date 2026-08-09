@@ -1,5 +1,5 @@
 <body>
-  <div x-data x-init="await $store.modelFallback.ensureLoaded(); context.title = 'Model Fallback';">
+  <div x-data x-init="await $store.modelFallback.ensureLoaded(); context.title = 'Model Fallback'; $store.modelFallback.backfillToggles(context.settings);">
     <div class="fallback-config">
 
       <!-- Header with Help Button -->
@@ -36,7 +36,7 @@
                    max="600"
                    step="10"
                    x-model="context.settings.fallback_timeout_s"
-                   :value="$store.modelFallback.normalizeSettings(context.settings).timeout_s" />
+                   @change="$store.modelFallback.clampField(context.settings, 'fallback_timeout_s', 30, 600, 300, true)" />
           </div>
         </div>
 
@@ -52,7 +52,7 @@
                    max="600"
                    step="10"
                    x-model="context.settings.fallback_utility_timeout_s"
-                   :value="$store.modelFallback.normalizeSettings(context.settings).utility_timeout_s" />
+                   @change="$store.modelFallback.clampField(context.settings, 'fallback_utility_timeout_s', 30, 600, 300, true)" />
           </div>
         </div>
 
@@ -68,7 +68,7 @@
                    max="30"
                    step="0.5"
                    x-model="context.settings.fallback_attempt_delay"
-                   :value="$store.modelFallback.normalizeSettings(context.settings).attempt_delay" />
+                   @change="$store.modelFallback.clampField(context.settings, 'fallback_attempt_delay', 0, 30, 2)" />
           </div>
         </div>
       </div>
@@ -91,7 +91,7 @@
                    min="1"
                    max="10"
                    x-model="context.settings.fallback_max_cycles"
-                   :value="$store.modelFallback.normalizeSettings(context.settings).max_cycles" />
+                   @change="$store.modelFallback.clampField(context.settings, 'fallback_max_cycles', 1, 10, 4, true)" />
           </div>
         </div>
 
@@ -107,7 +107,7 @@
                    max="120"
                    step="1"
                    x-model="context.settings.fallback_cycle_delay"
-                   :value="$store.modelFallback.normalizeSettings(context.settings).cycle_delay" />
+                   @change="$store.modelFallback.clampField(context.settings, 'fallback_cycle_delay', 0, 120, 5)" />
           </div>
         </div>
       </div>
@@ -129,8 +129,7 @@
         <div class="toggle-row">
           <label class="toggle">
             <input type="checkbox"
-                   x-model="context.settings.utility_timeout_guard_enabled"
-                   :checked="$store.modelFallback.isEnabled(context.settings, 'utility_timeout_guard')" />
+                   x-model="context.settings.utility_timeout_guard_enabled" />
             <span class="toggle-slider"></span>
           </label>
           <div class="toggle-label">
@@ -149,30 +148,7 @@
         <div class="toggle-row">
           <label class="toggle">
             <input type="checkbox"
-                   x-model="context.settings.webui_extensions_cache_enabled"
-                   :checked="$store.modelFallback.isEnabled(context.settings, 'webui_extensions_cache')" />
-            <span class="toggle-slider"></span>
-          </label>
-          <div class="toggle-label">
-            <div class="field-title">WebUI extensions cache
-              <span class="version-badge">v2.2</span>
-            </div>
-            <div class="field-description">
-              2s TTL cache + circuit breaker on
-              <code>get_webui_extensions</code>. Breaks the 150ms
-              polling storm during page lifecycle and short-circuits
-              to <code>[]</code> when the framework's filesystem
-              layer raises repeatedly (slow mount). Auto-busts on
-              plugin enable/disable.
-            </div>
-          </div>
-        </div>
-
-        <div class="toggle-row">
-          <label class="toggle">
-            <input type="checkbox"
-                   x-model="context.settings.context_size_guard_enabled"
-                   :checked="$store.modelFallback.isEnabled(context.settings, 'context_size_guard')" />
+                   x-model="context.settings.context_size_guard_enabled" />
             <span class="toggle-slider"></span>
           </label>
           <div class="toggle-label">
@@ -194,8 +170,7 @@
         <div class="toggle-row">
           <label class="toggle">
             <input type="checkbox"
-                   x-model="context.settings.langchain_compat_enabled"
-                   :checked="$store.modelFallback.isEnabled(context.settings, 'langchain_compat')" />
+                   x-model="context.settings.langchain_compat_enabled" />
             <span class="toggle-slider"></span>
           </label>
           <div class="toggle-label">
@@ -237,8 +212,6 @@
             <ul style="font-size: 0.8rem; line-height: 1.6; margin: 0; padding-left: 18px;">
               <li><code>utility_timeout_guard.max_wait_s</code> (default 120) — hard cap on a single utility call.</li>
               <li><code>utility_timeout_guard.jitter_s</code> (default 1.0) — random spread so concurrent agents don't lockstep.</li>
-              <li><code>webui_extensions_cache.ttl_s</code> (default 2.0) — cache freshness window.</li>
-              <li><code>webui_extensions_cache.circuit_breaker_threshold</code> (default 5) — errors in window before breaker opens.</li>
               <li><code>context_size_guard.max_chars</code> (default 50000) — trim threshold when enabled.</li>
               <li><code>context_size_guard.min_messages</code> (default 2) — never trim below this count.</li>
             </ul>

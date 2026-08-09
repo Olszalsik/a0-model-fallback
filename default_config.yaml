@@ -78,7 +78,6 @@ utility_timeout_guard_enabled: true     # v2.2 — outer timeout on call_utility
 # is harmless; nothing on the runtime side reads it.
 housekeeping_enabled: false             # v2.5 — REMOVED, kept as no-op for back-compat
 second_pulse_path_enabled: false        # v2.5 — REMOVED, kept as no-op for back-compat
-webui_extensions_cache_enabled: true    # v2.2 — TTL cache + circuit breaker on extensions lookup
 context_size_guard_enabled: false       # v2.3 — opt-in history trim on ContextOverflow spiral
 langchain_compat_enabled: true          # v2.4 — v0 -> v1 import shim (default ON)
 primary_skip_enabled: true              # v2.5.1 — escalate primary cooldown after N strikes
@@ -244,20 +243,6 @@ housekeeping:
   pulse_interval_s: 25.0
   stats_interval_s: 60.0
   stale_threshold_s: 120.0       # ignored; no loop exists to respawn
-
-# TTL cache + circuit breaker on helpers.extension.get_webui_extensions.
-# The 2s TTL breaks the 150ms polling storm the WebUI can produce
-# during page lifecycle. The circuit breaker returns [] immediately
-# when get_webui_extensions itself raises more than ``threshold``
-# times in ``window_s`` -- keeps the WebUI responsive even when the
-# framework's FS layer is slow.
-webui_extensions_cache:
-  enabled: true
-  ttl_s: 2.0
-  circuit_breaker_enabled: true
-  circuit_breaker_window_s: 10.0
-  circuit_breaker_threshold: 5
-  circuit_breaker_recovery_s: 30.0
 
 # --- v2.3 Context Size Guard (opt-in) ------------------------------------
 # Trim ``loop_data.history_output`` at message_loop_prompts_after
