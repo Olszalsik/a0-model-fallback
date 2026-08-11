@@ -1040,6 +1040,83 @@ non-router (`a0_venice/*`) still returns the 20s warm timeout (fast-path
 intact); a cold label returns the base (unchanged). Full suite (162
 tests) green. Backup: `fallback.py.before-warm-router.bak`.
 
+### v2.6.7 — Router detection + router-class wait tuning (2026-08-11)
+
+**Problem (the "300 second wait").** The v2.6.2 router capacity class
+detected routers by **label prefix only**: a candidate was `router` iff
+its cascade label started with `omniroute/`. But the user's OmniRoute
+provider is registered with `litellm_provider: openai`
+(`conf/model_providers.yaml`), so its chat/utility model_name arrives as
+`openai/auto/best-coding` — prefix `openai`, **not** `omniroute/`. The
+primary was mis-classified as `free_per_minute`, and a single `asyncio`
+timeout on it set a **300 s** cooldown (the `free_per_minute` timeout
+cooldown). OmniRoute is a self-healing gateway that re-routes the next
+request to a healthy tier, so that 5-min lockout stretched a seconds-long
+upstream blip into a 400-700 s recovery — exactly the "modular fallback
+interrupting omniroute" symptom. The cascade was doing its job (don't
+hammer a hung endpoint) but on the **wrong** capacity class.
+
+**Root cause is detection, not the wait policy.** The wait policy for
+`free_per_minute` is correct for a metered endpoint; it's wrong for a
+self-healing gateway. Four fixes, all gated on correct router detection:
+
+* **Fix A1 (label prefix, configurable).** `_classify_capacity` now also
+  matches configurable `router_label_prefixes` (default `["omniroute"]`;
+  add e.g. `"openai/auto"` to classify the aliased primary by label).
+* **Fix A2 (api_base, durable).** The provider config injects
+  `api_base: http://host.docker.internal:8080/v1` onto the wrapper kwargs
+  (`models.py:_merge_provider_defaults`); `_get_candidate_api_base`
+  surfaces it and `_classify_capacity` matches it against
+  `router_api_bases` (default 5 gateway host spellings on `:8080`).
+  This is the reliable matcher — it's stable regardless of which
+  `litellm_provider` prefix the label carries. A1 OR A2 wins.
+* **Fix B (timeout -> no cooldown).** Once router-class, a **pure**
+  `asyncio.TimeoutError` (no HTTP status) sets no cooldown
+  (`router_timeout_no_cooldown`, default `true` →
+  `router_timeout_cooldown_s`, default `0.0`) — the cascade retries the
+  gateway on the very next cycle instead of locking it out for 300 s.
+  Actual 5xx still gets `router_cooldown_s` (default 5 s) to space a
+  storm.
+* **Fix C (cycle backoff cap).** Continuous fallback + exponential
+  backoff compounds the wait: a router primary in a stuck cycle backs
+  off up to `max_cycle_delay_s` (user default 300 s). When the primary
+  is router-class, the cap is overridden by `router_max_cycle_delay_s`
+  (default 30 s) so the cascade re-probes within half a minute instead
+  of every 5 min.
+* **Fix D (per-call timeout headroom knob).** Router-class candidates are
+  already exempt from the 20 s warm fast-path (v2.6.3) and use the cold
+  base. `router_call_timeout_s` (default `0.0` = base unchanged) lets
+  the user give the self-healing gateway **more** headroom than the cold
+  base so litellm's internal 3× retry + the core 2×1.5 s retry can
+  recover a transient blip before the cascade declares a timeout.
+
+**Expected outcome.** OmniRoute primary reclassified as `router` → 429
+no cooldown, timeout → 0 s (retry next cycle), primary-skip exempt,
+cycle backoff capped at 30 s, cold timeout 90 s unchanged → recoveries
+drop from 400-700 s to < 60 s. The gateway's own 4-tier internal
+fallback keeps working because the cascade no longer locks it out.
+
+**Activation (important).** `plugins.get_plugin_config` does **not**
+merge `default_config.yaml` when a `config.json` exists — it's one or
+the other. So the new `default_config.yaml` keys only load for installs
+with no `config.json`. For installs that do have a `config.json` (this
+one), the fixes still activate because every helper falls back to a
+module-level `_DEFAULT_*` constant and every `cfg.get(...)` has a safe
+inline default (`True` / `0.0` / `_DEFAULT_ROUTER_MAX_CYCLE_DELAY_S`).
+**`config.json` does not need to be edited**; the user's sacred
+`config.json` is left untouched. To override a default (e.g. add
+`"openai/auto"` to label prefixes, or raise `router_call_timeout_s` for
+extra headroom), add the key to `config.json` or via the WebUI.
+
+**Files.** `fallback.py` — `_DEFAULT_ROUTER_API_BASES`,
+`_DEFAULT_ROUTER_MAX_CYCLE_DELAY_S`, `_router_label_prefixes`,
+`_router_api_bases`, `_is_router_label_prefix`, `_is_router_api_base`,
+`_get_candidate_api_base`, and the `api_base` param on
+`_classify_capacity` / `_capacity_skips_cooldown` / `_handle_error_cooldown`
+/ `_resolve_per_call_timeout`; `cand_api_base` threaded through both
+cascades' call sites; `primary_is_router` cap in both `_compute_cycle_sleep`
+functions. `default_config.yaml` — six new documented knobs.
+
 ### v2.6 configuration knobs
 
 | Knob | Default | Phase | Effect |
@@ -1055,6 +1132,12 @@ tests) green. Backup: `fallback.py.before-warm-router.bak`.
 | `primary_skip_strikes` | 2 | 5 | consecutive primary failures to escalate |
 | `primary_skip_cooldown_s` | 120 | 5 | escalation cooldown for a hung primary |
 | `router_cooldown_s` | 5 | 2 | 5xx/transient cooldown for `router` labels (v2.6.2); clamped `[0,60]`; `0` retries now |
+| `router_label_prefixes` | `["omniroute"]` | 2.6.7 | extra label prefixes classified as `router` (A1); OR with `router_api_bases` |
+| `router_api_bases` | 5× `*:8080` | 2.6.7 | api_base substrings classified as `router` (A2, durable); OR with prefixes |
+| `router_timeout_no_cooldown` | true | 2.6.7 | pure `asyncio.TimeoutError` on a router sets no cooldown (Fix B) |
+| `router_timeout_cooldown_s` | 0.0 | 2.6.7 | timeout cooldown when the above is false (Fix B) |
+| `router_max_cycle_delay_s` | 30 | 2.6.7 | cycle-backoff cap when the primary is router-class (Fix C); clamped `[0,3600]` |
+| `router_call_timeout_s` | 0.0 | 2.6.7 | per-call timeout headroom for router-class; `0` = cold base unchanged (Fix D) |
 
 Phase 2 (`_classify_capacity`) and Phase 4 (the CancelledError-vs-TimeoutError
 split) have **no config toggle** — they are inherent behaviors of the cascade,

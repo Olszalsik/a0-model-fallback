@@ -186,14 +186,17 @@ def _resolve_per_call_timeout(
     base_timeout_s: float,
     warm_timeout_s: float,
     warm_window_s: float,
+    agent=None,
+    api_base: str = "",
 ) -> float:
     """Return the per-candidate timeout for `label`. Warm labels get the
     shorter `warm_timeout_s`; cold labels (or those outside the warm
     window) get `base_timeout_s`. The user-set TIMEOUT= model kwarg is
     handled at the call site, not here — this helper is only invoked
     after the kwarg has already been checked (so a user kwarg wins
-    regardless of warm state). Router-class labels (omniroute/*) always
-    get the cold ``base_timeout_s`` -- see the note in the body.
+    regardless of warm state). Router-class labels (omniroute/*, or any
+    label whose api_base points at a router gateway) always get the
+    cold ``base_timeout_s`` -- see the note in the body.
     """
     try:
         # v2.6.3: router-class labels (omniroute/* -- self-healing gateways
@@ -205,9 +208,19 @@ def _resolve_per_call_timeout(
         # auto/best-coding-fast) in the "free coding fast" presets.
         # Routers get the cold ``base_timeout_s`` ceiling -- fast calls
         # still return fast; slow routed calls get the headroom they need.
-        # See A1 router capacity class + cascade_warm_timeout_s.
-        if _classify_capacity(label) == "router":
-            return base_timeout_s
+        # v2.6.7: detection now also covers labels whose api_base points
+        # at the gateway (``openai/auto/...`` via omniroute). See A1/A2.
+        # v2.6.7 Fix D: ``router_call_timeout_s`` (default 0 = base) lets
+        # the user give the self-healing router MORE headroom than the
+        # cold base (e.g. 120-180s) so the core 2x1.5s + litellm 3x retry
+        # has room to recover a transient blip before the cascade
+        # declares a timeout and cools the primary down.
+        if _classify_capacity(label, agent, api_base) == "router":
+            try:
+                rt = float(_get_plugin_cfg(agent).get("router_call_timeout_s", 0.0))
+            except Exception:
+                rt = 0.0
+            return base_timeout_s if rt <= 0 else max(base_timeout_s, rt)
         last_warm_at = _WARM_LABELS.get(label, 0.0)
         if time.monotonic() - last_warm_at < warm_window_s:
             return warm_timeout_s
@@ -830,11 +843,107 @@ def _maybe_clear_cooldown_for_healthy_label(agent, label: str) -> bool:
 _DEFAULT_ROUTER_PROVIDERS = ("omniroute",)
 _DEFAULT_ROUTER_COOLDOWN_S = 5.0
 
+# v2.6.7 Fix A2 -- default api_base substrings that identify the
+# OmniRoute gateway (an OpenAI-compatible proxy). Any candidate whose
+# api_base contains one of these is router-class regardless of its
+# label prefix. The user's omniroute provider is registered with
+# ``litellm_provider: openai`` (conf/model_providers.yaml), so its
+# chat/utility model_name arrives as ``openai/auto/best-coding`` -- NOT
+# ``omniroute/...`` -- and the legacy ``omniroute/`` prefix check misses
+# it, causing a 300s timeout cooldown on a self-healing gateway. Extend
+# via plugin config ``router_api_bases`` if the gateway runs on a
+# non-default host/port.
+_DEFAULT_ROUTER_API_BASES = (
+    "host.docker.internal:8080",
+    "localhost:8080",
+    "127.0.0.1:8080",
+    "0.0.0.0:8080",
+    "gateway.docker.internal:8080",
+)
 
-def _classify_capacity(label: str) -> str:
+# v2.6.7 Fix C -- cap on the cycle backoff when the primary (candidate 0)
+# is router-class. The default ``max_cycle_delay_s`` (300s) meant the
+# cascade only re-probed a cooled-down router primary every ~5 min; a
+# self-healing gateway recovers on the next call, so this just wastes
+# time. 30s keeps the probe responsive.
+_DEFAULT_ROUTER_MAX_CYCLE_DELAY_S = 30.0
+
+
+def _router_label_prefixes(agent) -> tuple:
+    """Configured router label prefixes (lowercased). Falls back to
+    ``_DEFAULT_ROUTER_PROVIDERS`` when plugin config is unavailable
+    (e.g. agent is None). Read live so UI changes apply without a
+    restart."""
+    try:
+        cfg = _get_plugin_cfg(agent) if agent is not None else {}
+        raw = cfg.get("router_label_prefixes", _DEFAULT_ROUTER_PROVIDERS)
+    except Exception:
+        raw = _DEFAULT_ROUTER_PROVIDERS
+    if isinstance(raw, str):
+        raw = [raw]
+    return tuple(str(p).strip().lower() for p in raw if str(p).strip())
+
+
+def _router_api_bases(agent) -> tuple:
+    """Configured api_base substrings identifying a router gateway."""
+    try:
+        cfg = _get_plugin_cfg(agent) if agent is not None else {}
+        raw = cfg.get("router_api_bases", _DEFAULT_ROUTER_API_BASES)
+    except Exception:
+        raw = _DEFAULT_ROUTER_API_BASES
+    if isinstance(raw, str):
+        raw = [raw]
+    return tuple(str(b).strip().lower() for b in raw if str(b).strip())
+
+
+def _is_router_label_prefix(label: str, agent=None) -> bool:
+    if not isinstance(label, str) or not label:
+        return False
+    low = label.lower()
+    for p in _router_label_prefixes(agent):
+        if low == p or low.startswith(p + "/"):
+            return True
+    return False
+
+
+def _is_router_api_base(api_base: str, agent=None) -> bool:
+    if not isinstance(api_base, str) or not api_base:
+        return False
+    low = api_base.lower()
+    for b in _router_api_bases(agent):
+        if b and b in low:
+            return True
+    return False
+
+
+def _get_candidate_api_base(spec, model_obj) -> str:
+    """Return the api_base for a cascade candidate: the primary's
+    ``model_obj.kwargs['api_base']`` or a fallback spec dict's
+    ``'api_base'``. Used to detect router-class candidates whose label
+    prefix doesn't betray the gateway (see ``_classify_capacity`` A2)."""
+    if spec is None:
+        kwargs = getattr(model_obj, "kwargs", None) if model_obj is not None else None
+        return (kwargs.get("api_base", "") if isinstance(kwargs, dict) else "") or ""
+    if isinstance(spec, dict):
+        return spec.get("api_base", "") or ""
+    return ""
+
+
+def _classify_capacity(label: str, agent=None, api_base: str = "") -> str:
     """Return one of ``concurrent_paid``, ``unlimited_paid``,
     ``router``, ``free_per_minute``. Unknown providers default to
-    ``free_per_minute`` (conservative)."""
+    ``free_per_minute`` (conservative).
+
+    v2.6.7: a label is router-class if (a) its provider segment is in
+    ``_DEFAULT_ROUTER_PROVIDERS`` / the configured
+    ``router_label_prefixes``, OR (b) its ``api_base`` points at a
+    configured router gateway (``router_api_bases``). Path (b) catches
+    the common mis-classification where the omniroute provider's
+    ``litellm_provider: openai`` makes the primary label arrive as
+    ``openai/auto/best-coding`` instead of ``omniroute/...`` -- without
+    it, the self-healing gateway gets a 300s timeout cooldown and the
+    agent stalls for minutes per outage.
+    """
     provider = label.split("/", 1)[0].lower() if "/" in label else ""
     # Local ollama is truly concurrent (many parallel requests to
     # localhost are fine). Anything matching "ollama*" but not exactly
@@ -851,21 +960,30 @@ def _classify_capacity(label: str) -> str:
     # call re-routes, so don't lock it out.
     if provider in _DEFAULT_ROUTER_PROVIDERS:
         return "router"
+    # v2.6.7 A1: configurable label-prefix match (e.g. "openai/auto" for
+    # a gateway exposed via an openai-compat provider).
+    if _is_router_label_prefix(label, agent):
+        return "router"
+    # v2.6.7 A2: api_base match -- the durable signal. The label may be
+    # "openai/auto/best-coding" but its api_base points at the omniroute
+    # gateway, so classify by where the call actually goes.
+    if _is_router_api_base(api_base, agent):
+        return "router"
     # nvidia_nim, groq, mistral, cohere, together_ai,
     # together, deepseek, anthropic, google, openai, etc. — all metered
     # or rate-limited at the per-minute granularity.
     return "free_per_minute"
 
 
-def _capacity_skips_cooldown(label: str) -> bool:
+def _capacity_skips_cooldown(label: str, agent=None, api_base: str = "") -> bool:
     """True for capacity classes that should NOT get a 429 cooldown and
     should NOT trigger primary-skip escalation: ``concurrent_paid``
     (local ollama — a 429 is a competing agent) and ``router``
     (self-healing gateways — the next call re-routes)."""
-    return _classify_capacity(label) in ("concurrent_paid", "router")
+    return _classify_capacity(label, agent, api_base) in ("concurrent_paid", "router")
 
 
-def _handle_error_cooldown(e, label, model_cooldowns, agent):
+def _handle_error_cooldown(e, label, model_cooldowns, agent, api_base: str = ""):
     """Apply cooldown logic to a failed model. Returns True if model was cooldowned.
 
     Cooldown duration policy (see _DEFAULT_COOLDOWNS_S for full table):
@@ -913,7 +1031,7 @@ def _handle_error_cooldown(e, label, model_cooldowns, agent):
         # cooldown — just skip without writing anything to ``store``.
         # The ``_last_skip_log_until`` dedupe (see below) will still
         # rate-limit the "skipping" log line.
-        if _capacity_skips_cooldown(label):
+        if _capacity_skips_cooldown(label, agent, api_base):
             return False
         retry_after = extract_retry_after_seconds(e)
         if retry_after and retry_after > 0:
@@ -977,13 +1095,25 @@ def _handle_error_cooldown(e, label, model_cooldowns, agent):
     # next call, so use a tiny ``router_cooldown_s`` (default 5s) — bypassing
     # the 30s floor — to space out a 5xx storm without locking the router
     # out for the 60-120s a normal endpoint would get.
-    if _classify_capacity(label) == "router":
+    # v2.6.7 Fix B: a PURE timeout (no status_code) on a self-healing router
+    # does NOT mean the gateway is broken — it was routing slowly this
+    # call, and the next call re-routes. ``router_timeout_no_cooldown``
+    # (default True) → ``router_timeout_cooldown_s`` (default 0s) so the
+    # cascade retries the router on the very next cycle instead of locking
+    # it out for the 300s a plain timeout would cost a free_per_minute
+    # label. Actual 5xx still gets ``router_cooldown_s`` to space a storm.
+    if _classify_capacity(label, agent, api_base) == "router":
         try:
-            dur = float(
-                _get_plugin_cfg(agent).get(
-                    "router_cooldown_s", _DEFAULT_ROUTER_COOLDOWN_S,
-                )
+            cfg = _get_plugin_cfg(agent)
+            is_pure_timeout = status_code is None and isinstance(
+                e, (asyncio.TimeoutError, TimeoutError)
             )
+            if is_pure_timeout and cfg.get("router_timeout_no_cooldown", True):
+                dur = float(cfg.get("router_timeout_cooldown_s", 0.0))
+            else:
+                dur = float(
+                    cfg.get("router_cooldown_s", _DEFAULT_ROUTER_COOLDOWN_S)
+                )
         except Exception:
             dur = _DEFAULT_ROUTER_COOLDOWN_S
         dur = max(0.0, min(dur, 60.0))
@@ -1417,7 +1547,7 @@ async def _patched_call_utility_model(
         # cooldown for these. Skip before the Phase 5 healthy-label
         # check so a peer success doesn't trigger a counter reset that
         # would later be wasted by a 30s escalation.
-        if _capacity_skips_cooldown(label):
+        if _capacity_skips_cooldown(label, self, cand_api_base):
             return
         # v2.6: Phase 5 short-circuit. _maybe_clear_cooldown_for_healthy_label
         # already enforces the only-cleared-never-overwritten invariant
@@ -1479,14 +1609,31 @@ async def _patched_call_utility_model(
         ``max_cycle_delay_s`` cap is reapplied after amplification so we
         never sleep longer than the configured ceiling."""
         import random
+        cap = max_cycle_delay_s
+        # v2.6.7 Fix C: when the primary is a self-healing router, probe
+        # it often (router_max_cycle_delay_s, default 30s) instead of
+        # backing off to max_cycle_delay_s (300s). The gateway recovers
+        # on the next call, so a long backoff just delays the re-probe
+        # and stretches a 300s outage into a 600s+ recovery.
+        if primary_is_router:
+            try:
+                cap = min(
+                    cap,
+                    float(_get_plugin_cfg(self).get(
+                        "router_max_cycle_delay_s",
+                        _DEFAULT_ROUTER_MAX_CYCLE_DELAY_S,
+                    )),
+                )
+            except Exception:
+                cap = min(cap, _DEFAULT_ROUTER_MAX_CYCLE_DELAY_S)
         base = cycle_delay * (backoff_multiplier ** min(consecutive_full_cycles, 10))
-        capped = min(base, max_cycle_delay_s)
+        capped = min(base, cap)
         if (
             consecutive_no_success_cycles >= cycle_stagnation_threshold
             and cycle_stagnation_factor > 1.0
         ):
             amplified = capped * cycle_stagnation_factor
-            capped = min(amplified, max_cycle_delay_s)
+            capped = min(amplified, cap)
             if not stagnation_logged_this_outage:
                 stagnation_logged_this_outage = True
                 try:
@@ -1503,9 +1650,16 @@ async def _patched_call_utility_model(
             capped += random.uniform(0.0, backoff_jitter_s)
         return capped
 
+    primary_label = _get_model_label(candidates[0], model_obj)
+    primary_api_base = _get_candidate_api_base(candidates[0], model_obj)
+    primary_is_router = (
+        _classify_capacity(primary_label, self, primary_api_base) == "router"
+    )
+
     while True:
         idx = (current_idx + attempt) % n
         label = _get_model_label(candidates[idx], model_obj)
+        cand_api_base = _get_candidate_api_base(candidates[idx], model_obj)
 
         # Skip models in cooldown
         cooldown_until = model_cooldowns.get(label)
@@ -1758,6 +1912,7 @@ async def _patched_call_utility_model(
         else:
             effective_timeout_s = _resolve_per_call_timeout(
                 label, timeout_s, warm_timeout_s, warm_window_s,
+                self, cand_api_base,
             )
 
         async def _call_utility_model():
@@ -1805,7 +1960,7 @@ async def _patched_call_utility_model(
             # timeout instead of looping on the 20s warm ceiling. See
             # _evict_warm_on_timeout for the full rationale.
             _evict_warm_on_timeout(e, label)
-            _handle_error_cooldown(e, label, model_cooldowns, self)
+            _handle_error_cooldown(e, label, model_cooldowns, self, cand_api_base)
             # v2.5.1: track consecutive primary failures. If [0] has just
             # timed out, escalate its cooldown so the cascade routes around
             # it for the next ``primary_skip_cooldown_s`` seconds instead of
@@ -1824,7 +1979,7 @@ async def _patched_call_utility_model(
                 self.context.log.log("error", content=err_msg)
                 PrintStyle(font_color="red", padding=True).print(err_msg)
                 # Mark as permanent so it's not retried, then raise
-                _handle_error_cooldown(e, label, model_cooldowns, self)
+                _handle_error_cooldown(e, label, model_cooldowns, self, cand_api_base)
                 raise CodeError(e, f"utility model [{label}]")
 
             is_json_err = isinstance(e, ValueError) and "valid JSON" in str(e)
@@ -1867,7 +2022,7 @@ async def _patched_call_utility_model(
                     # cooldown + advance. Keep the original exception `e`.
                     pass
 
-            _handle_error_cooldown(e, label, model_cooldowns, self)
+            _handle_error_cooldown(e, label, model_cooldowns, self, cand_api_base)
             # v2.5.1: same primary-skip escalation for the general error
             # path. The helper is a no-op when idx != 0.
             _maybe_extend_primary_cooldown(reason=type(e).__name__)
@@ -2108,7 +2263,7 @@ async def _patched_call_chat_model(
         # cooldown for these. Skip before the Phase 5 healthy-label
         # check so a peer success doesn't trigger a counter reset that
         # would later be wasted by a 30s escalation.
-        if _capacity_skips_cooldown(label):
+        if _capacity_skips_cooldown(label, self, cand_api_base):
             return
         # v2.6: Phase 5 short-circuit. _maybe_clear_cooldown_for_healthy_label
         # already enforces the only-cleared-never-overwritten invariant
@@ -2159,15 +2314,35 @@ async def _patched_call_chat_model(
     def _compute_cycle_sleep() -> float:
         """Same envelope as the utility cascade. See _patched_call_utility_model."""
         import random
+        cap = max_cycle_delay_s
+        # v2.6.7 Fix C: router-primary probe cap (see utility cascade).
+        if primary_is_router:
+            try:
+                cap = min(
+                    cap,
+                    float(_get_plugin_cfg(self).get(
+                        "router_max_cycle_delay_s",
+                        _DEFAULT_ROUTER_MAX_CYCLE_DELAY_S,
+                    )),
+                )
+            except Exception:
+                cap = min(cap, _DEFAULT_ROUTER_MAX_CYCLE_DELAY_S)
         base = cycle_delay * (backoff_multiplier ** min(consecutive_full_cycles, 10))
-        capped = min(base, max_cycle_delay_s)
+        capped = min(base, cap)
         if backoff_jitter_s > 0:
             capped += random.uniform(0.0, backoff_jitter_s)
         return capped
 
+    primary_label = _get_model_label(candidates[0], model_obj)
+    primary_api_base = _get_candidate_api_base(candidates[0], model_obj)
+    primary_is_router = (
+        _classify_capacity(primary_label, self, primary_api_base) == "router"
+    )
+
     while True:
         idx = (current_idx + attempt) % n
         label = _get_model_label(candidates[idx], model_obj)
+        cand_api_base = _get_candidate_api_base(candidates[idx], model_obj)
 
         # Skip models in cooldown
         cooldown_until = model_cooldowns.get(label)
@@ -2382,6 +2557,7 @@ async def _patched_call_chat_model(
         else:
             effective_timeout_s = _resolve_per_call_timeout(
                 label, timeout_s, warm_timeout_s, warm_window_s,
+                self, cand_api_base,
             )
 
         async def _call_chat_model():
@@ -2420,7 +2596,7 @@ async def _patched_call_chat_model(
             # timeout instead of the 20s warm ceiling (see the utility
             # timeout handler + _evict_warm_on_timeout for the rationale).
             _evict_warm_on_timeout(e, label)
-            _handle_error_cooldown(e, label, model_cooldowns, self)
+            _handle_error_cooldown(e, label, model_cooldowns, self, cand_api_base)
             # Timeouts are transient.
 
         except Exception as e:
@@ -2433,7 +2609,7 @@ async def _patched_call_chat_model(
                 )
                 self.context.log.log("error", content=err_msg)
                 PrintStyle(font_color="red", padding=True).print(err_msg)
-                _handle_error_cooldown(e, label, model_cooldowns, self)
+                _handle_error_cooldown(e, label, model_cooldowns, self, cand_api_base)
                 raise CodeError(e, f"chat model [{label}]")
 
             is_overflow = _is_context_overflow_error(e)
@@ -2471,7 +2647,7 @@ async def _patched_call_chat_model(
                     # cooldown + advance. Keep the original exception `e`.
                     pass
 
-            _handle_error_cooldown(e, label, model_cooldowns, self)
+            _handle_error_cooldown(e, label, model_cooldowns, self, cand_api_base)
             # v2.5.1: same primary-skip escalation for the general error
             # path. The helper is a no-op when idx != 0.
             _maybe_extend_primary_cooldown(reason=type(e).__name__)

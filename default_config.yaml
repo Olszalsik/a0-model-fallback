@@ -195,6 +195,71 @@ health_horizon_s: 60
 # immediately).
 router_cooldown_s: 5
 
+# --- v2.6.7 Router detection + router-class wait tuning --------------------
+# Extends the v2.6.2 router capacity class. The original detection was
+# prefix-only on the cascade label: a candidate was "router" iff its label
+# started with one of `_DEFAULT_ROUTER_PROVIDERS` (default ["omniroute"]).
+# That missed the common case where the OmniRoute primary is registered
+# under `litellm_provider: openai` (see conf/model_providers.yaml), so its
+# cascade label is `openai/auto/best-coding` — prefix "openai" — and it was
+# mis-classified as `free_per_minute`. A single timeout on that primary
+# then set a 300s cooldown (the `free_per_minute` timeout cooldown), which
+# is the "300 second wait" the user hit: the cascade refused to retry the
+# gateway for 5 min even though the gateway self-heals in seconds.
+#
+# Two matchers, either wins (OR):
+#   router_label_prefixes — prefix match on the cascade label (A1).
+#     Default ["omniroute"]. Add "openai/auto" here to also classify the
+#     litellm_provider-aliased OmniRoute primary by label.
+#   router_api_bases — substring match on the candidate's api_base (A2).
+#     This is the durable matcher: the provider config injects
+#     `api_base: http://host.docker.internal:8080/v1` onto the wrapper kwargs
+#     (models.py:_merge_provider_defaults), and that host:port is stable
+#     regardless of which litellm_provider prefix the label carries.
+#     Default covers the 5 common gateway host spellings on port 8080.
+# Set either list to [] to disable that matcher.
+router_label_prefixes:
+  - omniroute
+router_api_bases:
+  - host.docker.internal:8080
+  - localhost:8080
+  - 127.0.0.1:8080
+  - 0.0.0.0:8080
+  - gateway.docker.internal:8080
+
+# --- v2.6.7 Router-class timeout cooldown (Fix B) -------------------------
+# Once a candidate is correctly classified as router-class, what does a
+# *timeout* (not a 429/5xx) cost? For a normal endpoint a timeout means
+# "this model is hung, don't retry for a while" → the free_per_minute
+# 300s cooldown. For a self-healing gateway a timeout usually means "the
+# tier the gateway picked is slow/cold, the next call re-routes" → a long
+# cooldown just throws away the gateway's own recovery. With
+# router_timeout_no_cooldown: true (default), a pure asyncio.TimeoutError
+# (no HTTP status) on a router-class candidate sets NO cooldown — the
+# cascade retries it on the next pass. Set false to fall back to
+# router_timeout_cooldown_s.
+router_timeout_no_cooldown: true
+router_timeout_cooldown_s: 0.0
+
+# --- v2.6.7 Router-class cycle-backoff cap (Fix C) -------------------------
+# Continuous fallback + exponential backoff compounds the wait: a router
+# primary in a stuck cycle multiplies its cycle sleep up to
+# `max_cycle_delay_s` (user default 300s). For a router primary this cap
+# is overridden by `router_max_cycle_delay_s` so the cycle backs off at
+# most 30s instead of 300s. The gateway self-heals fast; a 5-min backoff
+# just adds dead wall time. Set to a value >= max_cycle_delay_s to disable
+# the override and use the global cap. Clamped to [0, 3600] at runtime.
+router_max_cycle_delay_s: 30.0
+
+# --- v2.6.7 Router-class per-call timeout headroom (Fix D) -----------------
+# Router-class candidates are EXEMPT from the warm fast-path ceiling (see
+# cascade_warm_timeout_s) — they always use the cold base ceiling. This
+# knob adds (or sets) headroom on top of the cold base for router-class
+# calls only. 0.0 = use the cold base unchanged (legacy). A small positive
+# value gives a self-healing gateway extra seconds to re-route a slow
+# tier before the cascade times it out and moves on.
+router_call_timeout_s: 0.0
+
 # --- v2.6 Cascade per-call timeouts (added 2026-07-28) -------------------
 # First call to a label (within `cascade_warm_window_s`) gets the legacy
 # `fallback_utility_timeout_s` / `fallback_timeout_s` (the cold default).
