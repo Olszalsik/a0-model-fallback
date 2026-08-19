@@ -96,6 +96,22 @@ class _FakeTransientError(Exception):
         return self.message
 
 
+class _FakeAuthError(Exception):
+    """Stand-in for a LiteLLM 401/403/404 (status_code on the exception).
+    ``_is_permanently_failed_model`` treats 401-404 as permanent, so this
+    exercises the v2.6.7 Fix B router exemption: a router-class label must
+    NOT take the 300s permanent cooldown — it falls through to the short
+    ``router_cooldown_s`` block instead."""
+
+    def __init__(self, status_code: int = 401, message: str = "Unauthorized"):
+        super().__init__(message)
+        self.status_code = status_code
+        self.message = message
+
+    def __str__(self) -> str:
+        return self.message
+
+
 class _FakeAgent:
     """Minimal stand-in for an Agent for _handle_error_cooldown."""
 
@@ -255,6 +271,71 @@ def test_handle_error_500_normal_cooldown_for_non_router():
         store[("nonrouter-500",)] = {}
 
 
+def test_handle_error_401_short_cooldown_for_router():
+    """v2.6.7 Fix B: a 401 (or 403/404) on an ``omniroute/*`` label is
+    ``_is_permanently_failed_model`` True, but a self-healing router must NOT
+    take the 300s permanent cooldown — the gateway re-routes the next call
+    (and 401 often just means one upstream tier's key tier exhausted). The
+    router exemption in the permanent-fail block makes it fall through to
+    the short ``router_cooldown_s`` (5s) instead. Guards the regression where
+    a gateway 401 locked the router out for 5 minutes per outage."""
+    agent = _FakeAgent("router-401")
+    store = _fb_mod._INMEM_COOLDOWNS
+    store[("router-401",)] = {}
+    e = _FakeAuthError(status_code=401, message="Unauthorized")
+    label = "omniroute/auto"
+
+    try:
+        before = time.monotonic()
+        with _patched_cfg():
+            result = _handle_error_cooldown(e, label, store, agent)
+        after = time.monotonic()
+
+        assert result is True, "router 401 should return True (cooldown written)"
+        cooldown_until = store[("router-401",)].get(label)
+        assert cooldown_until is not None, "router 401 cooldown should have been written"
+        remaining = cooldown_until - before
+        # The decisive assertion: the short router_cooldown_s (~5s), NOT the
+        # 300s permanent cooldown a non-router 401 would get.
+        assert remaining < 60.0, (
+            f"router 401 cooldown must be the short router_cooldown_s, not the "
+            f"300s permanent cooldown; got {remaining:.1f}s"
+        )
+        assert remaining <= _DEFAULT_ROUTER_COOLDOWN_S + 1.0, (
+            f"router 401 cooldown should be ~{_DEFAULT_ROUTER_COOLDOWN_S}s, "
+            f"got {remaining:.1f}s"
+        )
+    finally:
+        store[("router-401",)] = {}
+
+
+def test_handle_error_401_permanent_cooldown_for_non_router():
+    """Sanity companion to Fix B: a 401 on a NON-router label still gets the
+    permanent 300s cooldown (``_DEFAULT_COOLDOWNS_S[401]``) -- the router
+    exemption must NOT leak to non-router providers."""
+    agent = _FakeAgent("nonrouter-401")
+    store = _fb_mod._INMEM_COOLDOWNS
+    store[("nonrouter-401",)] = {}
+    e = _FakeAuthError(status_code=401, message="Unauthorized")
+    label = "nvidia_nim/meta/llama-3.1-70b-instruct"
+
+    try:
+        before = time.monotonic()
+        with _patched_cfg():
+            result = _handle_error_cooldown(e, label, store, agent)
+        assert result is True
+        cooldown_until = store[("nonrouter-401",)].get(label)
+        assert cooldown_until is not None
+        remaining = cooldown_until - before
+        # _DEFAULT_COOLDOWNS_S[401] == 300.0; allow timing slack.
+        assert 295.0 <= remaining <= 305.0, (
+            f"non-router 401 cooldown should be ~300s (permanent), "
+            f"got {remaining:.1f}s"
+        )
+    finally:
+        store[("nonrouter-401",)] = {}
+
+
 # ---------------------------------------------------------------------------
 # v2.6.3: router warm-timeout exemption
 # ---------------------------------------------------------------------------
@@ -284,10 +365,12 @@ def test_resolve_per_call_timeout_router_uses_cold_even_when_warm():
 
 
 def test_resolve_per_call_timeout_non_router_warm_uses_warm():
-    """Sanity: a warm NON-router label still gets the short warm timeout --
-    the fast-path is intact for normal providers. Guards against the
-    router exemption accidentally disabling the warm path for everyone."""
-    label = "a0_venice/some-model"
+    """Sanity: a warm ``free_per_minute`` label still gets the short warm
+    timeout -- the fast-path is intact for free-tier providers. Guards
+    against the router / unlimited_paid exemptions accidentally disabling
+    the warm path for everyone. (``a0_venice`` is ``unlimited_paid`` and is
+    intentionally exempt -- see test_resolve_per_call_timeout_unlimited_paid_warm_uses_base.)"""
+    label = "ollama_cloud/some-model"
     saved = _fb_mod._WARM_LABELS.get(label)
     try:
         _fb_mod._WARM_LABELS[label] = time.monotonic()  # mark warm
@@ -295,7 +378,31 @@ def test_resolve_per_call_timeout_non_router_warm_uses_warm():
             label, base_timeout_s=300.0, warm_timeout_s=20.0, warm_window_s=600.0,
         )
         assert got == 20.0, (
-            f"warm non-router must use warm_timeout_s (20s), got {got}"
+            f"warm free_per_minute must use warm_timeout_s (20s), got {got}"
+        )
+    finally:
+        if saved is None:
+            _fb_mod._WARM_LABELS.pop(label, None)
+        else:
+            _fb_mod._WARM_LABELS[label] = saved
+
+
+def test_resolve_per_call_timeout_unlimited_paid_warm_uses_base():
+    """v2.6.7: a warm ``unlimited_paid`` label (e.g. ``a0_venice`` = Agent Zero
+    API) gets the full cold ``base_timeout_s`` even when warm. Paid models
+    legitimately run long utility prompts; the 20s warm ceiling was timing
+    them out on the 2nd call and forcing a 300s cooldown, so the agent
+    dropped off after ONE successful request. Only ``free_per_minute``
+    labels keep the aggressive warm fast-path."""
+    label = "a0_venice/some-model"
+    saved = _fb_mod._WARM_LABELS.get(label)
+    try:
+        _fb_mod._WARM_LABELS[label] = time.monotonic()  # mark warm
+        got = _fb_mod._resolve_per_call_timeout(
+            label, base_timeout_s=300.0, warm_timeout_s=20.0, warm_window_s=600.0,
+        )
+        assert got == 300.0, (
+            f"warm unlimited_paid must use cold base (300s), got {got}"
         )
     finally:
         if saved is None:

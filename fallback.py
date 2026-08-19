@@ -215,12 +215,24 @@ def _resolve_per_call_timeout(
         # cold base (e.g. 120-180s) so the core 2x1.5s + litellm 3x retry
         # has room to recover a transient blip before the cascade
         # declares a timeout and cools the primary down.
-        if _classify_capacity(label, agent, api_base) == "router":
+        capacity = _classify_capacity(label, agent, api_base)
+        if capacity == "router":
             try:
                 rt = float(_get_plugin_cfg(agent).get("router_call_timeout_s", 0.0))
             except Exception:
                 rt = 0.0
             return base_timeout_s if rt <= 0 else max(base_timeout_s, rt)
+        # Paid (non-free) models legitimately run long utility prompts --
+        # history summarization of a long chat, JSON memory work, document
+        # rewriting. The 20s warm ceiling (``cascade_warm_timeout_s``) was
+        # designed to fast-detect a hung *connection* on a cheap cloud call,
+        # but on a paid model like "Agent Zero API" (a0_venice,
+        # ``unlimited_paid``) it timed out healthy calls right after the
+        # first success -- and the 300s timeout cooldown then stalled the
+        # agent for minutes. Give paid models the full cold timeout always;
+        # only ``free_per_minute`` labels keep the aggressive warm fast-path.
+        if capacity == "unlimited_paid":
+            return base_timeout_s
         last_warm_at = _WARM_LABELS.get(label, 0.0)
         if time.monotonic() - last_warm_at < warm_window_s:
             return warm_timeout_s
@@ -320,19 +332,40 @@ def _save_cooldown_store(agent, store: dict) -> None:
         pass  # best-effort persistence
 
 
+# Pure-timeout cooldown. A ``TimeoutError`` (no HTTP status_code) used to fall
+# through to the 300s "unknown error" default below, which meant a single slow
+# (but healthy) call on a non-router model locked it out for 5 minutes -- the
+# "works once, then in cooldown, then stalls" symptom. A timeout is NOT a
+# broken model: the connection/auth was fine, the call just didn't finish in
+# the per-call budget (often the 20s warm ceiling on a legitimately large
+# utility prompt). Use a short backoff so the cascade retries cold (the warm
+# label is evicted by ``_evict_warm_on_timeout``) and recovers on the next
+# attempt. Tunable via plugin config ``timeout_cooldown_s``.
+_DEFAULT_TIMEOUT_COOLDOWN_S = 45.0
+
+
 def _cooldown_seconds_for_status(status_code, exc) -> float:
     """Return the cooldown duration for a given exception, in seconds.
 
     Priority:
       1. Retry-After header from the exception (respects server's own hint)
-      2. Per-status default from _DEFAULT_COOLDOWNS_S
-      3. 300.0 (5 min) -- conservative default for unknown errors
+      2. Pure timeout (no status_code, TimeoutError) -> ``timeout_cooldown_s``
+         (default 45s) -- a slow call is not a broken model.
+      3. Per-status default from _DEFAULT_COOLDOWNS_S
+      4. 300.0 (5 min) -- conservative default for unknown errors
     """
     retry_after = extract_retry_after_seconds(exc)
     if retry_after and retry_after > 0:
         # Cap at 1 hour to avoid the previous 24h-bug if a server returns
         # an absurd Retry-After.
         return float(min(retry_after, 3600.0))
+    if not isinstance(status_code, int) and isinstance(
+        exc, (asyncio.TimeoutError, TimeoutError)
+    ):
+        try:
+            return float(_get_plugin_cfg(None).get("timeout_cooldown_s", _DEFAULT_TIMEOUT_COOLDOWN_S))
+        except Exception:
+            return _DEFAULT_TIMEOUT_COOLDOWN_S
     if isinstance(status_code, int):
         return _DEFAULT_COOLDOWNS_S.get(status_code, 300.0)
     return 300.0
@@ -1066,7 +1099,9 @@ def _handle_error_cooldown(e, label, model_cooldowns, agent, api_base: str = "")
             pass
         return True
 
-    if _is_permanently_failed_model(e):
+    if _is_permanently_failed_model(e) and _classify_capacity(
+        label, agent, api_base
+    ) != "router":
         # 400-with-invalid-key is genuinely permanent (the user has to
         # change the key manually), so we keep the long cooldown. The
         # status-code-based 401/403/etc. path uses a 5-minute cooldown
