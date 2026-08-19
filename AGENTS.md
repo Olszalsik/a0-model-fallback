@@ -1117,6 +1117,70 @@ extra headroom), add the key to `config.json` or via the WebUI.
 cascades' call sites; `primary_is_router` cap in both `_compute_cycle_sleep`
 functions. `default_config.yaml` — six new documented knobs.
 
+### v2.6.8 — Paid-model warm-path drop-off + router 4xx lockout (2026-08-19)
+
+**Problem (the "drops off after one request" stall).** A working paid
+utility model — `a0_venice` (Agent Zero API), capacity `unlimited_paid` —
+succeeded on its first (cold, 90s) call, was marked "warm", and then its
+**second** call was forced onto the 20s warm fast-path. A long utility
+prompt legitimately needs more than 20s, so the call hit a pure
+`asyncio.TimeoutError` (no HTTP status). That pure timeout fell through
+to the conservative **300 s** unknown-error cooldown → a 5-minute stall
+on a model that was perfectly healthy. Symptom: "I have credit and it's
+working, but it drops off after one request and sits in cooldown."
+The same dynamic stalled `omniroute/auto/coding:free` when cycling.
+
+**Root cause: the warm ceiling + the 300s timeout cooldown, applied to a
+capacity class that should never use either.** Three fixes:
+
+* **Fix 1 — pure-timeout 45s cooldown** (`_cooldown_seconds_for_status`).
+  A pure `TimeoutError` (no status code) now cools ~45s
+  (`timeout_cooldown_s`, default 45) instead of 300s. A slow call is not a
+  broken model. Per-HTTP-status cooldowns (`_DEFAULT_COOLDOWNS_S` for 429,
+  500, etc.) are unchanged; Retry-After still wins.
+* **Fix 2 — `unlimited_paid` warm-path exemption** (`_resolve_per_call_timeout`).
+  Paid models legitimately run long utility prompts, so they always get the
+  full cold `base_timeout_s` — never the 20s warm ceiling. Only
+  `free_per_minute` labels keep the aggressive warm fast-path. This was the
+  decisive fix: the 2nd call no longer times out at 20s, so it never reaches
+  the cooldown path that caused the drop-off.
+* **Fix 3 (Fix B) — router 4xx exemption** (`_handle_error_cooldown`).
+  `_is_permanently_failed_model` is True for 401/402/403/404, so an
+  `omniroute/*` 401/403/404 used to hit the permanent-fail block → a 300s
+  (401/403) or 24h (404) cooldown. The permanent-fail block now skips
+  `router`-class labels, so a router 401/403/404 falls through to the 5s
+  `router_cooldown_s` block — the gateway re-routes the next call, so a
+  minutes-long lockout per outage was wrong. Non-router labels keep the
+  permanent 401/403/404 cooldown (sanity-tested).
+
+**Activation.** Same gotcha as v2.6.7: `plugins.get_plugin_config` does
+not merge `default_config.yaml` when a `config.json` exists. The new
+`timeout_cooldown_s` key only loads for installs with no `config.json`;
+for this install the fix still activates because
+`_cooldown_seconds_for_status` falls back to the module-level
+`_DEFAULT_TIMEOUT_COOLDOWN_S = 45.0` constant. `config.json` is left
+untouched.
+
+**Files.** `fallback.py` — `_DEFAULT_TIMEOUT_COOLDOWN_S` +
+pure-timeout branch in `_cooldown_seconds_for_status`; the
+`unlimited_paid` early-return in `_resolve_per_call_timeout`; the
+`_classify_capacity(...) != "router"` guard on the permanent-fail block
+in `_handle_error_cooldown`. `tests/test_router_capacity.py` — updated
+`test_resolve_per_call_timeout_non_router_warm_uses_warm` to use
+`ollama_cloud/*` (free_per_minute, since `a0_venice` is now exempt); added
+`test_resolve_per_call_timeout_unlimited_paid_warm_uses_base`,
+`test_handle_error_401_short_cooldown_for_router`,
+`test_handle_error_401_permanent_cooldown_for_non_router`, and the
+`_FakeAuthError` fixture. `default_config.yaml` — new documented
+`timeout_cooldown_s` knob. Manifest/stats/README bumped 2.6.6 → 2.6.8.
+Suite: 160/160. Commit `e91f63d` → Olszalsik/a0-model-fallback main.
+
+> The accompanying UI fix for the empty fallback-provider dropdown lives
+> in the `_model_config` plugin (`model-config-store.js` `ensureLoaded`
+> re-fetch + `model-field.html` fallback-select `x-effect`), commit
+> `648dd7e` → Olszalsik/a0-model-config main. That was a display bug, not
+> the cycling cause.
+
 ### v2.6 configuration knobs
 
 | Knob | Default | Phase | Effect |
@@ -1138,6 +1202,7 @@ functions. `default_config.yaml` — six new documented knobs.
 | `router_timeout_cooldown_s` | 0.0 | 2.6.7 | timeout cooldown when the above is false (Fix B) |
 | `router_max_cycle_delay_s` | 30 | 2.6.7 | cycle-backoff cap when the primary is router-class (Fix C); clamped `[0,3600]` |
 | `router_call_timeout_s` | 0.0 | 2.6.7 | per-call timeout headroom for router-class; `0` = cold base unchanged (Fix D) |
+| `timeout_cooldown_s` | 45 | 2.6.8 | cooldown for a *pure* timeout (no HTTP status) on a non-router label; replaces the 300s unknown-error cooldown. Per-status cooldowns unchanged |
 
 Phase 2 (`_classify_capacity`) and Phase 4 (the CancelledError-vs-TimeoutError
 split) have **no config toggle** — they are inherent behaviors of the cascade,
@@ -1177,3 +1242,9 @@ label prefix; to revert Phase 4, restore the legacy cleanup-on-cancel branch.
   primary-skip exemption for `router` labels are inherent (there is no knob
   to put a router into normal cooldown treatment — change the label prefix
   or remove it from `_DEFAULT_ROUTER_PROVIDERS`).
+- **v2.6.8 pure-timeout cooldown:** `timeout_cooldown_s: 300` restores the
+  legacy 300s unknown-error cooldown for pure timeouts. The
+  `unlimited_paid` warm-path exemption (Fix 2) and the router 4xx exemption
+  (Fix 3) have **no knob** — they are inherent capacity-class policies.
+  To make a paid model use the warm fast-path again, it would have to be
+  reclassified as `free_per_minute` (which is wrong for a paid endpoint).

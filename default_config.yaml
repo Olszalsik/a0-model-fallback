@@ -260,6 +260,18 @@ router_max_cycle_delay_s: 30.0
 # tier before the cascade times it out and moves on.
 router_call_timeout_s: 0.0
 
+# --- v2.6.8 Pure-timeout cooldown + paid warm-path exemption ----------------
+# A *pure* timeout (asyncio.TimeoutError / TimeoutError with NO HTTP status
+# code) used to fall through to the conservative 300s unknown-error cooldown.
+# But a slow call is not a broken model: the request was still in flight and
+# the next attempt often succeeds. `timeout_cooldown_s` (default 45s) caps
+# the cooldown for pure timeouts only -- per-HTTP-status cooldowns (429,
+# 500, etc. via _DEFAULT_COOLDOWNS_S) are unchanged. Applies to non-router
+# labels; router-class labels keep their own `router_timeout_*` knobs above.
+# Set to a higher value (e.g. 120) if you want pure timeouts to back off
+# longer; set to ~30 to retry faster. Clamped to >= 0.
+timeout_cooldown_s: 45.0
+
 # --- v2.6 Cascade per-call timeouts (added 2026-07-28) -------------------
 # First call to a label (within `cascade_warm_window_s`) gets the legacy
 # `fallback_utility_timeout_s` / `fallback_timeout_s` (the cold default).

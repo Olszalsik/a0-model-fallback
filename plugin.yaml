@@ -9,7 +9,7 @@ description: >
   v0->v1 import shim. (The server-side WebUI extensions cache moved to
   the ui_loader_optimizer plugin in v2.6.6.) Self-contained; no official
   agent-zero file is modified.
-version: 2.6.6
+version: 2.6.8
 settings_sections:
   - agent
   - developer

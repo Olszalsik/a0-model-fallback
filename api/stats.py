@@ -64,7 +64,7 @@ class Stats(ApiHandler):
             pass
 
         return {
-            "version": "2.6.6",
+            "version": "2.6.8",
             "utility_timeout": ut,
             "context_size_guard": context_size,
             "langchain_compat": langchain_shim,
