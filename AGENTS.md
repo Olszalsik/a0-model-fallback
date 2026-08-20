@@ -1175,6 +1175,56 @@ in `_handle_error_cooldown`. `tests/test_router_capacity.py` — updated
 `timeout_cooldown_s` knob. Manifest/stats/README bumped 2.6.6 → 2.6.8.
 Suite: 160/160. Commit `e91f63d` → Olszalsik/a0-model-fallback main.
 
+### v2.6.8 addendum — a0_venice api_base classification (2026-08-20)
+
+**Problem (Fix 2 didn't actually reach `a0_venice`).** Fix 2 above exempts
+`unlimited_paid` from the warm fast-path, and `_classify_capacity` returns
+`unlimited_paid` for the `a0_venice` provider segment (line 1030). But the
+a0_venice provider is registered with `litellm_provider: openai` (see
+`conf/model_providers.yaml`), so its cascade label arrives as
+`openai/deepseek-v4-flash` — the `a0_venice` segment check never matches and
+the label fell through to `free_per_minute`. So Fix 2's exemption silently
+missed the exact model it was written for, and the "drops off after one
+request" symptom persisted. This is the symmetric case of the v2.6.7
+omniroute mis-classification (same root cause: `litellm_provider: openai`
+aliasing), and the fix is the same shape: classify by the durable
+`api_base` signal.
+
+**Fix — `unlimited_paid_api_bases` matcher** (`_classify_capacity`). After
+the router api_base check, before the `free_per_minute` fallthrough, a
+candidate whose `api_base` contains a substring in `unlimited_paid_api_bases`
+(default `["llm.agent-zero.ai"]`, the a0_venice endpoint) is classified
+`unlimited_paid`. The `api_base` is threaded end-to-end: both cascade call
+sites pass `cand_api_base` → `_resolve_per_call_timeout(api_base=...)` →
+`_classify_capacity(label, agent, api_base)`. With `a0_venice` now correctly
+`unlimited_paid`, Fix 2's warm-path exemption reaches it → the 2nd call gets
+the full cold `base_timeout_s` → no 20s timeout → no 45s cooldown → the
+model no longer drops off after one request.
+
+**Activation.** Same gotcha as v2.6.7/v2.6.8: `get_plugin_config` does not
+merge `default_config.yaml` when a `config.json` exists. The new
+`unlimited_paid_api_bases` key only loads for installs with no `config.json`;
+for this install the fix activates via the module-level
+`_DEFAULT_UNLIMITED_PAID_API_BASES = ("llm.agent-zero.ai",)` constant.
+`config.json` is left untouched.
+
+**Files.** `fallback.py` — `_DEFAULT_UNLIMITED_PAID_API_BASES` constant +
+`_unlimited_paid_api_bases(agent)` + `_is_unlimited_paid_api_base(api_base,
+agent)` helpers (after `_DEFAULT_ROUTER_MAX_CYCLE_DELAY_S`); the
+`_is_unlimited_paid_api_base` call in `_classify_capacity`. The router and
+unlimited_paid api_base matchers are intentionally ordered
+router-then-unlimited_paid (a gateway api_base wins over a paid-endpoint
+api_base if both ever matched; in practice they're disjoint hosts).
+`default_config.yaml` — new documented `unlimited_paid_api_bases` knob.
+`tests/test_router_capacity.py` — added
+`test_classify_a0_venice_api_base_unlimited_paid` (the core regression:
+`openai/deepseek-v4-flash` without api_base → `free_per_minute`, with
+`llm.agent-zero.ai` → `unlimited_paid`; incl. case-insensitive + substring +
+specificity guards) and
+`test_resolve_per_call_timeout_a0_venice_api_base_warm_uses_base`
+(end-to-end: warm `openai/deepseek-v4-flash` + a0_venice api_base → 300s cold
+base, not 20s warm). Suite: 162/162.
+
 > The accompanying UI fix for the empty fallback-provider dropdown lives
 > in the `_model_config` plugin (`model-config-store.js` `ensureLoaded`
 > re-fetch + `model-field.html` fallback-select `x-effect`), commit
@@ -1203,6 +1253,7 @@ Suite: 160/160. Commit `e91f63d` → Olszalsik/a0-model-fallback main.
 | `router_max_cycle_delay_s` | 30 | 2.6.7 | cycle-backoff cap when the primary is router-class (Fix C); clamped `[0,3600]` |
 | `router_call_timeout_s` | 0.0 | 2.6.7 | per-call timeout headroom for router-class; `0` = cold base unchanged (Fix D) |
 | `timeout_cooldown_s` | 45 | 2.6.8 | cooldown for a *pure* timeout (no HTTP status) on a non-router label; replaces the 300s unknown-error cooldown. Per-status cooldowns unchanged |
+| `unlimited_paid_api_bases` | `["llm.agent-zero.ai"]` | 2.6.8 | api_base substrings classified `unlimited_paid` (durable); catches the a0_venice primary whose `litellm_provider: openai` makes its label `openai/deepseek-v4-flash`, so the warm-path exemption (Fix 2) reaches it. `[]` disables (→ `free_per_minute`) |
 
 Phase 2 (`_classify_capacity`) and Phase 4 (the CancelledError-vs-TimeoutError
 split) have **no config toggle** — they are inherent behaviors of the cascade,
@@ -1248,3 +1299,8 @@ label prefix; to revert Phase 4, restore the legacy cleanup-on-cancel branch.
   (Fix 3) have **no knob** — they are inherent capacity-class policies.
   To make a paid model use the warm fast-path again, it would have to be
   reclassified as `free_per_minute` (which is wrong for a paid endpoint).
+- **v2.6.8 a0_venice api_base matcher:** `unlimited_paid_api_bases: []`
+  disables the durable api_base classification — an `openai/...`-aliased
+  paid endpoint then falls back to `free_per_minute` (the original
+  drop-off symptom returns). Add a host substring here for any other paid
+  endpoint that runs through an `openai`-aliased `litellm_provider`.

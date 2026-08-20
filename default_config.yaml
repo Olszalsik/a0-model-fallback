@@ -272,6 +272,23 @@ router_call_timeout_s: 0.0
 # longer; set to ~30 to retry faster. Clamped to >= 0.
 timeout_cooldown_s: 45.0
 
+# --- v2.6.8 unlimited_paid api_base matcher (a0_venice / Agent Zero API) ---
+# The paid-model warm-path exemption above only reaches a label that
+# _classify_capacity returns ``unlimited_paid`` for. The a0_venice provider
+# ("Agent Zero API") is registered with ``litellm_provider: openai``, so its
+# cascade label arrives as ``openai/deepseek-v4-flash`` -- the provider-segment
+# check (``a0_venice``) never matches and it falls through to
+# ``free_per_minute``, which keeps the aggressive 20s warm ceiling. The result
+# is the "works once, then drops off" symptom: the 2nd call times out at 20s
+# -> 45s cooldown -> the agent stalls.
+# This matcher is the durable fix (same shape as v2.6.7's router_api_bases):
+# substring match on the candidate's api_base. The default
+# ``llm.agent-zero.ai`` is the a0_venice endpoint. Add other paid endpoints
+# here when a paid provider also runs through an ``openai``-aliased label.
+# Set to [] to disable (falls back to free_per_minute for these labels).
+unlimited_paid_api_bases:
+  - llm.agent-zero.ai
+
 # --- v2.6 Cascade per-call timeouts (added 2026-07-28) -------------------
 # First call to a label (within `cascade_warm_window_s`) gets the legacy
 # `fallback_utility_timeout_s` / `fallback_timeout_s` (the cold default).

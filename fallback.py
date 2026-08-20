@@ -901,6 +901,48 @@ _DEFAULT_ROUTER_API_BASES = (
 # time. 30s keeps the probe responsive.
 _DEFAULT_ROUTER_MAX_CYCLE_DELAY_S = 30.0
 
+# v2.6.8 -- api_base matchers for the ``unlimited_paid`` capacity class.
+# Mirrors the v2.6.7 router api_base approach (see _DEFAULT_ROUTER_API_BASES)
+# for the symmetric mis-classification: the a0_venice ("Agent Zero API")
+# provider is registered with ``litellm_provider: openai``
+# (conf/model_providers.yaml), so its chat/utility model_name arrives as
+# ``openai/deepseek-v4-flash`` -- NOT ``a0_venice/...`` -- and the legacy
+# ``provider == "a0_venice"`` check misses it, classifying a paid endpoint as
+# ``free_per_minute``. That puts it on the 20s warm fast-path: a paid model
+# that legitimately runs a long utility prompt succeeds once, is marked warm,
+# then its 2nd call times out at 20s -> 300s (now 45s) cooldown -> the
+# "drops off after one request" symptom. Classifying it ``unlimited_paid`` via
+# its durable api_base (``llm.agent-zero.ai``) makes the v2.6.8 warm-path
+# exemption (see _resolve_per_call_timeout) reach it. Extend via plugin config
+# ``unlimited_paid_api_bases`` if a paid endpoint runs on a non-default host.
+_DEFAULT_UNLIMITED_PAID_API_BASES = (
+    "llm.agent-zero.ai",
+)
+
+
+def _unlimited_paid_api_bases(agent) -> tuple:
+    """Configured api_base substrings identifying an ``unlimited_paid``
+    endpoint (e.g. a0_venice / Agent Zero API). Falls back to
+    ``_DEFAULT_UNLIMITED_PAID_API_BASES`` when plugin config is unavailable."""
+    try:
+        cfg = _get_plugin_cfg(agent) if agent is not None else {}
+        raw = cfg.get("unlimited_paid_api_bases", _DEFAULT_UNLIMITED_PAID_API_BASES)
+    except Exception:
+        raw = _DEFAULT_UNLIMITED_PAID_API_BASES
+    if isinstance(raw, str):
+        raw = [raw]
+    return tuple(str(b).strip().lower() for b in raw if str(b).strip())
+
+
+def _is_unlimited_paid_api_base(api_base: str, agent=None) -> bool:
+    if not isinstance(api_base, str) or not api_base:
+        return False
+    low = api_base.lower()
+    for b in _unlimited_paid_api_bases(agent):
+        if b and b in low:
+            return True
+    return False
+
 
 def _router_label_prefixes(agent) -> tuple:
     """Configured router label prefixes (lowercased). Falls back to
@@ -1002,6 +1044,14 @@ def _classify_capacity(label: str, agent=None, api_base: str = "") -> str:
     # gateway, so classify by where the call actually goes.
     if _is_router_api_base(api_base, agent):
         return "router"
+    # v2.6.8: api_base match for unlimited_paid -- the symmetric case. The
+    # a0_venice ("Agent Zero API") primary arrives as "openai/deepseek-v4-flash"
+    # (litellm_provider: openai), so the provider-segment check above misses it
+    # and it would fall through to free_per_minute. Its api_base
+    # (llm.agent-zero.ai) is the durable signal that it's a paid endpoint,
+    # which makes the warm-path exemption (v2.6.8) reach it.
+    if _is_unlimited_paid_api_base(api_base, agent):
+        return "unlimited_paid"
     # nvidia_nim, groq, mistral, cohere, together_ai,
     # together, deepseek, anthropic, google, openai, etc. — all metered
     # or rate-limited at the per-minute granularity.

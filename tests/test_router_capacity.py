@@ -423,3 +423,59 @@ def test_resolve_per_call_timeout_cold_label_uses_base():
         assert got == 300.0, f"cold label must use base (300s), got {got}"
     finally:
         _fb_mod._WARM_LABELS.pop(label, None)
+
+
+def test_classify_a0_venice_api_base_unlimited_paid():
+    """v2.6.8: the a0_venice primary ("Agent Zero API") is registered with
+    ``litellm_provider: openai``, so its cascade label arrives as
+    ``openai/deepseek-v4-flash`` -- the ``a0_venice`` provider-segment check
+    never matches and it would fall through to ``free_per_minute``. The
+    durable signal is its api_base (``llm.agent-zero.ai``): classify by where
+    the call actually goes, so the warm-path exemption reaches it."""
+    # Without the api_base, the openai-aliased label is free_per_minute
+    # (the regression we're guarding against).
+    assert _classify_capacity("openai/deepseek-v4-flash") == "free_per_minute"
+    # With the a0_venice api_base, it is unlimited_paid.
+    assert _classify_capacity(
+        "openai/deepseek-v4-flash", api_base="https://llm.agent-zero.ai/v1"
+    ) == "unlimited_paid"
+    # Substring match -- trailing path / scheme variants all hit.
+    assert _classify_capacity(
+        "openai/deepseek-v4-flash", api_base="http://llm.agent-zero.ai:443/v1/chat"
+    ) == "unlimited_paid"
+    # Case-insensitive.
+    assert _classify_capacity(
+        "openai/deepseek-v4-flash", api_base="HTTPS://LLM.AGENT-ZERO.AI/V1"
+    ) == "unlimited_paid"
+    # A genuinely-free openai-aliased label with a different api_base stays
+    # free_per_minute (the matcher is specific, not a blanket openai catch).
+    assert _classify_capacity(
+        "openai/some-free-model", api_base="https://free.example.com/v1"
+    ) == "free_per_minute"
+
+
+def test_resolve_per_call_timeout_a0_venice_api_base_warm_uses_base():
+    """v2.6.8 end-to-end: a warm ``openai/deepseek-v4-flash`` whose api_base is
+    the a0_venice endpoint (``llm.agent-zero.ai``) gets the full cold
+    ``base_timeout_s`` -- NOT the 20s warm ceiling. This is the real
+    "works once, then drops off after one request" symptom: the 2nd call
+    timed out at 20s -> 300s cooldown. The api_base matcher classifies it
+    ``unlimited_paid`` so the warm-path exemption applies."""
+    label = "openai/deepseek-v4-flash"
+    api_base = "https://llm.agent-zero.ai/v1"
+    saved = _fb_mod._WARM_LABELS.get(label)
+    try:
+        _fb_mod._WARM_LABELS[label] = time.monotonic()  # mark warm
+        got = _fb_mod._resolve_per_call_timeout(
+            label, base_timeout_s=300.0, warm_timeout_s=20.0, warm_window_s=600.0,
+            api_base=api_base,
+        )
+        assert got == 300.0, (
+            f"warm a0_venice (api_base-matched unlimited_paid) must use cold "
+            f"base (300s), got {got}"
+        )
+    finally:
+        if saved is None:
+            _fb_mod._WARM_LABELS.pop(label, None)
+        else:
+            _fb_mod._WARM_LABELS[label] = saved
