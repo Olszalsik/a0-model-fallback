@@ -1231,6 +1231,61 @@ base, not 20s warm). Suite: 162/162.
 > `648dd7e` → Olszalsik/a0-model-config main. That was a display bug, not
 > the cycling cause.
 
+### v2.6.9 — stagnation closure `nonlocal` fix (2026-08-25)
+
+**Problem (crash during a sustained outage).** The v2.6 Phase 3 stagnation
+code crashed with `UnboundLocalError: cannot access local variable
+'stagnation_logged_this_outage'` exactly when the agent was already
+slow — during a sustained outage where every candidate is in cooldown
+and `consecutive_no_success_cycles` crosses `cycle_stagnation_threshold`
+in continuous mode. The crash fired inside `history.compress()`
+(via `summarize_messages` → `call_utility_model` → the utility cascade),
+killing history compression on top of the underlying outage.
+
+**Root cause — closure scoping.** `stagnation_logged_this_outage` is
+declared in the outer cascade function (~line 1561) as the one-log-per-
+outage gate. The nested `_compute_cycle_sleep` both *reads* it
+(`if not stagnation_logged_this_outage:`) and *writes* it (`= True`).
+In Python, **any** assignment in a function body makes that name local to
+the *entire* function, so the read above the assignment raises
+`UnboundLocalError` — the outer declaration is ignored, no `nonlocal`
+was declared. Trigger requires `continuous_mode` + stagnation
+threshold reached + `cycle_stagnation_factor > 1.0`, which is why it
+only surfaced mid-outage, not in normal operation or the test suite.
+
+**Second, silent layer (both cascades).** The `_succeed` nested functions
+reset `consecutive_no_success_cycles = 0` and
+`stagnation_logged_this_outage = False` on recovery, but their
+`nonlocal` lines only declared `consecutive_full_cycles,
+fallback_started_at` — so those resets wrote to throwaway locals. In the
+utility cascade this means the stagnation log-gate never re-armed and
+the counter never truly reset after a recovery. In the chat cascade the
+vars aren't consumed by `_compute_cycle_sleep` (no stagnation block
+there), so it was harmless dead code — but the same latent trap.
+
+**Fix.** Added `nonlocal stagnation_logged_this_outage` inside the
+utility `_compute_cycle_sleep`; added
+`nonlocal consecutive_no_success_cycles, stagnation_logged_this_outage`
+to both `_succeed` functions (utility + chat). No behavioral change to
+the algorithm, only to which scope the gate/counter live in.
+
+**Why the 162/162 suite missed it.** `tests/test_adaptive_sleep_v26.py`
+drives a `_compute_replica` helper that re-implements the envelope with a
+passed-in `log_emitted: list` and `.append()` — it never assigns to a
+closure gate variable, so it structurally cannot reproduce the
+read-then-write-without-`nonlocal` trap. The real closure was untested.
+A future regression test should drive the actual
+`_patched_call_utility_model` closure through a stagnation cycle.
+
+**Files.** `fallback.py` only — three `nonlocal` additions, no algorithm
+or config change. `py_compile` clean; 9/9 stagnation tests pass; full
+suite 158/162 on the Windows host (the 4 fails are the pre-existing
+container-path `/a0/.../default_config.yaml` `FileNotFoundError`, unrelated;
+they pass inside the container). Note this fix only stops the *crash*
+during an outage; the underlying provider outage is upstream and is
+routed around by the existing cooldown/router-detection logic once the
+crash stops masking it.
+
 ### v2.6 configuration knobs
 
 | Knob | Default | Phase | Effect |

@@ -1693,6 +1693,13 @@ async def _patched_call_utility_model(
         ``stagnation_logged_this_outage``), not per cycle. The
         ``max_cycle_delay_s`` cap is reapplied after amplification so we
         never sleep longer than the configured ceiling."""
+        # _succeed resets this on recovery; we set it True here to gate the
+        # one-log-per-outage message. Without `nonlocal` the assignment at
+        # the bottom of this block makes Python treat it as a local for the
+        # whole function, so the read above the assignment raises
+        # UnboundLocalError during a sustained outage (the agent-slowdown
+        # scenario). See memory: model-fallback stagnation nonlocal.
+        nonlocal stagnation_logged_this_outage
         import random
         cap = max_cycle_delay_s
         # v2.6.7 Fix C: when the primary is a self-healing router, probe
@@ -1926,6 +1933,13 @@ async def _patched_call_utility_model(
             # Continuous mode: if we were in a long fallback stretch, announce
             # the recovery so the user can correlate with provider quotas.
             nonlocal consecutive_full_cycles, fallback_started_at
+            # Phase 3 stagnation counter + one-log-per-outage gate also live
+            # in the enclosing scope; reset them here so the next zero-success
+            # run re-arms the gate and re-counts from 0. Without these the
+            # resets below wrote to throwaway locals (silent no-op), so after
+            # the first stagnation the gate never re-armed. See memory:
+            # model-fallback stagnation nonlocal.
+            nonlocal consecutive_no_success_cycles, stagnation_logged_this_outage
             if continuous_mode and consecutive_full_cycles > 0:
                 elapsed = int(time.monotonic() - fallback_started_at)
                 recovery_msg = (
@@ -2582,6 +2596,12 @@ async def _patched_call_chat_model(
                 PrintStyle(font_color="cyan", padding=True).print(ok)
             # Continuous mode: announce recovery from a long fallback stretch.
             nonlocal consecutive_full_cycles, fallback_started_at
+            # Phase 3 stagnation counter + one-log-per-outage gate live in
+            # the enclosing scope. The chat _compute_cycle_sleep doesn't
+            # consume them yet, but reset them properly so a future
+            # stagnation block can't silently break the same way. See memory:
+            # model-fallback stagnation nonlocal.
+            nonlocal consecutive_no_success_cycles, stagnation_logged_this_outage
             if continuous_mode and consecutive_full_cycles > 0:
                 elapsed = int(time.monotonic() - fallback_started_at)
                 recovery_msg = (
