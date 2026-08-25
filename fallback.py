@@ -153,6 +153,28 @@ _INMEM_HEALTHY_LABELS: dict = {}
 # cycle. Tunable via plugin config (health_horizon_s).
 _DEFAULT_HEALTH_HORIZON_S = 60.0
 
+# v2.6.8: cross-agent PERMANENT-FAIL blocklist -- the inverse of
+# _INMEM_HEALTHY_LABELS. Keyed by label (process-global, not per-agent),
+# maps label -> (status_code, expires_at). When ANY agent in this process
+# hits a genuinely permanent failure on a label (404 model-gone, or
+# 401/402/403 auth/quota -- the same API key/credentials are shared by
+# every agent, so the failure is shared), the label is marked dead here
+# so other agents skip it without re-paying the failure tax.
+#
+# EXPIRY IS INTENTIONAL (the user's 2026-08-25 caveat: "don't block
+# forever"). Each entry carries its own expires_at matching the
+# per-status cooldown (403 no-quota -> 5 min, so Venice's daily free
+# quota is re-probed and recovers after midnight UTC; 404 gone -> 24 h).
+# _is_label_dead pops the entry once it expires, so the next agent to
+# reach the label re-probes live and re-marks if still dead. A later
+# success clears the entry (see _mark_label_healthy).
+#
+# Excluded from the dead-mark: 429 (transient, per-agent Retry-After
+# already handles it), 5xx/timeout (transient), context-overflow and
+# payload-too-large (per-PROMPT, not per-model -- a different agent's
+# smaller prompt must not be blocked by another's oversize one).
+_INMEM_DEAD_LABELS: dict = {}
+
 # --- v2.6 warm/cold cascade timeouts --------------------------------------
 # Per-label "last successful call" timestamp. Mirrors _INMEM_HEALTHY_LABELS
 # but serves a different purpose: healthy labels trigger cross-agent
@@ -804,6 +826,11 @@ def _mark_label_healthy(agent, label: str) -> None:
         horizon = _DEFAULT_HEALTH_HORIZON_S
     horizon = max(5.0, min(horizon, 600.0))
     _INMEM_HEALTHY_LABELS[label] = time.monotonic() + horizon
+    # v2.6.8: a success supersedes any stale cross-agent dead-mark for
+    # this label (e.g. Venice's quota just refreshed after midnight, or
+    # a 404 model came back). Symmetric with _mark_label_dead clearing
+    # the healthy index.
+    _INMEM_DEAD_LABELS.pop(label, None)
 
 
 def _maybe_clear_cooldown_for_healthy_label(agent, label: str) -> bool:
@@ -831,6 +858,90 @@ def _maybe_clear_cooldown_for_healthy_label(agent, label: str) -> bool:
         return False
     store.pop(label, None)
     _save_cooldown_store(agent, store)
+    return True
+
+
+def _is_dead_for_all_agents(exc) -> bool:
+    """True for failures that are dead for EVERY agent in this process
+    (not just the one that hit them), and therefore belong in the shared
+    _INMEM_DEAD_LABELS blocklist.
+
+    The qualifying set is deliberately narrow (see _INMEM_DEAD_LABELS):
+      - 404: the model slug is gone/deprecated on the upstream. Re-routing
+        or retrying won't bring it back; every agent sharing the config
+        will 404 too.
+      - 401/402/403: auth / payment / quota. All agents share the same API
+        key and credentials, so an auth or quota-exhaustion failure is
+        shared. The dead-mark EXPIRES (5 min for 401/403, 1 h for 402) so
+        a daily-reset quota like Venice's free tier is re-probed and
+        recovers on its own schedule -- this is never a forever-block.
+      - 400 invalid-api-key: the key is wrong for everyone until the user
+        fixes it manually.
+
+    Excluded: 429 (transient; per-agent Retry-After handles it), 5xx and
+    pure timeouts (transient), context-overflow and payload-too-large
+    (per-PROMPT, not per-model -- blocking the label for all agents would
+    wrongly punish an agent with a smaller prompt).
+    """
+    if _is_invalid_api_key_400(exc):
+        return True
+    status_code = getattr(exc, "status_code", None)
+    return isinstance(status_code, int) and status_code in (401, 402, 403, 404)
+
+
+def _mark_label_dead(label: str, exc, agent=None) -> None:
+    """Record `label` as permanently failed in the shared cross-agent
+    blocklist, with an EXPIRING window (never forever). Called from
+    _handle_error_cooldown after the per-agent cooldown is also set --
+    the per-agent cooldown governs THIS agent's rotation; the shared
+    dead-mark stops OTHER agents from re-paying the same failure tax.
+
+    The dead window matches the per-status cooldown
+    (_cooldown_seconds_for_status) so re-probe cadence is unchanged:
+    Venice's no-quota 403 is re-probed every 5 min and recovers after
+    midnight; a gone 404 slug is re-probed every 24 h. _is_label_dead
+    auto-evicts expired entries, so the next agent to reach the label
+    re-probes live and re-marks if still dead.
+    """
+    if not _is_dead_for_all_agents(exc):
+        return
+    status_code = getattr(exc, "status_code", None)
+    if _is_invalid_api_key_400(exc):
+        dur = 86400.0
+    else:
+        dur = _cooldown_seconds_for_status(status_code, exc)
+    # Floor at 60s so a misconfigured Retry-After can't make the shared
+    # dead-mark vanish before any other agent even sees it; cap at 24h.
+    dur = max(60.0, min(dur, 86400.0))
+    _INMEM_DEAD_LABELS[label] = (status_code, time.monotonic() + dur)
+    # A fresh dead-mark supersedes any stale healthy signal (symmetric
+    # with _mark_label_healthy clearing the dead index).
+    _INMEM_HEALTHY_LABELS.pop(label, None)
+    try:
+        log_fn = getattr(getattr(agent, "context", None), "log", None)
+        if log_fn is not None:
+            log_fn(
+                "info",
+                f"[{label}] marked dead cross-agent (status {status_code}); "
+                f"other agents will skip it for {int(dur)}s.",
+            )
+    except Exception:
+        pass
+
+
+def _is_label_dead(label: str) -> bool:
+    """True if `label` is currently in the shared cross-agent dead
+    blocklist. Auto-evicts expired entries (so the next agent re-probes
+    live) and returns False once expired -- this is the "don't block
+    forever" guarantee.
+    """
+    entry = _INMEM_DEAD_LABELS.get(label)
+    if entry is None:
+        return False
+    _status, expires_at = entry
+    if expires_at <= time.monotonic():
+        _INMEM_DEAD_LABELS.pop(label, None)
+        return False
     return True
 
 
@@ -1163,6 +1274,10 @@ def _handle_error_cooldown(e, label, model_cooldowns, agent, api_base: str = "")
         store[label] = time.monotonic() + dur
         _record_last_status(agent, store, label, status_code)
         _save_cooldown_store(agent, store)
+        # v2.6.8: share the permanent fail cross-agent so other agents
+        # skip this label without re-paying the tax. Expiring (5 min for
+        # 401/403 quota, 24 h for 404 gone) -- never a forever-block.
+        _mark_label_dead(label, e, agent)
         if dur >= 3600.0:
             # Log only long cooldowns; the short ones are noise.
             try:
@@ -1206,6 +1321,14 @@ def _handle_error_cooldown(e, label, model_cooldowns, agent, api_base: str = "")
             store[label] = time.monotonic() + dur
             _record_last_status(agent, store, label, status_code)
             _save_cooldown_store(agent, store)
+        # v2.6.8: a router 404/auth is dead for all agents (gone slug or
+        # shared bad key), even though routers otherwise self-heal on
+        # 429/5xx/timeout. _mark_label_dead self-gates via
+        # _is_dead_for_all_agents, so it no-ops for the transient cases
+        # above and only marks the genuinely-permanent ones cross-agent.
+        # The shared dead-window is the long status-appropriate dur (24 h
+        # for 404); THIS agent keeps the short router cooldown above.
+        _mark_label_dead(label, e, agent)
         return True
     dur = _cooldown_seconds_for_status(status_code, e)
     # Don't apply cooldowns shorter than 30s -- they'd be cleared by the
@@ -1532,6 +1655,10 @@ async def _patched_call_utility_model(
     # ~150 countdown lines (300s -> 0s) per error cycle (Laci,
     # 2026-07-21).
     _last_skip_log_until: dict = {}
+    # v2.6.8: dedupe for the cross-agent dead-label skip log. Keyed by
+    # label -> the dead-entry expires_at we last logged, so a dead label
+    # announces its skip once per dead-window instead of every ~2s tick.
+    _last_dead_log_until: dict = {}
 
     # --- Continuous-fallback state -----------------------------------------
     # When `continuous_fallback` is true, the cascade runs forever (instead
@@ -1754,6 +1881,25 @@ async def _patched_call_utility_model(
         cand_api_base = _get_candidate_api_base(candidates[idx], model_obj)
 
         # Skip models in cooldown
+        # v2.6.8: cross-agent permanent-fail blocklist. If ANY agent in
+        # this process marked `label` dead (404 gone / auth-quota) and
+        # the shared entry hasn't expired, skip without paying the call.
+        # The entry expires on its own (5 min for quota -> Venice
+        # recovers after midnight; 24 h for a gone slug), so this is
+        # never a forever-block. Mirrors the cooldown-skip below: advance
+        # idx without counting the slot as "tried this cycle".
+        if _is_label_dead(label):
+            _status, dead_until = _INMEM_DEAD_LABELS[label]
+            if _last_dead_log_until.get(label) != dead_until:
+                _last_dead_log_until[label] = dead_until
+                self.context.log.log(
+                    "info",
+                    f"Utility model [{label}] dead cross-agent "
+                    f"(status {_status}), skipping "
+                    f"{int(dead_until - time.monotonic())}s",
+                )
+            attempt += 1
+            continue
         cooldown_until = model_cooldowns.get(label)
         # v2.5.2: cross-agent healthy-label reset. If another agent's
         # cascade just succeeded on this label within health_horizon_s,
@@ -2267,6 +2413,9 @@ async def _patched_call_chat_model(
     # cooldown window, not once per ~2s iteration. See the comment in
     # _patched_call_utility_model for the rationale (Laci, 2026-07-21).
     _last_skip_log_until: dict = {}
+    # v2.6.8: dedupe for the cross-agent dead-label skip log (mirrors
+    # the utility cascade's _last_dead_log_until above).
+    _last_dead_log_until: dict = {}
 
     # --- Continuous-fallback state -----------------------------------------
     # Mirrors _patched_call_utility_model. The chat cascade runs the same
@@ -2444,6 +2593,22 @@ async def _patched_call_chat_model(
         cand_api_base = _get_candidate_api_base(candidates[idx], model_obj)
 
         # Skip models in cooldown
+        # v2.6.8: cross-agent permanent-fail blocklist. Mirrors the
+        # utility cascade's dead-check above -- skip a label any agent
+        # marked dead (404 / auth-quota) without paying the call. Expiring
+        # (never forever); see _INMEM_DEAD_LABELS.
+        if _is_label_dead(label):
+            _status, dead_until = _INMEM_DEAD_LABELS[label]
+            if _last_dead_log_until.get(label) != dead_until:
+                _last_dead_log_until[label] = dead_until
+                self.context.log.log(
+                    "info",
+                    f"Chat model [{label}] dead cross-agent "
+                    f"(status {_status}), skipping "
+                    f"{int(dead_until - time.monotonic())}s",
+                )
+            attempt += 1
+            continue
         cooldown_until = model_cooldowns.get(label)
         # v2.5.2: cross-agent healthy-label reset. See
         # _maybe_clear_cooldown_for_healthy_label. Mirrors the utility
