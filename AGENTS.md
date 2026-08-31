@@ -1286,6 +1286,84 @@ during an outage; the underlying provider outage is upstream and is
 routed around by the existing cooldown/router-detection logic once the
 crash stops masking it.
 
+### v2.7.0 — Router cold-call warm-up budget + cross-agent dead-mark exemption (2026-08-31)
+
+**Problem (the "omniroute mislabeled unavailable" stall under
+multi-agent load).** Three concurrent agents with
+`omniroute/auto/coding:free` in the utility chain burn the gateway's free
+pool fast. Two compounding failures followed. (1) **Every warm-up call
+died at exactly 60 s.** After pool exhaustion the gateway must re-route
+to a fresh upstream, and that warm-up (probing rate-limited/dead slugs
+before landing on a working one) routinely exceeds the user's 60 s
+utility cold base (`fallback_utility_timeout_s: 60`). The router branch
+in `_resolve_per_call_timeout` had no cold/warm awareness: it returned
+`max(base, router_call_timeout_s=0)` = 60 s unconditionally, so the
+gateway never got the headroom to finish re-routing — one
+`timed out after 60s` per cycle, then the cascade cycled away.
+(2) **Worse, the gateway got cross-agent dead-marked.** The gateway
+surfaces its upstreams' failures: one pooled upstream's 401/403/404 (dead
+free slugs are common on openrouter) arrives as a gateway 4xx. The
+`_mark_label_dead` call in the router block of `_handle_error_cooldown`
+then put the `omniroute/<combo>` label into `_INMEM_DEAD_LABELS` with the
+per-status dead window — **24 h for 404** — blocking the label for every
+agent in the process even though the gateway itself was healthy and had
+eleven other upstreams. Symptom: "the fallback plugin labels omniroute
+cooldown/broken, but in reality it still has 32 free models."
+
+**Root cause: two router-specific policies that fit a metered endpoint
+but not a pooled self-healing gateway.** A timeout at the base budget is
+a warm-up-in-progress, not a broken endpoint; and a gateway-surfaced
+upstream 4xx is one upstream's state, not shared endpoint death (the
+gateway re-routes the next call and its own connection health —
+`exhausted_connection` exclusions, rate-limit backoffs — is the
+authority for upstream choice).
+
+**Fix 1 — cold-state warm-up budget (`_resolve_per_call_timeout`).**
+New knob `router_cold_call_timeout_s` (module default
+`_DEFAULT_ROUTER_COLD_CALL_TIMEOUT_S = 150.0`). For a router-class label
+that is COLD (no entry in `_WARM_LABELS` within the effective warm
+window — the same warm model the warm fast-path uses), return
+`max(router_budget, router_cold_call_timeout_s)` where
+`router_budget = max(base, router_call_timeout_s)` (Fix D unchanged).
+Warm router calls keep the fast base, composing with Fix D. `<= 0`
+disables. This is the inverse direction of the existing warm/cold
+system: warm/cold *shortens* healthy cloud calls; cold-budget *extends*
+a gateway's first call after pool churn.
+
+**Fix 2 — router dead-mark exemption (`_mark_label_dead`).** The
+function self-gates: a router-class label (via
+`_classify_capacity(label, agent, api_base)` — both the label-prefix
+(A1) and api_base (A2) detection paths) returns before the
+`_is_dead_for_all_agents` check, so a gateway-surfaced upstream
+401/402/403/404 can no longer poison the shared blocklist. `api_base` is
+threaded from both call sites inside `_handle_error_cooldown` (it was
+already a parameter there since v2.6.7). The router block's call is
+removed outright (the whole block is router-class by construction);
+non-router labels keep the shared dead-mark unchanged. Per-agent
+cooldowns for router labels are unchanged in every branch — only the
+cross-agent mark is skipped.
+
+**Activation.** Same gotcha as v2.6.7/v2.6.8: `get_plugin_config` does
+not merge `default_config.yaml` when a `config.json` exists. The new
+`router_cold_call_timeout_s` key only loads for installs with no
+`config.json`; for this install the fix activates via the module-level
+`_DEFAULT_ROUTER_COLD_CALL_TIMEOUT_S = 150.0` constant and the inline
+default in `_resolve_per_call_timeout`. `config.json` is left untouched.
+
+**Files.** `fallback.py` — `_DEFAULT_ROUTER_COLD_CALL_TIMEOUT_S`
+constant (after `_DEFAULT_ROUTER_MAX_CYCLE_DELAY_S`); the rewritten
+`capacity == "router"` branch of `_resolve_per_call_timeout`; the
+`api_base` param + router guard on `_mark_label_dead`; both
+`_handle_error_cooldown` call-site updates (permanent-fail call passes
+`api_base`; the router block no longer marks dead).
+`default_config.yaml` — new documented `router_cold_call_timeout_s: 150.0`
+knob in the router block. `tests/test_router_capacity.py` — six new tests:
+cold→150, warm→base(60), knob-0 disable, cold composes with
+`router_call_timeout_s`, dead-mark skips routers (label-prefix path),
+dead-mark skips routers (api_base path). `plugin.yaml`/`README.md`
+bumped 2.6.8 → 2.7.0. Suite: 179/179 on the Windows host
+(`REPO_ROOT_OVERRIDE="$(pwd -W)"`).
+
 ### v2.6 configuration knobs
 
 | Knob | Default | Phase | Effect |
@@ -1307,6 +1385,7 @@ crash stops masking it.
 | `router_timeout_cooldown_s` | 0.0 | 2.6.7 | timeout cooldown when the above is false (Fix B) |
 | `router_max_cycle_delay_s` | 30 | 2.6.7 | cycle-backoff cap when the primary is router-class (Fix C); clamped `[0,3600]` |
 | `router_call_timeout_s` | 0.0 | 2.6.7 | per-call timeout headroom for router-class; `0` = cold base unchanged (Fix D) |
+| `router_cold_call_timeout_s` | 150 | 2.7.0 | per-call timeout for a COLD router call (no success within the warm window): `max(base, router_call_timeout_s, this)`; covers gateway warm-up after free-pool exhaustion; `<= 0` disables |
 | `timeout_cooldown_s` | 45 | 2.6.8 | cooldown for a *pure* timeout (no HTTP status) on a non-router label; replaces the 300s unknown-error cooldown. Per-status cooldowns unchanged |
 | `unlimited_paid_api_bases` | `["llm.agent-zero.ai"]` | 2.6.8 | api_base substrings classified `unlimited_paid` (durable); catches the a0_venice primary whose `litellm_provider: openai` makes its label `openai/deepseek-v4-flash`, so the warm-path exemption (Fix 2) reaches it. `[]` disables (→ `free_per_minute`) |
 

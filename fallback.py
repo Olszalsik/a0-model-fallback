@@ -217,8 +217,10 @@ def _resolve_per_call_timeout(
     handled at the call site, not here — this helper is only invoked
     after the kwarg has already been checked (so a user kwarg wins
     regardless of warm state). Router-class labels (omniroute/*, or any
-    label whose api_base points at a router gateway) always get the
-    cold ``base_timeout_s`` -- see the note in the body.
+    label whose api_base points at a router gateway) skip the warm
+    fast-path: warm router calls get the cold ``base_timeout_s``, and a
+    COLD router call gets ``router_cold_call_timeout_s`` (v2.7.0 warm-up
+    budget) -- see the notes in the body.
     """
     try:
         # v2.6.3: router-class labels (omniroute/* -- self-healing gateways
@@ -240,10 +242,32 @@ def _resolve_per_call_timeout(
         capacity = _classify_capacity(label, agent, api_base)
         if capacity == "router":
             try:
-                rt = float(_get_plugin_cfg(agent).get("router_call_timeout_s", 0.0))
+                cfg = _get_plugin_cfg(agent)
+                rt = float(cfg.get("router_call_timeout_s", 0.0))
             except Exception:
+                cfg = {}
                 rt = 0.0
-            return base_timeout_s if rt <= 0 else max(base_timeout_s, rt)
+            # v2.7.0: a COLD router call (no success within the warm window)
+            # is usually re-routing to a fresh upstream after the free pool
+            # was exhausted; give it the warm-up budget instead of dying a
+            # "timed out after 60s" death every cycle. Once a call succeeds
+            # the label is warm and the fast base resumes.
+            router_budget = base_timeout_s if rt <= 0 else max(base_timeout_s, rt)
+            try:
+                cold_budget = float(
+                    cfg.get(
+                        "router_cold_call_timeout_s",
+                        _DEFAULT_ROUTER_COLD_CALL_TIMEOUT_S,
+                    )
+                )
+            except Exception:
+                cold_budget = _DEFAULT_ROUTER_COLD_CALL_TIMEOUT_S
+            if cold_budget <= 0:
+                return router_budget
+            is_warm = time.monotonic() - _WARM_LABELS.get(label, 0.0) < warm_window_s
+            if is_warm:
+                return router_budget
+            return max(router_budget, cold_budget)
         # Paid (non-free) models legitimately run long utility prompts --
         # history summarization of a long chat, JSON memory work, document
         # rewriting. The 20s warm ceiling (``cascade_warm_timeout_s``) was
@@ -889,12 +913,22 @@ def _is_dead_for_all_agents(exc) -> bool:
     return isinstance(status_code, int) and status_code in (401, 402, 403, 404)
 
 
-def _mark_label_dead(label: str, exc, agent=None) -> None:
+def _mark_label_dead(label: str, exc, agent=None, api_base: str = "") -> None:
     """Record `label` as permanently failed in the shared cross-agent
     blocklist, with an EXPIRING window (never forever). Called from
     _handle_error_cooldown after the per-agent cooldown is also set --
     the per-agent cooldown governs THIS agent's rotation; the shared
     dead-mark stops OTHER agents from re-paying the same failure tax.
+
+    v2.7.0: router-class labels are EXEMPT. A gateway surfaces its
+    upstreams' failures (a pooled upstream's 401/403/404 arrives as a
+    gateway 4xx), so marking `omniroute/<combo>` dead for every agent
+    starved all of them of a healthy gateway over ONE dead upstream
+    slug -- the 404 duration alone is 24 h. The gateway re-routes the
+    next call and its own connection health (rate-limits,
+    ``exhausted_connection`` exclusions) is the authority for upstream
+    choice; this agent's short ``router_cooldown_s`` (v2.6.8 Fix 3)
+    already spaces retries.
 
     The dead window matches the per-status cooldown
     (_cooldown_seconds_for_status) so re-probe cadence is unchanged:
@@ -903,6 +937,8 @@ def _mark_label_dead(label: str, exc, agent=None) -> None:
     auto-evicts expired entries, so the next agent to reach the label
     re-probes live and re-marks if still dead.
     """
+    if _classify_capacity(label, agent, api_base) == "router":
+        return
     if not _is_dead_for_all_agents(exc):
         return
     status_code = getattr(exc, "status_code", None)
@@ -1011,6 +1047,18 @@ _DEFAULT_ROUTER_API_BASES = (
 # self-healing gateway recovers on the next call, so this just wastes
 # time. 30s keeps the probe responsive.
 _DEFAULT_ROUTER_MAX_CYCLE_DELAY_S = 30.0
+
+# v2.7.0 -- per-call timeout for a COLD router call (no success within the
+# warm window). After the free-pool is exhausted (3 concurrent agents burn
+# through it fast), the gateway must re-route to a fresh upstream and the
+# warm-up (probing rate-limited/dead slugs before landing on a working
+# one) routinely exceeds the utility cold base (user default 60s). The
+# cascade then died a "timed out after 60s" death every cycle and the
+# gateway never got enough headroom to finish re-routing. 150s covers a
+# realistic multi-upstream warm-up; once a call succeeds the label is
+# warm (see _WARM_LABELS) and the fast base resumes. 0 disables (-> the
+# pre-v2.7.0 behavior of exactly ``router_call_timeout_s``/base).
+_DEFAULT_ROUTER_COLD_CALL_TIMEOUT_S = 150.0
 
 # v2.6.8 -- api_base matchers for the ``unlimited_paid`` capacity class.
 # Mirrors the v2.6.7 router api_base approach (see _DEFAULT_ROUTER_API_BASES)
@@ -1277,7 +1325,10 @@ def _handle_error_cooldown(e, label, model_cooldowns, agent, api_base: str = "")
         # v2.6.8: share the permanent fail cross-agent so other agents
         # skip this label without re-paying the tax. Expiring (5 min for
         # 401/403 quota, 24 h for 404 gone) -- never a forever-block.
-        _mark_label_dead(label, e, agent)
+        # v2.7.0: unreachable for router labels (the guard above skips
+        # the whole permanent-fail block); _mark_label_dead self-gates
+        # anyway.
+        _mark_label_dead(label, e, agent, api_base)
         if dur >= 3600.0:
             # Log only long cooldowns; the short ones are noise.
             try:
@@ -1321,14 +1372,12 @@ def _handle_error_cooldown(e, label, model_cooldowns, agent, api_base: str = "")
             store[label] = time.monotonic() + dur
             _record_last_status(agent, store, label, status_code)
             _save_cooldown_store(agent, store)
-        # v2.6.8: a router 404/auth is dead for all agents (gone slug or
-        # shared bad key), even though routers otherwise self-heal on
-        # 429/5xx/timeout. _mark_label_dead self-gates via
-        # _is_dead_for_all_agents, so it no-ops for the transient cases
-        # above and only marks the genuinely-permanent ones cross-agent.
-        # The shared dead-window is the long status-appropriate dur (24 h
-        # for 404); THIS agent keeps the short router cooldown above.
-        _mark_label_dead(label, e, agent)
+        # v2.7.0: routers are EXEMPT from the cross-agent dead-mark -- one
+        # pooled upstream's 404/auth must not put a healthy GATEWAY into
+        # _INMEM_DEAD_LABELS for the 404 duration (24 h), starving every
+        # agent. The gateway re-routes internally; its own connection
+        # health is the authority. This agent's short cooldown above
+        # still spaces retries.
         return True
     dur = _cooldown_seconds_for_status(status_code, e)
     # Don't apply cooldowns shorter than 30s -- they'd be cleared by the

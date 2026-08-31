@@ -479,3 +479,160 @@ def test_resolve_per_call_timeout_a0_venice_api_base_warm_uses_base():
             _fb_mod._WARM_LABELS.pop(label, None)
         else:
             _fb_mod._WARM_LABELS[label] = saved
+
+
+# ---------------------------------------------------------------------------
+# v2.7.0: router cold-call warm-up budget + dead-mark exemption
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_per_call_timeout_router_cold_uses_cold_budget():
+    """v2.7.0: a COLD router label (no success within the warm window) gets
+    the ``router_cold_call_timeout_s`` warm-up budget (default 150s), not the
+    (often much shorter) cold base. Mirrors the real symptom: after 3 agents
+    exhausted the free pool, the gateway had to re-route to a fresh upstream
+    and every call died a "timed out after 60s" death each cycle — the 150s
+    budget gives the warm-up headroom. Knob omitted -> module default."""
+    label = "omniroute/auto/coding:free"
+    saved = _fb_mod._WARM_LABELS.get(label)
+    try:
+        _fb_mod._WARM_LABELS.pop(label, None)  # ensure COLD
+        with _patched_cfg():
+            got = _fb_mod._resolve_per_call_timeout(
+                label, base_timeout_s=60.0, warm_timeout_s=20.0, warm_window_s=600.0,
+            )
+        assert got == 150.0, (
+            f"cold router must use the 150s warm-up budget, got {got}"
+        )
+    finally:
+        if saved is None:
+            _fb_mod._WARM_LABELS.pop(label, None)
+        else:
+            _fb_mod._WARM_LABELS[label] = saved
+
+
+def test_resolve_per_call_timeout_router_warm_uses_base():
+    """v2.7.0: a WARM router label keeps the fast cold base (here 60s) -- the
+    warm-up budget must apply ONLY while the label is cold, otherwise every
+    legit-but-slow gateway call would cost up to 150s of headroom even when
+    the route is hot."""
+    label = "omniroute/auto/coding:free"
+    saved = _fb_mod._WARM_LABELS.get(label)
+    try:
+        _fb_mod._WARM_LABELS[label] = time.monotonic()  # mark warm
+        with _patched_cfg():
+            got = _fb_mod._resolve_per_call_timeout(
+                label, base_timeout_s=60.0, warm_timeout_s=20.0, warm_window_s=600.0,
+            )
+        assert got == 60.0, (
+            f"warm router must keep the fast base (60s), got {got}"
+        )
+    finally:
+        if saved is None:
+            _fb_mod._WARM_LABELS.pop(label, None)
+        else:
+            _fb_mod._WARM_LABELS[label] = saved
+
+
+def test_resolve_per_call_timeout_router_cold_zero_disables():
+    """v2.7.0: ``router_cold_call_timeout_s: 0`` disables the warm-up budget
+    -- cold router calls fall back to the pre-v2.7.0 budget
+    (``max(base, router_call_timeout_s)`` = base here 60s)."""
+    label = "omniroute/auto/coding:free"
+    saved = _fb_mod._WARM_LABELS.get(label)
+    try:
+        _fb_mod._WARM_LABELS.pop(label, None)  # ensure COLD
+        cfg = dict(_PATCHED_PLUGIN_CFG)
+        cfg["router_cold_call_timeout_s"] = 0
+        with patch.object(_fb_mod, "_get_plugin_cfg", lambda agent: dict(cfg)):
+            got = _fb_mod._resolve_per_call_timeout(
+                label, base_timeout_s=60.0, warm_timeout_s=20.0, warm_window_s=600.0,
+            )
+        assert got == 60.0, (
+            f"knob 0 must disable the warm-up budget (base 60s), got {got}"
+        )
+    finally:
+        if saved is None:
+            _fb_mod._WARM_LABELS.pop(label, None)
+        else:
+            _fb_mod._WARM_LABELS[label] = saved
+
+
+def test_resolve_per_call_timeout_router_cold_respects_router_call_timeout():
+    """v2.7.0: the cold budget composes with ``router_call_timeout_s`` (v2.6.7
+    Fix D static headroom) -- a COLD router call gets the max of the two so
+    setting a big Fix-D headroom is never silently truncated by the default."""
+    label = "omniroute/auto/coding:free"
+    saved = _fb_mod._WARM_LABELS.get(label)
+    try:
+        _fb_mod._WARM_LABELS.pop(label, None)  # ensure COLD
+        cfg = dict(_PATCHED_PLUGIN_CFG)
+        cfg["router_cold_call_timeout_s"] = 150.0
+        cfg["router_call_timeout_s"] = 180.0
+        with patch.object(_fb_mod, "_get_plugin_cfg", lambda agent: dict(cfg)):
+            got = _fb_mod._resolve_per_call_timeout(
+                label, base_timeout_s=60.0, warm_timeout_s=20.0, warm_window_s=600.0,
+            )
+        assert got == 180.0, (
+            f"cold router with router_call_timeout_s=180 must get 180s "
+            f"(max of cold budget and static headroom), got {got}"
+        )
+    finally:
+        if saved is None:
+            _fb_mod._WARM_LABELS.pop(label, None)
+        else:
+            _fb_mod._WARM_LABELS[label] = saved
+
+
+def test_mark_label_dead_skips_router():
+    """v2.7.0: a gateway-surfaced upstream 401/403/404 must NOT put the
+    omniroute label into the shared cross-agent dead blocklist -- one dead
+    upstream slug (404 -> 24h duration) starved every agent of a healthy
+    gateway. Non-router labels keep the shared dead-mark."""
+    e = _FakeAuthError(status_code=404, message="model not found: dead/slug")
+    label_router = "omniroute/auto/coding:free"
+    label_plain = "openrouter/google/gemma-4-31b-it:free"
+    saved_dead = dict(_fb_mod._INMEM_DEAD_LABELS)
+    saved_healthy = dict(_fb_mod._INMEM_HEALTHY_LABELS)
+    try:
+        _fb_mod._mark_label_dead(label_router, e, _FakeAgent("deadmark-router"))
+        assert label_router not in _fb_mod._INMEM_DEAD_LABELS, (
+            "router label must NOT be cross-agent dead-marked"
+        )
+        # Sanity: the same failure on a non-router label is still shared.
+        _fb_mod._mark_label_dead(label_plain, e, _FakeAgent("deadmark-plain"))
+        entry = _fb_mod._INMEM_DEAD_LABELS.get(label_plain)
+        assert entry is not None, (
+            "non-router 404 must still be cross-agent dead-marked"
+        )
+        assert entry[0] == 404, (
+            f"dead-mark entry should carry the status code, got {entry!r}"
+        )
+    finally:
+        _fb_mod._INMEM_DEAD_LABELS.clear()
+        _fb_mod._INMEM_DEAD_LABELS.update(saved_dead)
+        _fb_mod._INMEM_HEALTHY_LABELS.clear()
+        _fb_mod._INMEM_HEALTHY_LABELS.update(saved_healthy)
+
+
+def test_mark_label_dead_skips_router_via_api_base():
+    """v2.7.0: the router dead-mark exemption also fires for api_base-matched
+    routers (``openai/auto/...`` whose api_base is the gateway) -- the A2
+    detection path must reach the exemption too, not just label prefixes."""
+    e = _FakeAuthError(status_code=404, message="provider returned 404")
+    label = "openai/auto/coding:free"
+    api_base = "http://host.docker.internal:8080/v1"
+    saved_dead = dict(_fb_mod._INMEM_DEAD_LABELS)
+    saved_healthy = dict(_fb_mod._INMEM_HEALTHY_LABELS)
+    try:
+        _fb_mod._mark_label_dead(
+            label, e, _FakeAgent("deadmark-router-apibase"), api_base=api_base
+        )
+        assert label not in _fb_mod._INMEM_DEAD_LABELS, (
+            "api_base-matched router label must NOT be cross-agent dead-marked"
+        )
+    finally:
+        _fb_mod._INMEM_DEAD_LABELS.clear()
+        _fb_mod._INMEM_DEAD_LABELS.update(saved_dead)
+        _fb_mod._INMEM_HEALTHY_LABELS.clear()
+        _fb_mod._INMEM_HEALTHY_LABELS.update(saved_healthy)

@@ -260,6 +260,17 @@ router_max_cycle_delay_s: 30.0
 # tier before the cascade times it out and moves on.
 router_call_timeout_s: 0.0
 
+# --- v2.7.0 Router cold-call warm-up budget ---------------------------------
+# When 3+ concurrent agents exhaust the gateway's free pool, OmniRoute must
+# re-route to a fresh upstream and the warm-up (probing rate-limited/dead
+# slugs before landing on a working one) routinely exceeds the utility cold
+# base (60s). The cascade then died a "timed out after 60s" death every
+# cycle. This knob gives a COLD router call (no success within the warm
+# window) its own larger per-call timeout, so the warm-up can finish; once a
+# call succeeds the label is warm and the fast cold base resumes. 0 disables
+# (-> pre-v2.7.0 behavior). Only reaches router-class candidates.
+router_cold_call_timeout_s: 150.0
+
 # --- v2.6.8 Pure-timeout cooldown + paid warm-path exemption ----------------
 # A *pure* timeout (asyncio.TimeoutError / TimeoutError with NO HTTP status
 # code) used to fall through to the conservative 300s unknown-error cooldown.
