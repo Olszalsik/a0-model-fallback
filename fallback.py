@@ -2988,3 +2988,324 @@ async def _patched_call_chat_model(
     if continuous_mode:
         return None, None
     raise RuntimeError(exhausted)
+
+
+# ---------------------------------------------------------------------------
+# v2.8.0: turn-path fallback cascade (call_chat_model_turn)
+# ---------------------------------------------------------------------------
+# Since the v2.10/2.11 upstream merge, the main agent loop no longer calls
+# ``Agent.call_chat_model`` -- it calls ``Agent.call_chat_model_turn``
+# (agent.py monologue -> ``unified_turn`` -> ``LiteLLMTransport.astream``).
+# The chat cascade above is therefore bypassed on EVERY main-loop LLM call:
+# a 429 (e.g. OpenRouter free-pool "upstream_429") is litellm-retried against
+# the SAME model, then the RateLimitError escapes to ``handle_exception``,
+# which has no handler for it -> HandledException -> the agent stops.
+#
+# This cascade wraps the original ``call_chat_model_turn`` (captured at patch
+# install time, still the ``@extensible`` wrapper, so its own start/end
+# extension points and Responses-state handling stay intact) and rotates
+# through the same candidate list built by ``_build_candidates``. It reuses
+# the shared cooldown store, ``_handle_error_cooldown``, warm/cold timeouts,
+# and the cross-agent dead-label index, so a 429 learned on the turn path
+# also protects the utility cascade (and vice versa).
+#
+# On exhaustion it raises RetryAfterHours, which the existing
+# _70_handle_retry_after_hours extension swallows (sleep 60s) so the
+# monologue loop re-enters this cascade and retries -- candidates in
+# cooldown are skipped, so the agent keeps rotating across multi-hour
+# free-tier outages without blocking interventions longer than one pass.
+#
+# Unlike the chat cascade we deliberately do NOT loop full cycles inside
+# the call: each invocation does one pass over the candidates, then yields
+# control back to the monologue loop via RetryAfterHours. Same
+# ``continuous_fallback`` end result (agent stays alive), but interventions
+# (user typing a new message) stay responsive between passes.
+
+# Captured original ``Agent.call_chat_model_turn`` (the ``@extensible``
+# wrapper). Set by install_chat_turn_patch().
+_ORIGINAL_CALL_CHAT_MODEL_TURN = None
+
+
+async def _patched_call_chat_model_turn(
+    self,
+    messages=None,
+    response_callback=None,
+    reasoning_callback=None,
+    background: bool = False,
+    explicit_caching: bool = True,
+):
+    """Fallback cascade for the v2.10+ turn path (see module docstring block)."""
+    original = _ORIGINAL_CALL_CHAT_MODEL_TURN
+    if original is None:
+        raise RuntimeError("call_chat_model_turn original not captured")
+
+    model_obj = self.get_chat_model()
+    if model_obj is None:
+        # No chat model configured -- let the original raise its own error.
+        return await original(
+            self,
+            messages=messages,
+            response_callback=response_callback,
+            reasoning_callback=reasoning_callback,
+            background=background,
+            explicit_caching=explicit_caching,
+        )
+
+    candidates = _build_candidates(model_obj, use_utility_models=False, agent=self)
+    n = len(candidates)
+    if n <= 1:
+        # No fallbacks configured -- nothing to rotate; single attempt.
+        return await original(
+            self,
+            messages=messages,
+            response_callback=response_callback,
+            reasoning_callback=reasoning_callback,
+            background=background,
+            explicit_caching=explicit_caching,
+        )
+
+    # --- Config knobs (same keys as the chat cascade) ----------------------
+    plugin_cfg = _get_plugin_cfg(self)
+    default_timeout = float(plugin_cfg.get("fallback_timeout_s", 300))
+    model_kwargs = getattr(model_obj, "kwargs", {}) or {}
+    timeout_s = float(
+        model_kwargs.get("TIMEOUT", model_kwargs.get("timeout", default_timeout))
+    )
+    warm_timeout_s = float(plugin_cfg.get(
+        "cascade_warm_timeout_s", _DEFAULT_CASCADE_WARM_TIMEOUT_S,
+    ))
+    warm_window_s = float(plugin_cfg.get(
+        "cascade_warm_window_s", _DEFAULT_CASCADE_WARM_WINDOW_S,
+    ))
+    attempt_delay: float = _clamp_delay(
+        float(
+            model_kwargs.get(
+                "FALLBACK_ATTEMPT_DELAY",
+                model_kwargs.get(
+                    "fallback_attempt_delay",
+                    float(plugin_cfg.get("fallback_attempt_delay", 2.0)),
+                ),
+            )
+        ),
+        _MAX_ATTEMPT_DELAY,
+        "attempt_delay",
+    )
+    # NOTE: no ``or {}`` here -- a freshly seeded store is an EMPTY dict,
+    # which is falsy; ``or {}`` would swap in an unregistered literal and
+    # the success path would then save that empty dict back over the
+    # store, wiping the cooldowns _handle_error_cooldown just wrote.
+    # (The chat/utility cascades carry this same latent pattern -- see
+    # AGENTS.md v2.8.0 notes.)
+    model_cooldowns = _get_cooldown_store(self)
+    if not isinstance(model_cooldowns, dict):
+        model_cooldowns = {}
+    _last_skip_log_until: dict = {}
+    _last_dead_log_until: dict = {}
+
+    primary_label = _get_model_label(candidates[0], model_obj)
+    _consecutive_primary_failures = 0
+
+    def _reset_primary_strikes() -> None:
+        nonlocal _consecutive_primary_failures
+        if _consecutive_primary_failures > 0:
+            _consecutive_primary_failures = 0
+
+    async def _call_original_with_model(current_model, *, timeout_s_override=None):
+        """Run the original turn method against a specific candidate model.
+
+        The original reads ``self.get_chat_model()`` -- we shadow it with an
+        instance attribute for the duration of the call and restore it in
+        ``finally``. Instance attributes shadow class attributes, so the
+        original body (and anything it calls) picks up the candidate.
+        """
+        try:
+            self.get_chat_model = lambda: current_model  # type: ignore[method-assign]
+            effective_timeout = (
+                timeout_s if timeout_s_override is None else timeout_s_override
+            )
+            coro = original(
+                self,
+                messages=messages,
+                response_callback=_response_cb,
+                reasoning_callback=_reasoning_cb,
+                background=background,
+                explicit_caching=explicit_caching,
+            )
+            return await asyncio.wait_for(coro, timeout=effective_timeout)
+        finally:
+            # Remove the shadow (don't restore a bound copy -- the class
+            # attribute must stay untouched so reloads don't stack layers).
+            try:
+                del self.__dict__["get_chat_model"]
+            except KeyError:
+                pass
+
+    # Detect whether any response chunk already reached the UI. If a
+    # transient error arrives AFTER streaming started, retrying would
+    # duplicate the partial output in the chat UI -- in that case we apply
+    # the cooldown bookkeeping but re-raise instead of rotating.
+    streamed_any = False
+
+    async def _response_cb(chunk: str, total: str):
+        nonlocal streamed_any
+        if chunk:
+            streamed_any = True
+        if response_callback is None:
+            return None
+        return await response_callback(chunk, total)
+
+    async def _reasoning_cb(chunk: str, total: str):
+        nonlocal streamed_any
+        if chunk:
+            streamed_any = True
+        if reasoning_callback is None:
+            return None
+        return await reasoning_callback(chunk, total)
+
+    last_error: Exception | None = None
+    last_idx = 0
+    attempted = 0
+
+    for idx in range(n):
+        spec = candidates[idx]
+        label = _get_model_label(spec, model_obj)
+        cand_api_base = _get_candidate_api_base(spec, model_obj)
+
+        # Skip labels another agent marked dead (404 / auth-quota), mirroring
+        # the chat cascade's cross-agent dead-label check.
+        if _is_label_dead(label):
+            _status, dead_until = _INMEM_DEAD_LABELS[label]
+            if _last_dead_log_until.get(label) != dead_until:
+                _last_dead_log_until[label] = dead_until
+                self.context.log.log(
+                    "info",
+                    f"Chat model [{label}] dead cross-agent "
+                    f"(status {_status}), skipping "
+                    f"{int(dead_until - time.monotonic())}s",
+                )
+            continue
+
+        cooldown_until = model_cooldowns.get(label)
+        if cooldown_until is not None:
+            _maybe_clear_cooldown_for_healthy_label(self, label)
+            cooldown_until = model_cooldowns.get(label)
+        now = time.monotonic()
+        if cooldown_until and cooldown_until > now:
+            remaining = int(cooldown_until - now)
+            if _last_skip_log_until.get(label) != cooldown_until:
+                _last_skip_log_until[label] = cooldown_until
+                self.context.log.log(
+                    "info",
+                    f"Chat model [{label}] in cooldown, skipping "
+                    f"({remaining}s remaining)",
+                )
+            continue
+
+        current_model = _build_model(spec, model_obj)
+        _strip_a0_only_kwargs(current_model)
+
+        # Per-candidate warm/cold timeout (same policy as the chat cascade).
+        # A user TIMEOUT= model kwarg was already folded into ``timeout_s``
+        # above; the warm fast-path applies to kwarg-less presets.
+        effective_timeout_s = _resolve_per_call_timeout(
+            label, timeout_s, warm_timeout_s, warm_window_s,
+            self, cand_api_base,
+        )
+
+        if idx > 0:
+            warn = f"Chat model (turn) switching to [{idx}/{n - 1}]: {label}"
+            self.context.log.log("warning", content=warn)
+            PrintStyle(font_color="orange", padding=True).print(warn)
+
+        # litellm's own num_retries (settings litellm_global_kwargs) retry the
+        # SAME rate-limited model -- wasted latency on shared-pool 429s whose
+        # Retry-After we already know. The cascade owns retries now.
+        # NOTE: the shadowed get_chat_model makes the original build its
+        # Responses state and call kwargs from the candidate wrapper.
+        try:
+            llm_result = await _call_original_with_model(
+                current_model,
+                timeout_s_override=effective_timeout_s,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            last_error = e
+            last_idx = idx
+            if _is_code_error(e):
+                err_msg = (
+                    f"Chat model (turn) [{idx}] CODE ERROR "
+                    f"({type(e).__name__}): {label} - {_format_exception(e)}. "
+                    f"Code bug, not an API failure -- failing fast."
+                )
+                self.context.log.log("error", content=err_msg)
+                PrintStyle(font_color="red", padding=True).print(err_msg)
+                raise
+            # Timeout handling: evict the warm label (fix A) so the retry
+            # uses the cold timeout, and book the error cooldown.
+            _evict_warm_on_timeout(e, label)
+            _handle_error_cooldown(e, label, model_cooldowns, self, cand_api_base)
+            if idx == 0:
+                _consecutive_primary_failures += 1
+            if streamed_any:
+                # Partial output already reached the UI -- rotating now would
+                # duplicate it. Book the cooldown (done above) and let the
+                # exception surface; the monologue loop's next iteration will
+                # route around the cooled-down label.
+                raise
+            attempted += 1
+            if attempt_delay > 0:
+                await _yielding_sleep(min(attempt_delay, 10.0))
+            continue
+
+        # --- Success ---------------------------------------------------------
+        model_cooldowns.pop(label, None)
+        _save_cooldown_store(self, model_cooldowns)
+        _mark_label_healthy(self, label)
+        _WARM_LABELS[label] = time.monotonic()
+        _reset_primary_strikes()
+        self.set_data(DATA_KEY_EXT_RETRY_ATTEMPTS, 0)
+        self.set_data(DATA_KEY_EXT_RETRY_PHASE, 0)
+        self.set_data(DATA_KEY_EXT_RETRY_NOTIFIED, False)
+        if idx != 0:
+            ok = f"Chat model (turn) fallback succeeded, now using [{idx}]: {label}"
+            self.context.log.log("info", content=ok)
+            PrintStyle(font_color="cyan", padding=True).print(ok)
+        return llm_result
+
+    # --- One pass over all candidates failed --------------------------------
+    _emit_fallback_summary(self, "chat", candidates)
+    # Bump the cooldown floor so the next pass (after the handler's 60s
+    # sleep) doesn't immediately re-try a just-failed 429 label: the
+    # cooldowns were already written by _handle_error_cooldown.
+    retry_after = 60.0
+    if last_error is not None:
+        hint = extract_retry_after_seconds(last_error)
+        if hint and 0 < hint <= 300.0:
+            retry_after = max(retry_after, float(hint))
+    exhausted = (
+        f"All chat model candidates exhausted after {attempted} turn attempt(s) "
+        f"(last failure: {type(last_error).__name__} on "
+        f"[{last_idx}] after {int(retry_after)}s cooldown). "
+        f"Retrying automatically."
+    )
+    self.context.log.log("warning", content=exhausted)
+    PrintStyle(font_color="yellow", padding=True).print(exhausted)
+    raise RetryAfterHours(retry_after=retry_after)
+
+
+def install_chat_turn_patch(agent_cls) -> bool:
+    """Monkey-patch ``Agent.call_chat_model_turn`` with the turn cascade.
+
+    Idempotent (guards on the ``_fallback_turn_patched`` marker, same as
+    _00_install_fallback_patches does for the other two methods). Captures
+    the ``@extensible`` wrapper so the original's start/end extension
+    points and Responses-state handling keep working under the cascade.
+    """
+    global _ORIGINAL_CALL_CHAT_MODEL_TURN
+    if getattr(agent_cls.call_chat_model_turn, "_fallback_turn_patched", False):
+        return False
+    _ORIGINAL_CALL_CHAT_MODEL_TURN = agent_cls.call_chat_model_turn
+    agent_cls.call_chat_model_turn = _patched_call_chat_model_turn
+    _patched_call_chat_model_turn._fallback_turn_patched = True  # type: ignore[attr-defined]
+    return True

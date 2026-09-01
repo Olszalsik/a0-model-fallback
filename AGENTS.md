@@ -12,15 +12,59 @@ provider going dark for hours is normal operating conditions, not a failure.
 
 ## What this plugin does
 
-`fallback.py` monkey-patches two methods onto the `Agent` class:
+`fallback.py` monkey-patches three methods onto the `Agent` class:
 
 | Method | Patched at | Purpose |
 |---|---|---|
 | `Agent.call_utility_model` | `_patched_call_utility_model`, `fallback.py:694` | Wraps the utility model call (used for memory, summarization, JSON validation, tool sub-tasks). |
-| `Agent.call_chat_model` | `_patched_call_chat_model`, `fallback.py:1075+` | Wraps the main chat model call. |
+| `Agent.call_chat_model` | `_patched_call_chat_model`, `fallback.py:1075+` | Wraps the main chat model call (legacy path; still used by `_email_integration` / `_document_query`). |
+| `Agent.call_chat_model_turn` | `_patched_call_chat_model_turn` + `install_chat_turn_patch`, installed from the same `agent_init/_00_install_fallback_patches.py` | **v2.8.0** — the turn path. Since the v2.10/2.11 upstream merge the MAIN agent loop calls this (monologue → `unified_turn` → `LiteLLMTransport.astream`), not `call_chat_model`. Without this patch the chat cascade is dead code on every main-loop call and a single 429 kills the agent. |
 
 Both wrappers share the same contract: build a candidate list from the active
 preset (`_build_candidates`), then loop through candidates until one succeeds.
+
+### v2.8.0 — turn-path cascade + transient-error safety net (2026-09-01)
+
+Root cause that motivated this: `usr/settings.json` → litellm
+`num_retries: 2` retried a shared-pool OpenRouter 429 (`z-ai/glm-5.2:free`,
+`upstream_429`, `Retry-After: 5`) against the SAME model, the resulting
+`litellm.RateLimitError` escaped to `handle_exception` (which only handled
+`RetryAfterHours`), `_90_handle_critical_exception` wrapped it as
+`HandledException`, and the agent stopped.
+
+Two additions fix it:
+
+1. **Turn cascade** (`_patched_call_chat_model_turn`). Wraps the captured
+   `@extensible` original (so its own `chat_model_call_before/after` hooks and
+   Responses-state handling still run) and does ONE pass over
+   `_build_candidates(...)` per invocation: skips dead / cooled-down labels
+   (shared cooldown store + cross-agent dead-label index), applies
+   `_handle_error_cooldown` and `_evict_warm_on_timeout` per failure, honors
+   the provider's `Retry-After`, and re-raises immediately if any response
+   chunk already streamed to the UI (rotating would duplicate partial output).
+   On exhaustion it raises `RetryAfterHours` — the existing
+   `handle_exception/end/_70` extension swallows it (60 s sleep) and the
+   monologue loop re-enters the cascade, which now skips the cooled-down
+   labels. Net effect: same continuous-mode survivability as the chat
+   cascade, but interventions stay responsive between passes.
+   **Deliberate difference from the chat cascade:** no full-cycle loop inside
+   the call. Do not "fix" this by adding a `while True` — it would block
+   interventions for the whole outage.
+   Candidate-model injection works by shadowing `self.get_chat_model` with an
+   instance attribute for the duration of each inner call (restored in
+   `finally` by deleting the instance attr — never assign a restored bound
+   copy, or plugin reloads stack layers).
+
+2. **Safety net** (`extensions/python/_functions/agent/Agent/handle_exception/
+   end/_60_handle_transient_llm_error.py`). Last-resort swallow of transient
+   provider errors (429, 5xx, connection, timeout) that still escape any
+   cascade. Books the cooldown (best-effort label from `exc.model`), sleeps
+   3 s, and clears `data["exception"]` — bounded at 5 consecutive swallows
+   (state resets after 5 quiet minutes) so a genuinely broken setup still
+   surfaces. Runs BEFORE `_70` and must never touch `RetryAfterHours`.
+
+Both mechanisms share the cooldown store with the chat/utility cascades, so a
+429 learned on any path protects every other path on the next turn.
 
 This plugin also owns six **LLM-error-handling** extensions on top of the
 cascade. They live here (not in separate plugins) so a single
