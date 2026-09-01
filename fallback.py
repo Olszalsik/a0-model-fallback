@@ -1682,7 +1682,11 @@ async def _patched_call_utility_model(
         )
     )
 
-    model_cooldowns: dict = _get_cooldown_store(self) or {}
+    # v2.8.1: no ``or {}`` -- a freshly seeded store is an EMPTY (falsy)
+    # dict; ``or {}`` swapped in an unregistered literal, and the success
+    # path's _save_cooldown_store then wrote that empty dict back over the
+    # store, wiping the cooldown _handle_error_cooldown had just booked.
+    model_cooldowns: dict = _get_cooldown_store(self)
     if not isinstance(model_cooldowns, dict):
         model_cooldowns = {}
 
@@ -2445,7 +2449,11 @@ async def _patched_call_chat_model(
         )
     )
 
-    model_cooldowns: dict = _get_cooldown_store(self) or {}
+    # v2.8.1: no ``or {}`` -- a freshly seeded store is an EMPTY (falsy)
+    # dict; ``or {}`` swapped in an unregistered literal, and the success
+    # path's _save_cooldown_store then wrote that empty dict back over the
+    # store, wiping the cooldown _handle_error_cooldown had just booked.
+    model_cooldowns: dict = _get_cooldown_store(self)
     if not isinstance(model_cooldowns, dict):
         model_cooldowns = {}
 

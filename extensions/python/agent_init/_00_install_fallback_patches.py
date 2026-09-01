@@ -11,12 +11,27 @@ from agent import Agent
 
 class InstallFallbackPatches(Extension):
     def execute(self, **kwargs):
-        # Lazy import to avoid circular dependencies during module load
-        from usr.plugins._model_fallback.fallback import (
-            _patched_call_utility_model,
-            _patched_call_chat_model,
-            install_chat_turn_patch,
-        )
+        # Lazy import to avoid circular dependencies during module load.
+        # v2.8.1: resolve via the module object with getattr, NOT from-imports.
+        # A stale fallback.py (e.g. a .pyc left over after a partial update on
+        # a slow bind mount) must degrade gracefully -- an ImportError here
+        # would kill Agent.__init__ and with it every new chat.
+        import usr.plugins._model_fallback.fallback as fb
+
+        _patched_call_utility_model = getattr(
+            fb, "_patched_call_utility_model", None)
+        _patched_call_chat_model = getattr(fb, "_patched_call_chat_model", None)
+        install_chat_turn_patch = getattr(fb, "install_chat_turn_patch", None)
+        if _patched_call_utility_model is None or _patched_call_chat_model is None:
+            try:
+                self.agent.context.log.log(
+                    "error",
+                    "Model Fallback System: fallback.py is missing its patch "
+                    "functions (stale install?). No fallback coverage active.",
+                )
+            except Exception:
+                pass
+            return
 
         # Only patch if not already patched (avoid double-patching on reload)
         if getattr(Agent.call_utility_model, "_fallback_patched", False):
@@ -32,7 +47,27 @@ class InstallFallbackPatches(Extension):
         # Turn path (v2.10+ monologue). install_chat_turn_patch captures the
         # @extensible wrapper before overwriting, so the original's own
         # extension points keep firing. Idempotent on its own marker.
-        turn_patched = install_chat_turn_patch(Agent)
+        turn_patched = False
+        if install_chat_turn_patch is not None:
+            try:
+                turn_patched = install_chat_turn_patch(Agent)
+            except Exception as e:
+                try:
+                    self.agent.context.log.log(
+                        "warning",
+                        f"Model Fallback System: turn-path cascade not "
+                        f"installed ({type(e).__name__}: {e}). Chat cascade "
+                        f"still active.",
+                    )
+                except Exception:
+                    pass
+        elif self.agent and self.agent.context:
+            self.agent.context.log.log(
+                "warning",
+                "Model Fallback System: fallback.py predates the turn-path "
+                "cascade (v2.8.0) -- main-loop calls have chat-cascade "
+                "coverage only.",
+            )
 
         if self.agent and self.agent.context:
             msg = "Model Fallback System patches installed via agent_init."

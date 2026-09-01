@@ -66,6 +66,35 @@ Two additions fix it:
 Both mechanisms share the cooldown store with the chat/utility cascades, so a
 429 learned on any path protects every other path on the next turn.
 
+### v2.8.1 — stale-install resilience + `or {}` cooldown fix (2026-09-01)
+
+Two follow-up fixes to v2.8.0, from live-container failures:
+
+1. **Installer must never kill `Agent.__init__`.** A stale `__pycache__`/.pyc
+   on a slow bind mount left the container running a pre-v2.8.0 `fallback.py`
+   while the updated `_00_install_fallback_patches.py` loaded — the
+   `from ... import install_chat_turn_patch` raised `ImportError` inside
+   `Agent.__init__`, so **no new chat could be created**. The installer now
+   imports the module and resolves `getattr(fb, name, None)` for every patch
+   symbol, logs a clear error/warning instead of raising, and installs whatever
+   subset exists. Never convert these back to from-imports.
+2. **`or {}` cooldown-store wipe.** `_get_cooldown_store(agent)` seeds a fresh
+   EMPTY dict on first use; an empty dict is falsy, so
+   `model_cooldowns = _get_cooldown_store(self) or {}` bound an UNREGISTERED
+   literal in all three cascades. Cooldowns written via `_handle_error_cooldown`
+   landed in the registered store, but a fallback success then
+   `_save_cooldown_store`'d the empty literal back over it — the first
+   cooldown after a restart silently vanished. All three cascades now use the
+   registered store object directly (isinstance-guard only). The turn-path
+   cascade shipped with this bug in v2.8.0; the utility/chat cascades carried
+   it latently since the shared cooldown store was introduced.
+
+Test-suite note (same class as the langchain suite-pollution fix):
+`tests/test_candidate_normalize.py` `reload(fb_mod)` REBINDS all fallback
+module globals mid-suite. Anything resolved via import-time from-imports
+(`_INMEM_COOLDOWNS`, `RetryAfterHours`, ...) is a stale object afterwards.
+New tests must read module state through `fallback.<name>` at call time.
+
 This plugin also owns six **LLM-error-handling** extensions on top of the
 cascade. They live here (not in separate plugins) so a single
 `usr/plugins/_model_fallback/.toggle-0` disables everything and a single
