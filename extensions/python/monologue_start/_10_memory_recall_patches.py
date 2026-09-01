@@ -21,6 +21,7 @@ Patches applied:
 import os
 import asyncio
 import json
+import inspect
 
 from helpers.extension import Extension
 from agent import LoopData
@@ -32,6 +33,32 @@ _DEFAULT_MEMORY_CONFIG = {
     "memory_recall_delayed": True,
     "memory_memorize_consolidation": False,
 }
+
+
+def _find_framework_class(agent, extension_point, class_name, module_suffix):
+    """Resolve the extension class the framework will ACTUALLY instantiate.
+
+    A0 loads extension files via helpers.modules.import_module -- a
+    synthetic module named after the file basename, never registered in
+    sys.modules. A canonical dotted-path import therefore creates a
+    phantom module + class that the dispatcher never calls: wrapping or
+    patching it is a silent no-op (v0.5.2 / earlier versions of this file
+    all had this bug live). The authoritative list is
+    helpers.extension._get_extension_classes -- the same cache the
+    dispatcher iterates.
+    """
+    try:
+        from helpers import extension as _ext
+
+        classes = _ext._get_extension_classes(extension_point, agent=agent)
+        for cls in classes or []:
+            if cls.__name__ != class_name:
+                continue
+            if str(getattr(cls, "__module__", "")).endswith(module_suffix):
+                return cls
+    except Exception:
+        pass
+    return None
 
 
 class MemoryRecallPatches(Extension):
@@ -59,53 +86,72 @@ class MemoryRecallPatches(Extension):
             pass
 
     def _patch_recall_wait(self):
-        """Wrap await task in try/except to prevent TimeoutError crash."""
-        from plugins._memory.extensions.python.message_loop_prompts_after._91_recall_wait import RecallWait
-        from plugins._memory.extensions.python.message_loop_prompts_after._50_recall_memories import (
-            DATA_NAME_TASK as _TASK,
-            DATA_NAME_ITER as _ITER,
-        )
-        from helpers import plugins
+        """Wrap RecallWait.execute so a recall failure cannot crash the loop.
 
-        if getattr(RecallWait, '_mfb_memory_patched', False):
+        WRAPS (does not replace) the upstream execute: upstream v2.11's
+        _91_recall_wait applies the recall result after ``await task``, and
+        replacing the method wholesale would silently drop that.
+        """
+        RecallWait = _find_framework_class(
+            self.agent, "message_loop_prompts_after", "RecallWait", "_91_recall_wait"
+        )
+        if RecallWait is None:
             return
 
-        async def safe_execute(self_recall, loop_data=LoopData(), **kwargs):
-            if not self_recall.agent:
+        if getattr(RecallWait, "_mfb_memory_patched", False):
+            return
+
+        original = RecallWait.execute
+
+        async def safe_execute(self_recall, loop_data=None, **kwargs):
+            if loop_data is None:
+                loop_data = LoopData()
+            try:
+                return await original(self_recall, loop_data, **kwargs)
+            except asyncio.CancelledError:
+                # Shutdown cancellation must propagate (never swallow it);
+                # the recall task itself cannot deliver one here because
+                # upstream's 30s wait_for converts to TimeoutError first.
+                raise
+            except (asyncio.TimeoutError, Exception):
+                # Memory recall is best-effort; a timeout/error must not
+                # kill the agent loop.
                 return
 
-            cfg = plugins.get_plugin_config("_memory", self_recall.agent)
-            if not cfg:
-                return None
-
-            task = self_recall.agent.get_data(_TASK)
-            iter_val = self_recall.agent.get_data(_ITER) or 0
-
-            if task and not task.done():
-                if cfg.get("memory_recall_delayed", False):
-                    if iter_val == loop_data.iteration:
-                        delay_text = self_recall.agent.read_prompt("memory.recall_delay_msg.md")
-                        loop_data.extras_temporary["memory_recall_delayed"] = delay_text
-                        return
-
-                # CRITICAL FIX: catch exceptions to prevent agent loop crash.
-                try:
-                    await task
-                except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
-                    pass
-
+        safe_execute.__wrapped__ = original
         RecallWait.execute = safe_execute
         RecallWait._mfb_memory_patched = True
 
     def _patch_search_timeout(self):
-        """Increase SEARCH_TIMEOUT from 30 to 90 seconds."""
-        from plugins._memory.extensions.python.message_loop_prompts_after import _50_recall_memories as rm
+        """Increase SEARCH_TIMEOUT from 30 to 90 seconds.
 
-        if getattr(rm, '_mfb_timeout_patched', False):
+        The framework's _50_recall_memories module is synthetic (not in
+        sys.modules), so we reach its globals dict through a method's
+        ``__globals__`` on the resolved framework class.
+        """
+        RecallMemories = _find_framework_class(
+            self.agent,
+            "message_loop_prompts_after",
+            "RecallMemories",
+            "_50_recall_memories",
+        )
+        if RecallMemories is None:
             return
 
-        rm.SEARCH_TIMEOUT = 90
-        rm._mfb_timeout_patched = True
+        module_globals = None
+        for attr in list(vars(RecallMemories).values()):
+            fn = getattr(attr, "__func__", attr)
+            if inspect.isfunction(fn) and "SEARCH_TIMEOUT" in fn.__globals__:
+                module_globals = fn.__globals__
+                break
+        if module_globals is None:
+            return
+
+        if module_globals.get("_mfb_timeout_patched", False):
+            return
+
+        module_globals["SEARCH_TIMEOUT"] = 90
+        module_globals["_mfb_timeout_patched"] = True
 
     def _patch_memorize_files(self):
         """Patch MAX_MSGS_CHARS in memorize files on disk for next process."""
@@ -126,14 +172,12 @@ class MemoryRecallPatches(Extension):
 
     def _patch_memorize_runtime(self):
         """Patch memorize methods at runtime to enforce 50k char limit on current session."""
-        try:
-            from plugins._memory.extensions.python.monologue_end._50_memorize_fragments import MemorizeMemories
-            from plugins._memory.extensions.python.monologue_end._51_memorize_solutions import MemorizeSolutions
-        except ImportError:
-            return
-
-        for cls in (MemorizeMemories, MemorizeSolutions):
-            if getattr(cls, '_mfb_memorize_patched', False):
+        for point, name, suffix in (
+            ("monologue_end", "MemorizeMemories", "_50_memorize_fragments"),
+            ("monologue_end", "MemorizeSolutions", "_51_memorize_solutions"),
+        ):
+            cls = _find_framework_class(self.agent, point, name, suffix)
+            if cls is None or getattr(cls, "_mfb_memorize_patched", False):
                 continue
 
             original = cls.memorize

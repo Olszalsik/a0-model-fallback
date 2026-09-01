@@ -95,6 +95,44 @@ module globals mid-suite. Anything resolved via import-time from-imports
 (`_INMEM_COOLDOWNS`, `RetryAfterHours`, ...) is a stale object afterwards.
 New tests must read module state through `fallback.<name>` at call time.
 
+### v2.8.2 — memory recall patches must bind the FRAMEWORK classes (2026-09-01)
+
+`extensions/python/monologue_start/_10_memory_recall_patches.py` had the
+same defect class as the v2.8.1 stale install, but the opposite direction:
+it imported core extension classes via CANONICAL dotted paths
+(`plugins._memory.extensions..._91_recall_wait`), while the framework loads
+extension files via `helpers.modules.import_module` — a SYNTHETIC module
+named after the file basename, never registered in `sys.modules`. The
+canonical import therefore created a phantom module + class the dispatcher
+never instantiates. Every runtime patch here was a silent no-op live:
+
+- `RecallWait.execute` wrap never installed (the 30s recall `TimeoutError`
+  still killed the agent loop — 2026-08-27 crash tracebacks show no
+  `safe_execute` frame),
+- `SEARCH_TIMEOUT = 90` never applied (framework module kept 30),
+- `MemorizeMemories`/`MemorizeSolutions` wraps never installed.
+
+The fix resolves classes through `helpers.extension._get_extension_classes`
+— the exact cached list `call_extensions_async` iterates — matched by class
+name + `__module__.endswith(basename)`. `SEARCH_TIMEOUT` is patched via a
+method's `__globals__` (the synthetic module dict; the module itself is not
+in `sys.modules`). Two behavioral corrections while there:
+
+- `RecallWait.execute` is now WRAPPED (calls the original), not replaced —
+  the old `safe_execute` reimplemented the pre-v2.11 body and would have
+  silently dropped upstream's recall-result application had it ever bound.
+- The wrapper re-raises `CancelledError` (shutdown cancellation must not be
+  swallowed) and swallows only `TimeoutError`/`Exception`.
+
+Tests: `tests/test_memory_recall_patches_v282.py` (5/5). Gotcha: build fake
+module globals with `exec()` — a nested `def`'s `__globals__` is the TEST
+module's dict, so the `_mfb_timeout_patched` flag leaks across tests and
+silently disarms the later assertions.
+
+The same phantom-class bug existed in `memory_hardening` v0.5.2
+(recall-wait guard + recall method patch) — fixed there in parallel (v0.5.3,
+`helpers/extension_class.py` shared resolver).
+
 This plugin also owns six **LLM-error-handling** extensions on top of the
 cascade. They live here (not in separate plugins) so a single
 `usr/plugins/_model_fallback/.toggle-0` disables everything and a single
