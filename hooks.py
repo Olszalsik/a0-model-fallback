@@ -3,8 +3,10 @@
 # v2.8.3: real data-key names (the old literal strings
 # "ext_retry_phase"/"ext_retry_at" didn't match what the cascade
 # reads/writes, so reset_fallback_settings never cleared them).
-DATA_KEY_EXT_RETRY_PHASE = "_mfb_ext_retry_phase"
-DATA_KEY_EXT_RETRY_AT = "_mfb_ext_retry_at"
+# v2.8.5: the dead "_mfb_ext_retry_at" constant (nothing in fallback.py
+# writes it; the live key is _mfb_ext_retry_attempts) was removed and
+# reset_fallback_settings now clears the real keys via the fallback module
+# constants.
 
 
 async def install():
@@ -36,9 +38,14 @@ async def install():
             return
 
         results = langchain_compat.install_shim()
-        langchain_compat.mark_installed()
         installed = [k for k, v in results.items() if v]
+        # v2.8.5 (wiring#12): only record the install marker when at least
+        # one shim actually installed. Marking unconditionally made
+        # already_installed_in_process() return True after a total failure
+        # (e.g. langchain_core absent), so the agent_init extension's
+        # defensive retry was skipped for the life of the process.
         if installed:
+            langchain_compat.mark_installed()
             import logging
             logging.getLogger("model_fallback.langchain_compat.install").info(
                 "langchain compat shim installed at process start: %s",
@@ -106,8 +113,18 @@ async def pre_update():
     pass
 
 
-async def uninstall():
+def uninstall():
     """Plugin disable / process-shutdown hook.
+
+    v2.8.5: made SYNC. The framework calls sync hooks directly but runs
+    coroutine hooks via ``asyncio.run`` (helpers/plugins.py:917-920) --
+    and the only live trigger for uninstall is the plugin-delete API
+    endpoint, which executes INSIDE a running event loop. ``asyncio.run``
+    there raised RuntimeError, the API turned it into a 500, and every
+    piece of uninstall cleanup below was silently skipped. The body was
+    always fully synchronous; the async declaration was the only problem.
+    (The async ``install`` hook is safe: it only fires from the sync
+    plugin-installer path.)
 
     v2.4 update: the resilience layer (utility timeout monkey-patch,
     langchain import shim) holds process-global resources that must
@@ -149,28 +166,52 @@ async def uninstall():
 
 
 def get_fallback_settings(agent) -> dict:
-    """Get current fallback settings for an agent."""
+    """Get the fallback settings an agent's cascades actually use.
+
+    v2.8.5: read them from the merged plugin config
+    (fallback._get_plugin_cfg = default_config.yaml + config.json). The
+    old version read agent-data keys the runtime never writes -- the
+    cascades resolve every knob from plugin config (model kwargs first),
+    so "get" displayed hardcoded defaults (delay 5.0, attempts 60) that
+    contradicted both config.json and the YAML defaults.
+    """
+    try:
+        from usr.plugins._model_fallback import fallback as _fb
+
+        cfg = _fb._get_plugin_cfg(agent)
+    except Exception:  # noqa: BLE001
+        cfg = {}
     return {
-        "max_cycles": int(agent.get_data("fallback_max_cycles") or 4),
-        "cycle_delay": float(agent.get_data("fallback_cycle_delay") or 5.0),
-        "extended_retry_enabled": bool(agent.get_data("extended_retry_enabled") or True),
-        "phase_a_delay_s": float(agent.get_data("phase_a_delay_s") or 900.0),
-        "phase_b_delay_s": float(agent.get_data("phase_b_delay_s") or 3600.0),
-        "initial_cycle_attempts": int(agent.get_data("initial_cycle_attempts") or 60),
+        "max_cycles": int(cfg.get("fallback_max_cycles", 4)),
+        "cycle_delay": float(cfg.get("fallback_cycle_delay", 5.0)),
+        "extended_retry_enabled": bool(cfg.get("extended_retry_enabled", True)),
+        "phase_a_delay_s": float(cfg.get("phase_a_delay_s", 900.0)),
+        "phase_b_delay_s": float(cfg.get("phase_b_delay_s", 3600.0)),
+        "initial_cycle_attempts": int(cfg.get("initial_cycle_attempts", 60)),
     }
 
 
 def reset_fallback_settings(agent):
-    """Reset fallback settings to defaults."""
-    agent.set_data("fallback_max_cycles", 4)
-    agent.set_data("fallback_cycle_delay", 5.0)
-    agent.set_data("extended_retry_enabled", True)
-    agent.set_data("phase_a_delay_s", 900.0)
-    agent.set_data("phase_b_delay_s", 3600.0)
-    agent.set_data("initial_cycle_attempts", 60)
+    """Reset the runtime fallback state to defaults.
+
+    v2.8.5: the cascade knobs live in plugin config (edited in the WebUI),
+    not agent data -- the old version wrote dead data keys AND cleared a
+    nonexistent "_mfb_ext_retry_at" while leaving the live
+    "_mfb_ext_retry_attempts" stale, so "reset" never restarted the
+    extended-retry burst budget (the next exhaustion immediately promoted
+    phase A -> B into the 3600s wait). Now: clear cooldowns + the real
+    extended-retry phase state. Config knobs remain user-managed.
+    """
     clear_cooldowns(agent)
-    agent.set_data(DATA_KEY_EXT_RETRY_PHASE, None)
-    agent.set_data(DATA_KEY_EXT_RETRY_AT, None)
+    try:
+        from usr.plugins._model_fallback import fallback as _fb
+
+        agent.set_data(_fb.DATA_KEY_EXT_RETRY_PHASE, 0)
+        agent.set_data(_fb.DATA_KEY_EXT_RETRY_ATTEMPTS, 0)
+        agent.set_data(_fb.DATA_KEY_EXT_RETRY_NOTIFIED, False)
+        agent.set_data(_fb.DATA_KEY_TURN_PRIMARY_FAILS, 0)
+    except Exception:  # noqa: BLE001
+        pass
     return get_fallback_settings(agent)
 
 
@@ -187,7 +228,14 @@ def clear_cooldowns(agent):
         cleared = _fb.clear_all_cooldowns(agent)
     except Exception:  # noqa: BLE001
         cleared = 0
-    agent.set_data("_model_cooldowns", {})
+    # v2.8.5: also wipe the persisted key by its current name. The old
+    # literal "_model_cooldowns" was the pre-v2.8.5 (underscore-prefixed)
+    # name -- persist_chat strips underscore keys, so nothing ever
+    # persisted under it anyway.
+    try:
+        agent.set_data(_fb.DATA_KEY_COOLDOWNS, {})
+    except Exception:  # noqa: BLE001
+        pass
     return cleared
 
 
@@ -204,4 +252,10 @@ def get_cooldowns(agent) -> dict:
             return live
     except Exception:  # noqa: BLE001
         pass
-    return agent.get_data("_model_cooldowns") or {}
+    # v2.8.5: fall back to the persisted key under its CURRENT name (the
+    # legacy "_model_cooldowns" literal predated the rename).
+    try:
+        from usr.plugins._model_fallback import fallback as _fb2
+        return agent.get_data(_fb2.DATA_KEY_COOLDOWNS) or {}
+    except Exception:  # noqa: BLE001
+        return {}

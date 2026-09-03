@@ -26,6 +26,13 @@ import inspect
 from helpers.extension import Extension
 from agent import LoopData
 
+# v2.8.5 (AD): version-stamp the install guards. A bare ``True`` sentinel
+# survives a plugin UPDATE: the wrapper (closure) from the old code stays
+# live on the framework class for the rest of the process even though its
+# logic is stale. Patches now also record _mfb_*_patch_version; a version
+# mismatch unwraps the old wrapper (via the stored original) and re-applies.
+_PATCH_VERSION = "2.8.5"
+
 
 # Safe defaults written to /a0/plugins/_memory/config.json when missing.
 _DEFAULT_MEMORY_CONFIG = {
@@ -61,6 +68,48 @@ def _find_framework_class(agent, extension_point, class_name, module_suffix):
     return None
 
 
+def _resolve_memory_cfg(agent) -> dict:
+    """Resolve the plugin's memory_* knobs (wiring#6, v2.8.5).
+
+    The YAML documented ``memory_recall_timeout_s`` /
+    ``memory_memorize_max_chars`` / ``memory_recall_delayed`` /
+    ``memory_memorize_consolidation`` but every consumer hardcoded its
+    value, so editing the config did nothing. Merged config
+    (default_config.yaml under config.json), same precedence as the
+    other extensions.
+    """
+    try:
+        from helpers import plugins as plugin_helpers  # type: ignore
+        cfg = plugin_helpers.get_plugin_config("_model_fallback", agent) or {}
+        try:
+            defaults = plugin_helpers.get_default_plugin_config(
+                "_model_fallback"
+            ) or {}
+            if isinstance(defaults, dict):
+                merged = dict(defaults)
+                if isinstance(cfg, dict):
+                    merged.update(cfg)
+                cfg = merged
+        except Exception:  # noqa: BLE001
+            pass
+    except Exception:  # noqa: BLE001
+        cfg = {}
+    try:
+        timeout_s = max(30.0, min(float(cfg.get("memory_recall_timeout_s") or 90), 600.0))
+    except (TypeError, ValueError):
+        timeout_s = 90.0
+    try:
+        max_chars = max(1000, min(int(cfg.get("memory_memorize_max_chars") or 50000), 500000))
+    except (TypeError, ValueError):
+        max_chars = 50000
+    return {
+        "recall_timeout_s": int(timeout_s),
+        "memorize_max_chars": int(max_chars),
+        "recall_delayed": bool(cfg.get("memory_recall_delayed", True)),
+        "memorize_consolidation": bool(cfg.get("memory_memorize_consolidation", False)),
+    }
+
+
 class MemoryRecallPatches(Extension):
     async def execute(self, loop_data: LoopData = LoopData(), **kwargs):
         # Apply patches silently -- never let our fix crash the agent loop.
@@ -72,8 +121,13 @@ class MemoryRecallPatches(Extension):
             self._patch_search_timeout()
         except Exception:
             pass
+        # v2.8.5 (wiring#9): the disk-touching patches ran SYNCHRONOUSLY on
+        # the event loop every monologue (two file reads + a stat + a
+        # possible write). Offload them to a thread; self-healing (re-check
+        # after a framework update overwrites the files) is preserved --
+        # only the blocking wait moves off the loop.
         try:
-            self._patch_memorize_files()
+            await asyncio.to_thread(self._patch_memorize_files)
         except Exception:
             pass
         try:
@@ -81,7 +135,7 @@ class MemoryRecallPatches(Extension):
         except Exception:
             pass
         try:
-            self._ensure_config()
+            await asyncio.to_thread(self._ensure_config)
         except Exception:
             pass
 
@@ -98,10 +152,17 @@ class MemoryRecallPatches(Extension):
         if RecallWait is None:
             return
 
-        if getattr(RecallWait, "_mfb_memory_patched", False):
-            return
-
-        original = RecallWait.execute
+        current = RecallWait.execute
+        if getattr(current, "_mfb_safe_wrapper", False):
+            # Ours (this or a previous plugin version): re-patch only when
+            # the plugin version changed (AD).
+            if getattr(current, "_mfb_patch_version", "") == _PATCH_VERSION:
+                return
+            original = getattr(current, "__wrapped__", None) or current
+        else:
+            if getattr(RecallWait, "_mfb_memory_patched", False):
+                return
+            original = current
 
         async def safe_execute(self_recall, loop_data=None, **kwargs):
             if loop_data is None:
@@ -119,8 +180,11 @@ class MemoryRecallPatches(Extension):
                 return
 
         safe_execute.__wrapped__ = original
+        safe_execute._mfb_safe_wrapper = True
+        safe_execute._mfb_patch_version = _PATCH_VERSION
         RecallWait.execute = safe_execute
         RecallWait._mfb_memory_patched = True
+        RecallWait._mfb_patch_version = _PATCH_VERSION
 
     def _patch_search_timeout(self):
         """Increase SEARCH_TIMEOUT from 30 to 90 seconds.
@@ -147,70 +211,127 @@ class MemoryRecallPatches(Extension):
         if module_globals is None:
             return
 
-        if module_globals.get("_mfb_timeout_patched", False):
+        if module_globals.get("_mfb_timeout_patched", False) and (
+            module_globals.get("_mfb_timeout_patch_version", "") == _PATCH_VERSION
+        ):
             return
 
-        module_globals["SEARCH_TIMEOUT"] = 90
+        module_globals["SEARCH_TIMEOUT"] = _resolve_memory_cfg(self.agent)["recall_timeout_s"]
         module_globals["_mfb_timeout_patched"] = True
+        module_globals["_mfb_timeout_patch_version"] = _PATCH_VERSION
 
     def _patch_memorize_files(self):
-        """Patch MAX_MSGS_CHARS in memorize files on disk for next process."""
+        """Patch MAX_MSGS_CHARS in memorize files on disk for next process.
+
+        v2.8.5 (wiring#9): the paths were hardcoded to /a0 (container) and
+        silently no-oped anywhere else; derive them from this file's own
+        location (usr/plugins/<this>/... -> framework root) with /a0 as
+        the fallback. Runs in a worker thread (see execute)."""
+        try:
+            root = os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.dirname(os.path.dirname(os.path.dirname(
+                    os.path.dirname(__file__)))))))
+            # __file__ = <root>/usr/plugins/_model_fallback/extensions/python/
+            # monologue_start/<this>.py -> 7 dirname() steps up = framework root
+        except Exception:
+            root = "/a0"
+        base = os.path.join(root, "plugins", "_memory", "extensions", "python",
+                            "monologue_end")
         files = [
-            "/a0/plugins/_memory/extensions/python/monologue_end/_50_memorize_fragments.py",
-            "/a0/plugins/_memory/extensions/python/monologue_end/_51_memorize_solutions.py",
+            os.path.join(base, "_50_memorize_fragments.py"),
+            os.path.join(base, "_51_memorize_solutions.py"),
         ]
         for f in files:
             try:
+                # v2.8.5 (wiring#6): the 50000 target was hardcoded; use
+                # the memory_memorize_max_chars knob.
+                target = _resolve_memory_cfg(self.agent)["memorize_max_chars"]
                 with open(f, 'r') as fh:
                     content = fh.read()
                 if 'MAX_MSGS_CHARS = 80000' in content:
-                    content = content.replace('MAX_MSGS_CHARS = 80000', 'MAX_MSGS_CHARS = 50000')
+                    content = content.replace(
+                        'MAX_MSGS_CHARS = 80000', f'MAX_MSGS_CHARS = {target}')
                     with open(f, 'w') as fh:
                         fh.write(content)
             except Exception:
                 pass
 
     def _patch_memorize_runtime(self):
-        """Patch memorize methods at runtime to enforce 50k char limit on current session."""
+        """Patch memorize methods at runtime to enforce the
+        memory_memorize_max_chars limit on the current session."""
+        limit = _resolve_memory_cfg(self.agent)["memorize_max_chars"]
         for point, name, suffix in (
             ("monologue_end", "MemorizeMemories", "_50_memorize_fragments"),
             ("monologue_end", "MemorizeSolutions", "_51_memorize_solutions"),
         ):
             cls = _find_framework_class(self.agent, point, name, suffix)
-            if cls is None or getattr(cls, "_mfb_memorize_patched", False):
+            if cls is None:
                 continue
+            current = cls.memorize
+            if getattr(cls, "_mfb_memorize_patched", False):
+                # Ours (this or a previous plugin version): re-patch only
+                # when the plugin version changed (AD).
+                if getattr(cls, "_mfb_memorize_patch_version", "") == _PATCH_VERSION:
+                    continue
+                original = getattr(current, "_mfb_orig", None) or current
+            else:
+                original = current
 
-            original = cls.memorize
-
-            def make_safe(orig):
+            def make_safe(orig, _limit=limit):
                 async def safe_memorize(self_mem, loop_data, log_item, **kwargs):
                     agent = self_mem.agent
                     if agent:
                         orig_concat = agent.concat_messages
                         def limited_concat(history):
                             text = orig_concat(history)
-                            if len(text) > 50000:
-                                text = text[-50000:]
+                            if len(text) > _limit:
+                                text = text[-_limit:]
                             return text
                         agent.concat_messages = limited_concat
                         try:
                             await orig(self_mem, loop_data, log_item, **kwargs)
                         finally:
-                            agent.concat_messages = orig_concat
+                            # v2.8.5 (wiring#10): restore only if nothing
+                            # else swapped the attribute while we were
+                            # awaiting. A blind restore would clobber a
+                            # wrapper installed meanwhile (re-entrant or
+                            # concurrent memorize on the same agent) and
+                            # silently un-limit the session.
+                            if getattr(agent, "concat_messages", None) is limited_concat:
+                                agent.concat_messages = orig_concat
                     else:
                         await orig(self_mem, loop_data, log_item, **kwargs)
                 return safe_memorize
 
-            cls.memorize = make_safe(original)
+            new_memorize = make_safe(original)
+            new_memorize._mfb_orig = original
+            cls.memorize = new_memorize
             cls._mfb_memorize_patched = True
+            cls._mfb_memorize_patch_version = _PATCH_VERSION
 
     def _ensure_config(self):
-        """Ensure /a0/plugins/_memory/config.json exists with safe defaults."""
-        config_path = "/a0/plugins/_memory/config.json"
+        """Ensure the _memory plugin's config.json exists with safe defaults.
+
+        v2.8.5 (wiring#9): path derived from this file's location (see
+        _patch_memorize_files) instead of a hardcoded /a0; runs in a
+        worker thread (see execute). v2.8.5 (wiring#6): the defaults now
+        come from the plugin's memory_* knobs instead of a second
+        hardcoded dict that could drift from the YAML."""
+        try:
+            root = os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.dirname(os.path.dirname(os.path.dirname(
+                    os.path.dirname(__file__)))))))
+        except Exception:
+            root = "/a0"
+        config_path = os.path.join(root, "plugins", "_memory", "config.json")
         if os.path.exists(config_path):
             return
+        cfg = _resolve_memory_cfg(self.agent)
+        defaults = dict(_DEFAULT_MEMORY_CONFIG)
+        defaults["memory_recall_delayed"] = cfg["recall_delayed"]
+        defaults["memory_memorize_consolidation"] = cfg["memorize_consolidation"]
         try:
             with open(config_path, 'w') as fh:
-                json.dump(_DEFAULT_MEMORY_CONFIG, fh, indent=4)
+                json.dump(defaults, fh, indent=4)
         except Exception:
             pass

@@ -91,6 +91,43 @@ def utility_timeout_record_close_inner(success: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Context size guard counters (v2.8.5 -- moved OUT of the extension file)
+# ---------------------------------------------------------------------------
+# The trim hook lived its counters in the extension module. Extension
+# files load as SYNTHETIC modules (basename only, not registered in
+# sys.modules under the full path), so api/stats.py's import of the
+# extension path created a SECOND module instance with a fresh zero
+# counter -- the stats endpoint reported phantom zeros forever while
+# the live hook counted in its own instance. Helpers modules import
+# normally, so hosting the counter here gives both sides the same
+# object.
+
+_CONTEXT_GUARD: Dict[str, Any] = {
+    "trims": 0,
+    "messages_dropped": 0,
+    "last_kept": 0,
+    "last_dropped": 0,
+}
+
+
+def context_guard_snapshot() -> Dict[str, Any]:
+    return dict(_CONTEXT_GUARD)
+
+
+def context_guard_record_trim(dropped: int, kept: int) -> None:
+    _CONTEXT_GUARD["trims"] += 1
+    _CONTEXT_GUARD["messages_dropped"] += int(dropped)
+    _CONTEXT_GUARD["last_kept"] = int(kept)
+    _CONTEXT_GUARD["last_dropped"] = int(dropped)
+
+
+def reset_context_guard_counters() -> None:
+    _CONTEXT_GUARD.update({
+        "trims": 0, "messages_dropped": 0, "last_kept": 0, "last_dropped": 0,
+    })
+
+
+# ---------------------------------------------------------------------------
 # Reset (called by hooks.uninstall)
 # ---------------------------------------------------------------------------
 
@@ -114,4 +151,7 @@ def reset() -> None:
         "calls_total": 0, "timeouts_total": 0, "max_observed_wait_s": 0.0,
         "last_timeout_at": 0.0, "last_timeout_model": "",
         "close_inner_attempted": 0, "close_inner_succeeded": 0,
+    })
+    _CONTEXT_GUARD.update({
+        "trims": 0, "messages_dropped": 0, "last_kept": 0, "last_dropped": 0,
     })

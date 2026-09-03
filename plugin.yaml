@@ -12,7 +12,7 @@ description: >
   (The server-side WebUI extensions cache moved to the
   ui_loader_optimizer plugin in v2.6.6.) Self-contained; no official
   agent-zero file is modified.
-version: 2.8.4
+version: 2.8.5
 settings_sections:
   - agent
   - developer

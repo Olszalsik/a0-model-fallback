@@ -23,6 +23,111 @@ provider going dark for hours is normal operating conditions, not a failure.
 Both wrappers share the same contract: build a candidate list from the active
 preset (`_build_candidates`), then loop through candidates until one succeeds.
 
+### v2.8.5 — third-pass audit fixes (2026-09-03)
+
+Deep-dive pass over the cascades. Findings fixed (all verified in source
+before fixing; full suite 213/213 after):
+
+**CRITICAL / HIGH — cascade mechanics**
+
+- **Event-loop freeze on an all-skipped roster** (both utility + chat
+  cascades). The pass-boundary check (`attempt % n == 0`, empty-pass spin +
+  cycle accounting) sat BELOW the dead/cooldown `continue` checks, so it
+  only ran when the landing candidate was live. All-skipped roster → every
+  iteration exited via a skip `continue` with NO `await` → tight loop that
+  froze the event loop until the shortest dead TTL (a 24h dead mark → hang
+  until restart). A cooled STARTING candidate also meant the boundary never
+  fired and cycle accounting / RetryAfterHours never engaged. The boundary
+  block moved ABOVE the skip checks; skips still `continue` instantly.
+- **Dead 5xx retry** (both cascades). The retry-after-5xx branch awaited a
+  coroutine object it had ALREADY awaited (and consumed) in the failed
+  attempt — `RuntimeError: cannot reuse already awaited coroutine`. Both
+  now build a fresh coroutine inside the retry try.
+- **Turn kill path** (`call_chat_model_turn`). The turn cascade resolved
+  per-candidate timeouts with the warm fast-path ACTIVE: a main-loop turn
+  legitimately streams for 15–90 s, so the 20 s warm ceiling timed out
+  healthy turns, `_60` saw a bare TimeoutError (no status, no litellm
+  class) and let it reach `_90` → agent stopped. Turn path now passes
+  `allow_warm=False`; `_resolve_per_call_timeout` grew the kwarg; `_60`
+  treats a bare `TimeoutError`/`asyncio.TimeoutError` as transient.
+- **n≤1 quota-death path** (turn cascade). With no fallback candidates a
+  sustained outage surfaced the raw error every turn; `_60` swallowed it ≤5
+  times then the agent stopped. The single-attempt path now books the
+  normal cooldown and raises `RetryAfterHours(retry_after=...)` (owned by
+  `_70`) unless the failure is permanent or output already streamed, and
+  re-raises as-is when extended retry AND continuous mode are both off.
+- **`clear_all_cooldowns` defeated recovery** — it now also clears
+  `_INMEM_DEAD_LABELS` and `_WARM_LABELS` and resets the last-status dict.
+- **Turn strike-counter persistence** — the turn cascade is a single pass,
+  so the closure-local primary-skip counter maxed at 1 and the v2.8.4
+  escalation was dead. Counter now persists via `DATA_KEY_TURN_PRIMARY_FAILS`
+  across turns.
+- **`_60` api_base registry** — `_LABEL_API_BASES` (populated by
+  `_resolve_per_call_timeout`, consumed by `_handle_error_cooldown`) so
+  safety-net bookings classify router/free/paid correctly instead of
+  mis-cooling a gateway 30 s or dead-marking it 24 h.
+- **`_maybe_raise_retry_after_hours` max_cycles** — callers' kwarg-resolved
+  cycle cap now reaches the gate instead of a hardcoded value.
+
+**MEDIUM**
+
+- **Persistence was dead code** (all `_mfb_*` data keys). `persist_chat.py`
+  strips agent.data keys starting with `_` (:194/:223, restore at :311), so
+  cooldown seeding / extended-retry phase / cascade position never actually
+  persisted. All DATA_KEY_* constants renamed to a non-underscore
+  `mfb_*` prefix; `_70` and hooks use the constants instead of literals.
+- **Utility timeout guard toggle-off** — `_install` returned False on
+  `enabled: false` BEFORE refreshing the resolved config, so a live wrapper
+  kept guarding until restart. Refresh now happens in the disabled branch.
+- **Utility guard budget vs cold routers** — the outer guard's flat 60 s
+  budget fired first on every utility call to a COLD router (150 s
+  warm-up budget), killed the call, and booked nothing (starvation loop).
+  `_resolve_config` injects `_router_cold_s`; `guarded_call` raises its
+  budget to `max(default, router cold)` still capped by `max_wait_s`, and
+  a guard timeout now books the cooldown + evicts the warm label (needs
+  `agent=`, passed by the wrapper).
+- **`_70` honors `retry_after`** — the phase A (900 s) / phase B (3600 s)
+  delays the cascades computed were ignored; the handler slept a hardcoded
+  60 s and re-entered a full cascade pass. Now clamps the exception's
+  `retry_after` to [30, 7200] s, sliced.
+- **Hooks** — `uninstall()` made SYNC (the framework runs async hooks via
+  `asyncio.run`, which raises inside the plugin-delete API's running loop
+  → 500 → cleanup silently skipped); `get_fallback_settings` reads the
+  merged plugin config instead of dead agent-data keys;
+  `reset_fallback_settings` clears the REAL extended-retry keys.
+- **Stats phantom counters** — the context-size-guard counter lived in the
+  extension module (synthetic module, not in sys.modules), so api/stats.py
+  importing that path created a SECOND instance with fresh zeros and the
+  WebUI tile reported phantom zeros forever. Counter moved to
+  `helpers/stats.py` (`context_guard_*` accessors); the extension keeps
+  `get_counter`/`reset_counter` wrappers for the tests.
+- **Turn shadow UnboundLocalError hazard** — `prev_shadow` captured outside
+  the try so the finally can never hit UnboundLocalError.
+
+**LOW**
+
+- Warm fast-path entry is evicted for any label that books a cooldown
+  (AA) — closes the 20 s-fail → cooldown → 20 s-fail loop. Router /
+  concurrent_paid 429s (no cooldown booked) keep the warm ceiling.
+- Expired `_INMEM_HEALTHY_LABELS` entries are popped (AB).
+- Chat cascade `_compute_cycle_sleep` gained the Phase-3 stagnation
+  amplification (+ `nonlocal` flag) the utility cascade already had (Y);
+  the all-skipped spin in BOTH cascades now mirrors the router probe cap
+  (`router_max_cycle_delay_s`).
+- memory_* knobs are wired (wiring#6): `memory_recall_timeout_s`,
+  `memory_memorize_max_chars`, `memory_recall_delayed`,
+  `memory_memorize_consolidation` were documented but every consumer
+  hardcoded its value.
+- context-size guard config merge (wiring#7): `_resolve_runtime_config`
+  now merges default_config.yaml under config.json (same gap the utility
+  guard fixed in v2.8.3).
+- memory recall patches disk I/O offloaded to `asyncio.to_thread` and
+  paths derived from the file location instead of hardcoded `/a0`
+  (wiring#9); concat_messages swap restore is re-entrancy-safe (wiring#10);
+  `mark_installed` only fires when at least one shim actually installed
+  (wiring#12); install guards are version-stamped so a plugin UPDATE
+  re-applies changed wrappers instead of leaving stale closures live (AD).
+
 ### v2.8.0 — turn-path cascade + transient-error safety net (2026-09-01)
 
 Root cause that motivated this: `usr/settings.json` → litellm

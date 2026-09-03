@@ -145,6 +145,7 @@ async def guarded_call(
     *,
     model_name: str = "",
     config_overrides: Optional[Dict[str, Any]] = None,
+    agent: Any = None,
 ) -> Any:
     """Run ``inner_coro_factory()`` under ``asyncio.wait_for``.
 
@@ -154,8 +155,9 @@ async def guarded_call(
     a coroutine that another task is already driving.
 
     On ``asyncio.TimeoutError`` we close the inner chain, record a
-    stat, and re-raise as ``RepairableException`` so the LLM sees a
-    recoverable error rather than a hard timeout.
+    stat, book a cooldown for the utility label (v2.8.5, needs
+    ``agent``), and re-raise as ``RepairableException`` so the LLM
+    sees a recoverable error rather than a hard timeout.
     """
     cfg = resolve_config(config_overrides or get_resolved())
     if not cfg.get("enabled", True):
@@ -163,9 +165,19 @@ async def guarded_call(
 
     max_wait = float(cfg.get("max_wait_s") or 120.0)
     default_to = float(cfg.get("default_timeout_s") or 30.0)
-    # Use the larger of the two so a configured "default" never exceeds
-    # the hard cap; this keeps the contract: "max_wait_s" is a real cap.
-    timeout_s = min(max(default_to, 0.0), max_wait)
+    # v2.8.5: raise the budget to cover the inner cascade's largest
+    # legitimate per-call timeout. A cold router call gets up to
+    # router_cold_call_timeout_s (150s, v2.7.0), injected here as the
+    # private ``_router_cold_s`` key by
+    # _10_install_utility_timeout_patch._resolve_config; without this
+    # the OUTER guard fired first on every utility call to a cold
+    # router, killed the call, and the cascade never got to book its
+    # own cooldown. Normal labels keep the default ceiling, and the
+    # max_wait_s hard cap still wins for everything -- so this stays
+    # min(budget, max_wait), not an unbounded max.
+    router_cold = float(cfg.get("_router_cold_s") or 0.0)
+    budget = max(max(default_to, 0.0), max(router_cold, 0.0))
+    timeout_s = min(budget, max_wait)
     # Add a small random spread so concurrent agents don't hit the
     # wire lockstep.
     jitter = float(cfg.get("jitter_s") or 0.0)
@@ -182,6 +194,31 @@ async def guarded_call(
         stats.utility_timeout_record_timeout(model_name)
         if cfg.get("close_inner_on_timeout", True):
             _try_close_inner_coro(inner)
+        # v2.8.5: book the timeout cooldown for this utility label so the
+        # next utility call routes around it. Before, the outer guard
+        # killed the call and booked NOTHING -- a candidate that hung past
+        # the budget was retried from scratch on every subsequent call and
+        # utility traffic starved. Router labels keep their policy: a pure
+        # timeout books a 0s cooldown (router_timeout_no_cooldown), handled
+        # inside _handle_error_cooldown via the label->api_base registry.
+        # The cascade also usually books its own cooldown -- but only when
+        # ITS wait_for fires first, which this budget change makes the
+        # normal case; this is the safety net for the race the other way.
+        try:
+            if agent is not None and model_name:
+                from usr.plugins._model_fallback import fallback as _fb
+
+                timeout_exc = TimeoutError(
+                    f"utility timeout guard: {model_name} exceeded "
+                    f"{elapsed:.1f}s"
+                )
+                _fb._evict_warm_on_timeout(timeout_exc, model_name)
+                _fb._handle_error_cooldown(
+                    timeout_exc, model_name, _fb._get_cooldown_store(agent),
+                    agent,
+                )
+        except Exception:  # noqa: BLE001
+            pass
         _log.warning(
             "utility call exceeded %.1fs (max_wait_s=%.1f, model=%s); "
             "raising RepairableException for cascade failover",

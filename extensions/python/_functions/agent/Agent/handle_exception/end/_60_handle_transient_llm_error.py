@@ -66,6 +66,17 @@ def _is_transient_llm_error(exc: Exception) -> bool:
     except Exception:
         pass
 
+    # v2.8.5: a builtin TimeoutError / asyncio.TimeoutError (same class on
+    # 3.11+) escaping the turn cascade's mid-stream re-raise carries no
+    # status_code and a bare str(exc), so none of the checks above matched
+    # and the error fell through to _90 -- ONE 20s warm-ceiling timeout on
+    # a streaming turn stopped the whole run. The cascade already booked
+    # its cooldown + evicted the warm label before re-raising, so treating
+    # the shape as transient here is safe (this handler only sees LLM-call
+    # failures anyway).
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return True
+
     # Shared detector from the plugin (phrase-based: "rate limit",
     # "too many requests", "upstream_429", ...).
     try:

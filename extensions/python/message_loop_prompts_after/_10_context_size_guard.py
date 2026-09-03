@@ -210,40 +210,61 @@ def trim_history(
 # ---------------------------------------------------------------------------
 
 
-class _Counter:
-    """Per-process counters exposed by the stats endpoint."""
+# v2.8.5: the counters moved to helpers/stats.py. This module is loaded
+# as a SYNTHETIC module (basename, not registered under the full path in
+# sys.modules), so api/stats.py importing this path created a SECOND
+# instance with a fresh zero counter -- the stats endpoint reported
+# phantom zeros forever. The helpers module imports normally, so both
+# sides now share one counter dict. get_counter()/reset_counter() remain
+# as thin wrappers for the tests and for a dict-style ``.trims``-style
+# access we keep via a tiny proxy below.
 
-    def __init__(self):
-        self.trims = 0
-        self.messages_dropped = 0
-        self.last_kept = 0
-        self.last_dropped = 0
+class _CounterProxy:
+    """Dict-backed snapshot proxy kept for get_counter() callers."""
 
     def snapshot(self) -> Dict[str, Any]:
-        return {
-            "trims": self.trims,
-            "messages_dropped": self.messages_dropped,
-            "last_kept": self.last_kept,
-            "last_dropped": self.last_dropped,
-        }
+        from usr.plugins._model_fallback.helpers import stats as _stats
+        return _stats.context_guard_snapshot()
+
+    # Attribute-style reads (counter.trims) for backward compatibility.
+    def __getattr__(self, name: str) -> Any:
+        try:
+            from usr.plugins._model_fallback.helpers import stats as _stats
+            return _stats.context_guard_snapshot().get(name, 0)
+        except Exception:  # noqa: BLE001
+            return 0
 
 
-_counter = _Counter()
-
-
-def get_counter() -> _Counter:
-    return _counter
+def get_counter() -> _CounterProxy:
+    return _CounterProxy()
 
 
 def reset_counter() -> None:
-    global _counter
-    _counter = _Counter()
+    from usr.plugins._model_fallback.helpers import stats as _stats
+    _stats.reset_context_guard_counters()
 
 
 def _resolve_runtime_config(agent) -> Dict[str, Any]:
     try:
         from helpers import plugins as plugin_helpers  # type: ignore
         cfg = plugin_helpers.get_plugin_config("_model_fallback", agent) or {}
+        # v2.8.5 (wiring#7): get_plugin_config returns config.json WITHOUT
+        # merging default_config.yaml (same gap the utility guard hit --
+        # see _10_install_utility_timeout_patch._resolve_config v2.8.3).
+        # Merge the YAML defaults UNDER config.json so the YAML's
+        # ``context_size_guard:`` section (max_chars / min_messages /
+        # notice_text) is effective and user config.json values win.
+        try:
+            defaults = plugin_helpers.get_default_plugin_config(
+                "_model_fallback"
+            ) or {}
+            if isinstance(defaults, dict):
+                merged = dict(defaults)
+                if isinstance(cfg, dict):
+                    merged.update(cfg)
+                cfg = merged
+        except Exception:  # noqa: BLE001
+            pass
     except Exception:  # noqa: BLE001
         cfg = {}
     # v2.5 WebUI: top-level ``context_size_guard_enabled`` wins
@@ -290,10 +311,11 @@ class ContextSizeGuard(Extension):
             )
             if trimmed:
                 loop_data.history_output = new_list
-                _counter.trims += 1
-                _counter.messages_dropped += dropped
-                _counter.last_kept = len(new_list)
-                _counter.last_dropped = dropped
+                try:
+                    from usr.plugins._model_fallback.helpers import stats as _stats
+                    _stats.context_guard_record_trim(dropped, len(new_list))
+                except Exception:  # noqa: BLE001
+                    pass
                 _log.info(
                     "context_size_guard: dropped %d oldest message(s) to fit under "
                     "%d char budget (kept %d)",

@@ -157,8 +157,11 @@ def test_turn_cascade_defines_and_calls_primary_skip():
     assert "_consecutive_primary_failures += 1" in turn_src
     assert turn_src.count("def _maybe_extend_primary_cooldown") == 1
     # The call site sits right after the idx==0 increment.
+    # v2.8.5: widened from 400 -- the strike counter now also persists to
+    # agent data (DATA_KEY_TURN_PRIMARY_FAILS) between the increment and
+    # the escalation call, which pushed the call past the old window.
     site = turn_src.index("if idx == 0:")
-    assert "_maybe_extend_primary_cooldown(reason=" in turn_src[site : site + 400]
+    assert "_maybe_extend_primary_cooldown(reason=" in turn_src[site : site + 800]
 
 
 # ---------------------------------------------------------------------------

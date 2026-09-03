@@ -40,15 +40,14 @@ class Stats(ApiHandler):
     async def process(self, input: Dict[str, Any], request: Request) -> Dict[str, Any]:
         ut = stats.utility_timeout_snapshot()
 
-        # Context size guard counters live in a separate module (the
-        # trim hook). Lazy import so a missing module never breaks
-        # the stats endpoint.
+        # Context size guard counters. v2.8.5: they live in helpers/stats
+        # -- importing the EXTENSION module here used to create a second
+        # synthetic module instance with a fresh zero counter, so this
+        # endpoint reported phantom zeros forever while the live hook
+        # counted in its own instance.
         context_size: Dict[str, Any] = {}
         try:
-            from usr.plugins._model_fallback.extensions.python.message_loop_prompts_after import (
-                _10_context_size_guard as _csg,
-            )
-            context_size = _csg.get_counter().snapshot()
+            context_size = stats.context_guard_snapshot()
         except Exception:  # noqa: BLE001
             context_size = {"trims": 0, "messages_dropped": 0,
                             "last_kept": 0, "last_dropped": 0}

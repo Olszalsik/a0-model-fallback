@@ -79,15 +79,31 @@ from usr.plugins._model_fallback.models_ext import (
 # in-memory dict resets on every run_ui restart (Docker container restart,
 # or `supervisorctl restart run_ui`). The persisted copy is only used to
 # bootstrap the in-memory dict on first call after a restart.
+#
+# v2.8.5: NONE of these keys may start with "_". persist_chat.py's
+# serializer strips agent.data keys with a leading underscore
+# (helpers/persist_chat.py:194/:223, and _deserialize_agents restores
+# agent.data from that stripped dict at :311), so every pre-v2.8.5
+# "_mfb_*" key was silently dropped from chat.json and the whole
+# restart-survival layer (cooldown seeding, extended-retry phase,
+# cascade position) never actually persisted. Chats persisted by older
+# versions keep the legacy "_model_cooldowns" key; it is simply ignored
+# (cooldowns are transient and re-seed from the live store anyway).
 # ---------------------------------------------------------------------------
-DATA_KEY_UTIL_IDX = "_mfb_utility_idx"
-DATA_KEY_CHAT_IDX = "_mfb_chat_idx"
-DATA_KEY_COOLDOWNS = "_model_cooldowns"
-DATA_KEY_COOLDOWN_SEED_AT = "_mfb_cooldown_seed_at"
-DATA_KEY_COOLDOWN_LAST_STATUS = "_mfb_cooldown_last_status"
-DATA_KEY_EXT_RETRY_NOTIFIED = "_ext_retry_notified"
-DATA_KEY_EXT_RETRY_PHASE = "_mfb_ext_retry_phase"   # 0 = A, 1 = B, 2 = off
-DATA_KEY_EXT_RETRY_ATTEMPTS = "_mfb_ext_retry_attempts"
+DATA_KEY_UTIL_IDX = "mfb_utility_idx"
+DATA_KEY_CHAT_IDX = "mfb_chat_idx"
+DATA_KEY_COOLDOWNS = "mfb_model_cooldowns"
+DATA_KEY_COOLDOWN_SEED_AT = "mfb_cooldown_seed_at"
+DATA_KEY_COOLDOWN_LAST_STATUS = "mfb_cooldown_last_status"
+DATA_KEY_EXT_RETRY_NOTIFIED = "mfb_ext_retry_notified"
+DATA_KEY_EXT_RETRY_PHASE = "mfb_ext_retry_phase"   # 0 = A, 1 = B, 2 = off
+DATA_KEY_EXT_RETRY_ATTEMPTS = "mfb_ext_retry_attempts"
+# v2.8.5: turn-path primary-skip strike counter. The turn cascade is a
+# single pass (idx==0 visited once per invocation), so the closure-local
+# counter the chat/utility cascades use maxes at 1 and the
+# primary_skip_strikes>=2 escalation could never fire. This key persists
+# the counter across turns.
+DATA_KEY_TURN_PRIMARY_FAILS = "mfb_turn_primary_fails"
 
 # In-memory cooldown store, keyed by (agent_id, model_label).
 # Reset on every Python process restart -> resets on every run_ui bounce.
@@ -184,6 +200,16 @@ _INMEM_DEAD_LABELS: dict = {}
 # 30s ago) shouldn't clear another agent's fresh "broken" cooldown.
 _WARM_LABELS: dict = {}
 
+# v2.8.5: label -> api_base registry, populated by _resolve_per_call_timeout
+# (the one choke point every cascade passes through per candidate). The
+# _60 handle_exception safety net books cooldowns with only the label it
+# can scrape from ``exc.model`` -- without this registry its api_base is
+# "", so router detection (A2) missed and a gateway 429 became a 30s
+# free_per_minute cooldown, while a gateway-surfaced 401/404 could
+# dead-mark the healthy gateway cross-agent for up to 24h (the exact
+# failure v2.7.0 Fix 2 removed, reintroduced through the safety net).
+_LABEL_API_BASES: dict = {}
+
 # Cold timeout is the legacy `fallback_utility_timeout_s` /
 # `fallback_timeout_s` (typically 60-300s). Warm timeout is shorter —
 # the connection / auth / DNS is already established. Tunable via
@@ -211,6 +237,7 @@ def _resolve_per_call_timeout(
     warm_window_s: float,
     agent=None,
     api_base: str = "",
+    allow_warm: bool = True,
 ) -> float:
     """Return the per-candidate timeout for `label`. Warm labels get the
     shorter `warm_timeout_s`; cold labels (or those outside the warm
@@ -222,8 +249,21 @@ def _resolve_per_call_timeout(
     fast-path: warm router calls get the cold ``base_timeout_s``, and a
     COLD router call gets ``router_cold_call_timeout_s`` (v2.7.0 warm-up
     budget) -- see the notes in the body.
+
+    ``allow_warm=False`` (v2.8.5, turn path only) disables the warm
+    fast-path entirely: the turn path is the MAIN agent loop, where a
+    streaming generation legitimately runs 15-90s, so the 20s warm
+    ceiling killed long turns mid-stream every other turn (succeed cold
+    -> warm -> 20s ceiling -> TimeoutError -> 45s cooldown -> repeat),
+    and the escaped TimeoutError stopped the whole run at _90. Router
+    warm-up budgets are unaffected (they key off the same warm window
+    but produce the COLD budget).
     """
     try:
+        # v2.8.5: register label -> api_base for later api_base-less callers
+        # (the _60 safety net). Don't overwrite an existing entry with "".
+        if api_base:
+            _LABEL_API_BASES[label] = api_base
         # v2.6.3: router-class labels (omniroute/* -- self-healing gateways
         # that front many upstreams, often free/slow tiers) skip the
         # aggressive warm fast-path. The 20s warm timeout assumes a fast
@@ -280,9 +320,10 @@ def _resolve_per_call_timeout(
         # only ``free_per_minute`` labels keep the aggressive warm fast-path.
         if capacity == "unlimited_paid":
             return base_timeout_s
-        last_warm_at = _WARM_LABELS.get(label, 0.0)
-        if time.monotonic() - last_warm_at < warm_window_s:
-            return warm_timeout_s
+        if allow_warm:
+            last_warm_at = _WARM_LABELS.get(label, 0.0)
+            if time.monotonic() - last_warm_at < warm_window_s:
+                return warm_timeout_s
     except Exception:
         # Defensive: if _WARM_LABELS access fails for any reason, fall
         # back to the legacy cold-timeout. Better to over-wait once than
@@ -404,6 +445,15 @@ def clear_all_cooldowns(agent) -> int:
     it back on success/escalation -- with the literal swap, a
     "Clear cooldowns" pressed mid-turn was silently undone and the stale
     cooldowns resurrected. Same class as the v2.8.1 ``or {}`` wipe.
+
+    v2.8.5: also clear the cross-agent state that would otherwise defeat
+    the documented recovery procedure. _handle_error_cooldown's docstring
+    says "fix your key, then call clear_cooldowns" -- but this function
+    never touched _INMEM_DEAD_LABELS, so a 24h dead-mark (invalid key 400,
+    gone 404) kept every cascade in every agent skipping the label
+    ("dead cross-agent") for the rest of the TTL. Warm labels and the
+    last-status map are cleared too so the first post-clear retry takes
+    the cold timeout and the UI status map matches the empty store.
     """
     agent_id = getattr(agent, "context", None)
     agent_id = getattr(agent_id, "id", None) or id(agent)
@@ -414,9 +464,14 @@ def clear_all_cooldowns(agent) -> int:
         _INMEM_COOLDOWNS[key] = store
     cleared = len(store)
     store.clear()
+    # Cross-agent indexes are process-global by design (same credentials
+    # process-wide), so a user-initiated clear resets them process-wide.
+    _INMEM_DEAD_LABELS.clear()
+    _WARM_LABELS.clear()
     try:
         agent.set_data(DATA_KEY_COOLDOWNS, {})
         agent.set_data(DATA_KEY_COOLDOWN_SEED_AT, time.time())
+        agent.set_data(DATA_KEY_COOLDOWN_LAST_STATUS, {})
     except Exception:  # noqa: BLE001
         pass  # best-effort persistence
     return cleared
@@ -993,7 +1048,14 @@ def _maybe_clear_cooldown_for_healthy_label(agent, label: str) -> bool:
     than waiting for the next cycle sleep.
     """
     healthy_until = _INMEM_HEALTHY_LABELS.get(label)
-    if healthy_until is None or healthy_until < time.monotonic():
+    if healthy_until is None:
+        return False
+    if healthy_until < time.monotonic():
+        # v2.8.5 (AB): pop the expired entry instead of leaving it. The
+        # dict had no other eviction path (only a fresh dead-mark popped
+        # it), so stale healthy marks accumulated for the life of the
+        # process.
+        _INMEM_HEALTHY_LABELS.pop(label, None)
         return False
     store = _get_cooldown_store(agent)
     if label not in store:
@@ -1372,6 +1434,28 @@ def _handle_error_cooldown(e, label, model_cooldowns, agent, api_base: str = "")
     """
     store = _get_cooldown_store(agent)
     status_code = getattr(e, "status_code", None)
+    if not api_base:
+        # v2.8.5: the _60 handle_exception safety net books cooldowns with
+        # only the label (scraped from exc.model) and no api_base, which
+        # broke every _classify_capacity/_mark_label_dead decision below:
+        # a gateway 429 became a 30s free_per_minute cooldown, and a
+        # gateway-surfaced 401/404 could dead-mark the healthy gateway
+        # cross-agent for up to 24h. Cascades register label -> api_base
+        # via _resolve_per_call_timeout.
+        api_base = _LABEL_API_BASES.get(label, "")
+
+    # v2.8.5 (AA): evict the warm fast-path entry for a label that just
+    # failed. A label that books a cooldown must not re-enter rotation
+    # with the 20s warm ceiling the moment that cooldown expires (still
+    # inside the 600s warm window) -- that recreates the warm fail-loop
+    # with cooldown gaps (20s failure -> Ns cooldown -> 20s failure ...).
+    # Exception: a router / concurrent_paid 429 books NO cooldown (the
+    # branch below returns False) and the label stays in rotation; a 429
+    # arrives fast (not a hung connection), so keeping the warm ceiling
+    # preserves fast hung-connection detection on the next call, and the
+    # next success re-warms the label anyway.
+    if not (_is_rate_limited_error(e) and _capacity_skips_cooldown(label, agent, api_base)):
+        _WARM_LABELS.pop(label, None)
 
     if _is_context_overflow_error(e):
         # Permanent for this prompt; needs a model with bigger context.
@@ -1668,7 +1752,10 @@ async def _yielding_sleep(total_seconds: float) -> None:
 
 
 
-def _maybe_raise_retry_after_hours(agent, cycle_count: int, n: int, total_attempts: int) -> None:
+def _maybe_raise_retry_after_hours(
+    agent, cycle_count: int, n: int, total_attempts: int,
+    max_cycles: int | None = None,
+) -> None:
     """Check extended-retry conditions and raise RetryAfterHours if appropriate.
 
     Behavior:
@@ -1679,6 +1766,13 @@ def _maybe_raise_retry_after_hours(agent, cycle_count: int, n: int, total_attemp
       - If `max_cycles > 0 and cycle_count >= max_cycles`: enter extended retry
         using phase A or B delay, then raise RetryAfterHours.
       - State is persisted in agent.data so subsequent calls can resume.
+
+    v2.8.5: ``max_cycles`` accepts the calling cascade's kwarg-resolved cap
+    (kwargs beat cfg in the loop). It used to re-read only plugin cfg, so a
+    caller with ``MAX_FALLBACK_CYCLES=2`` in kwargs vs cfg default 4 broke
+    out of its loop at 2 cycles, found ``2 < 4`` here, returned, and fell
+    through to the legacy RuntimeError -- silently skipping the
+    RetryAfterHours the loop clearly intended.
     """
     cfg = _get_plugin_cfg(agent)
     if bool(cfg.get("continuous_fallback", False)):
@@ -1686,7 +1780,10 @@ def _maybe_raise_retry_after_hours(agent, cycle_count: int, n: int, total_attemp
     if not cfg.get("extended_retry_enabled", True):
         return
 
-    max_cycles = int(cfg.get("fallback_max_cycles", 4))
+    if max_cycles is None:
+        max_cycles = int(cfg.get("fallback_max_cycles", 4))
+    else:
+        max_cycles = int(max_cycles)
     if max_cycles <= 0 or cycle_count < max_cycles:
         return
 
@@ -2128,6 +2225,144 @@ async def _patched_call_utility_model(
         label = _get_model_label(candidates[idx], model_obj)
         cand_api_base = _get_candidate_api_base(candidates[idx], model_obj)
 
+        # v2.8.5: pass-boundary check -- moved ABOVE the dead/cooldown skip
+        # checks. It previously sat below them and only ran when the landing
+        # candidate (idx == current_idx) was live, which broke two ways:
+        #   1. All-skipped roster: every iteration exited via a skip
+        #      `continue` containing NO `await` -- no sleep, no empty_passes
+        #      increment, no exhaustion, no RetryAfterHours. A sync-only
+        #      tight loop that froze the ENTIRE event loop (WebUI, other
+        #      agents, the outer utility-timeout guard's timer) until the
+        #      shortest cooldown/dead TTL expired (45s -> ~45s freeze; a 24h
+        #      dead mark -> hang until restart).
+        #   2. Mixed roster with a cooled STARTING candidate: the boundary
+        #      never fired, so cycle_count stayed 0 and max_cycles /
+        #      stagnation backoff / RetryAfterHours never engaged while
+        #      live fallbacks were re-attempted every attempt_delay.
+        # Every branch below ends in `continue`, so for a live starting
+        # candidate the order of operations is unchanged; skips still
+        # `continue` instantly (the attempt_delay sleep stays after the
+        # skip checks).
+        if attempt > 0 and attempt % n == 0:
+            if tried_this_cycle == 0:
+                # Every model in this pass was skipped (all in cooldown or
+                # dead-marked). Don't count it as a "cycle" -- just wait a
+                # bit and try the same set again. The shortest cooldown
+                # among them determines when the next real attempt can
+                # happen.
+                # v2.8.3: bound the flat 2s spin. When EVERY candidate is
+                # dead-marked (e.g. a 24h cross-agent 404 entry), this path
+                # used to loop every 2s for the entire dead TTL with no
+                # backoff and, in legacy mode, no exit at all. Escalate the
+                # spin with the stagnation factor (capped at
+                # max_cycle_delay_s); in legacy mode, treat persistent
+                # all-skipped as exhaustion so max_cycles /
+                # RetryAfterHours govern again.
+                empty_passes += 1
+                spin_s = min(
+                    2.0 * (cycle_stagnation_factor ** empty_passes),
+                    max_cycle_delay_s,
+                )
+                # v2.8.5 (Y): mirror _compute_cycle_sleep's router probe
+                # cap -- a router-primary cascade re-probes every
+                # router_max_cycle_delay_s (default 30s); the all-skipped
+                # spin must not back off toward max_cycle_delay_s (300s)
+                # and stretch the gateway's re-probe with it.
+                if primary_is_router:
+                    try:
+                        spin_s = min(
+                            spin_s,
+                            float(_get_plugin_cfg(self).get(
+                                "router_max_cycle_delay_s",
+                                _DEFAULT_ROUTER_MAX_CYCLE_DELAY_S,
+                            )),
+                        )
+                    except Exception:
+                        spin_s = min(spin_s, _DEFAULT_ROUTER_MAX_CYCLE_DELAY_S)
+                if backoff_jitter_s > 0:
+                    spin_s += random.uniform(0.0, backoff_jitter_s)
+                if not continuous_mode and empty_passes >= 3:
+                    cycle_count += 1
+                    _emit_fallback_summary(self, "utility", candidates)
+                    _maybe_raise_retry_after_hours(self, cycle_count, n, attempt, max_cycles=max_cycles)
+                    raise RuntimeError(
+                        f"All utility model candidates skipped "
+                        f"(cooldown/dead) for {empty_passes} consecutive "
+                        f"passes; exhausted."
+                    )
+                await asyncio.sleep(spin_s)
+                attempt = 0
+                tried_this_cycle = 0
+                cycle_permanent_count = 0
+                continue
+
+            # Early-exit: if EVERY attempted model in this cycle was a
+            # permanent failure, the upstream isn't going to recover in
+            # the next 5 seconds -- skip the noisy cycle-and-sleep
+            # ritual and go straight to extended-retry mode. This is
+            # what the user sees as "agent-zero stopped working": an
+            # all-dead candidate set spamming "switching to [N/2]" /
+            # "cycling" lines for minutes instead of saying "all
+            # models are out, waiting 15 min" once.
+            if (
+                early_exit_enabled
+                and cycle_permanent_count > 0
+                and cycle_permanent_count == tried_this_cycle
+            ):
+                cycle_count += 1
+                _emit_fallback_summary(self, "utility", candidates)
+                # Continuous mode: never raise RetryAfterHours; the cascade
+                # must keep cycling so the agent stays alive across multi-hour
+                # rate-limit windows. In legacy mode, raise if applicable.
+                if not continuous_mode:
+                    _maybe_raise_retry_after_hours(self, cycle_count, n, attempt, max_cycles=max_cycles)
+                # If extended-retry is disabled, fall through to the
+                # normal cycle log + sleep. In continuous mode, the sleep is
+                # the backoff envelope, not the flat cycle_delay.
+                consecutive_full_cycles += 1
+                sleep_s = _compute_cycle_sleep() if continuous_mode else cycle_delay
+                cycle_msg = (
+                    f"Utility models cycling (all permanent). "
+                    f"Sleeping {sleep_s:.0f}s "
+                    f"(cycle {cycle_count}, consecutive={consecutive_full_cycles})..."
+                )
+                self.context.log.log("warning", content=cycle_msg)
+                PrintStyle(font_color="orange", padding=True).print(cycle_msg)
+                await _yielding_sleep(sleep_s)
+                _set_model_idx(self, use_utility_models=True, idx=0)
+                attempt = 0
+                tried_this_cycle = 0
+                cycle_permanent_count = 0
+                continue
+
+            cycle_count += 1
+            # Continuous mode: skip the max_cycles cap. The cascade is
+            # designed to run forever so a multi-hour provider outage does
+            # not kill the agent. See AGENTS.md.
+            if not continuous_mode and max_cycles > 0 and cycle_count >= max_cycles:
+                # Try extended retry before giving up
+                _maybe_raise_retry_after_hours(self, cycle_count, n, attempt, max_cycles=max_cycles)
+                break
+            consecutive_full_cycles += 1
+            # v2.6: Phase 3 — stagnation counter increments on every
+            # cycle iteration that didn't produce a success. _succeed
+            # resets it. _compute_cycle_sleep applies the stagnation
+            # amplification factor once it crosses the threshold.
+            consecutive_no_success_cycles += 1
+            sleep_s = _compute_cycle_sleep() if continuous_mode else cycle_delay
+            cycle_msg = (
+                f"Utility models cycling (all attempted). "
+                f"Sleeping {sleep_s:.0f}s "
+                f"(cycle {cycle_count}, consecutive={consecutive_full_cycles})..."
+            )
+            self.context.log.log("warning", content=cycle_msg)
+            PrintStyle(font_color="orange", padding=True).print(cycle_msg)
+            await _yielding_sleep(sleep_s)
+            _set_model_idx(self, use_utility_models=True, idx=0)
+            attempt = 0
+            tried_this_cycle = 0
+            cycle_permanent_count = 0
+
         # Skip models in cooldown
         # v2.6.8: cross-agent permanent-fail blocklist. If ANY agent in
         # this process marked `label` dead (404 gone / auth-quota) and
@@ -2187,113 +2422,7 @@ async def _patched_call_utility_model(
         if _last_skip_log_until.get(label) is not None:
             _last_skip_log_until.pop(label, None)
 
-        # Reset the "tried" counter at the start of each new pass through
-        # the candidate list. A pass is complete when we've visited every
-        # candidate index exactly once without hitting the `continue` above.
-        if attempt > 0 and attempt % n == 0:
-            if tried_this_cycle == 0:
-                # Every model in this pass was skipped (all in cooldown or
-                # dead-marked). Don't count it as a "cycle" -- just wait a
-                # bit and try the same set again. The shortest cooldown
-                # among them determines when the next real attempt can
-                # happen.
-                # v2.8.3: bound the flat 2s spin. When EVERY candidate is
-                # dead-marked (e.g. a 24h cross-agent 404 entry), this path
-                # used to loop every 2s for the entire dead TTL with no
-                # backoff and, in legacy mode, no exit at all. Escalate the
-                # spin with the stagnation factor (capped at
-                # max_cycle_delay_s); in legacy mode, treat persistent
-                # all-skipped as exhaustion so max_cycles /
-                # RetryAfterHours govern again.
-                empty_passes += 1
-                spin_s = min(
-                    2.0 * (cycle_stagnation_factor ** empty_passes),
-                    max_cycle_delay_s,
-                )
-                if backoff_jitter_s > 0:
-                    spin_s += random.uniform(0.0, backoff_jitter_s)
-                if not continuous_mode and empty_passes >= 3:
-                    cycle_count += 1
-                    _emit_fallback_summary(self, "utility", candidates)
-                    _maybe_raise_retry_after_hours(self, cycle_count, n, attempt)
-                    raise RuntimeError(
-                        f"All utility model candidates skipped "
-                        f"(cooldown/dead) for {empty_passes} consecutive "
-                        f"passes; exhausted."
-                    )
-                await asyncio.sleep(spin_s)
-                attempt = 0
-                tried_this_cycle = 0
-                cycle_permanent_count = 0
-                continue
-
-            # Early-exit: if EVERY attempted model in this cycle was a
-            # permanent failure, the upstream isn't going to recover in
-            # the next 5 seconds -- skip the noisy cycle-and-sleep
-            # ritual and go straight to extended-retry mode. This is
-            # what the user sees as "agent-zero stopped working": an
-            # all-dead candidate set spamming "switching to [N/2]" /
-            # "cycling" lines for minutes instead of saying "all
-            # models are out, waiting 15 min" once.
-            if (
-                early_exit_enabled
-                and cycle_permanent_count > 0
-                and cycle_permanent_count == tried_this_cycle
-            ):
-                cycle_count += 1
-                _emit_fallback_summary(self, "utility", candidates)
-                # Continuous mode: never raise RetryAfterHours; the cascade
-                # must keep cycling so the agent stays alive across multi-hour
-                # rate-limit windows. In legacy mode, raise if applicable.
-                if not continuous_mode:
-                    _maybe_raise_retry_after_hours(self, cycle_count, n, attempt)
-                # If extended-retry is disabled, fall through to the
-                # normal cycle log + sleep. In continuous mode, the sleep is
-                # the backoff envelope, not the flat cycle_delay.
-                consecutive_full_cycles += 1
-                sleep_s = _compute_cycle_sleep() if continuous_mode else cycle_delay
-                cycle_msg = (
-                    f"Utility models cycling (all permanent). "
-                    f"Sleeping {sleep_s:.0f}s "
-                    f"(cycle {cycle_count}, consecutive={consecutive_full_cycles})..."
-                )
-                self.context.log.log("warning", content=cycle_msg)
-                PrintStyle(font_color="orange", padding=True).print(cycle_msg)
-                await _yielding_sleep(sleep_s)
-                _set_model_idx(self, use_utility_models=True, idx=0)
-                attempt = 0
-                tried_this_cycle = 0
-                cycle_permanent_count = 0
-                continue
-
-            cycle_count += 1
-            # Continuous mode: skip the max_cycles cap. The cascade is
-            # designed to run forever so a multi-hour provider outage does
-            # not kill the agent. See AGENTS.md.
-            if not continuous_mode and max_cycles > 0 and cycle_count >= max_cycles:
-                # Try extended retry before giving up
-                _maybe_raise_retry_after_hours(self, cycle_count, n, attempt)
-                break
-            consecutive_full_cycles += 1
-            # v2.6: Phase 3 — stagnation counter increments on every
-            # cycle iteration that didn't produce a success. _succeed
-            # resets it. _compute_cycle_sleep applies the stagnation
-            # amplification factor once it crosses the threshold.
-            consecutive_no_success_cycles += 1
-            sleep_s = _compute_cycle_sleep() if continuous_mode else cycle_delay
-            cycle_msg = (
-                f"Utility models cycling (all attempted). "
-                f"Sleeping {sleep_s:.0f}s "
-                f"(cycle {cycle_count}, consecutive={consecutive_full_cycles})..."
-            )
-            self.context.log.log("warning", content=cycle_msg)
-            PrintStyle(font_color="orange", padding=True).print(cycle_msg)
-            await _yielding_sleep(sleep_s)
-            _set_model_idx(self, use_utility_models=True, idx=0)
-            attempt = 0
-            tried_this_cycle = 0
-            cycle_permanent_count = 0
-        elif attempt > 0:
+        if attempt > 0:
             await _yielding_sleep(attempt_delay)
 
         tried_this_cycle += 1
@@ -2557,6 +2686,28 @@ async def _patched_call_utility_model(
                     ),
                 )
                 try:
+                    # v2.8.5: the first attempt already consumed `_inner_coro`
+                    # (wait_for awaited it to completion), and that coroutine
+                    # captured its kwargs -- including the transport mode -- at
+                    # creation time, BEFORE force_chat_completions_mode above
+                    # mutated the model. The old retry re-awaited the consumed
+                    # coroutine, raised "cannot reuse already awaited
+                    # coroutine", was swallowed by the except below, and the
+                    # "retrying once" log never did anything. Build a FRESH
+                    # coroutine now that the model is in chat-completions mode.
+                    _inner_coro = call_data["model"].unified_call(
+                        system_message=call_data["system"],
+                        user_message=call_data["message"],
+                        response_callback=(
+                            stream_callback if call_data["callback"] else None
+                        ),
+                        rate_limiter_callback=(
+                            self.rate_limiter_callback
+                            if not call_data["background"]
+                            else None
+                        ),
+                        fallbacks=None,
+                    )
                     response, _reasoning = await _call_utility_model()
                     return await _succeed(response)
                 except Exception:
@@ -2578,7 +2729,7 @@ async def _patched_call_utility_model(
 
     # Last-ditch extended-retry check (if cycle_count was below max when we broke)
     _emit_fallback_summary(self, "utility", candidates)
-    _maybe_raise_retry_after_hours(self, cycle_count, n, attempt)
+    _maybe_raise_retry_after_hours(self, cycle_count, n, attempt, max_cycles=max_cycles)
 
     exhausted = (
         f"All utility model candidates exhausted after {cycle_count} cycle(s) "
@@ -2865,7 +3016,17 @@ async def _patched_call_chat_model(
             _consecutive_primary_failures = 0
 
     def _compute_cycle_sleep() -> float:
-        """Same envelope as the utility cascade. See _patched_call_utility_model."""
+        """Same envelope as the utility cascade. See _patched_call_utility_model.
+
+        v2.8.5 (Y): this copy was missing the Phase-3 stagnation
+        amplification the utility cascade has had since v2.6 -- the chat
+        cascade backed off to max_cycle_delay_s during a full outage and
+        then hammered every candidate at that fixed cadence, while the
+        utility cascade amplified the sleep by cycle_stagnation_factor.
+        The ``nonlocal`` matters: without it the one-log-per-outage
+        assignment makes the flag function-local and the read above it
+        raises UnboundLocalError on the first stagnation cycle."""
+        nonlocal stagnation_logged_this_outage
         import random
         cap = max_cycle_delay_s
         # v2.6.7 Fix C: router-primary probe cap (see utility cascade).
@@ -2882,6 +3043,24 @@ async def _patched_call_chat_model(
                 cap = min(cap, _DEFAULT_ROUTER_MAX_CYCLE_DELAY_S)
         base = cycle_delay * (backoff_multiplier ** min(consecutive_full_cycles, 10))
         capped = min(base, cap)
+        if (
+            consecutive_no_success_cycles >= cycle_stagnation_threshold
+            and cycle_stagnation_factor > 1.0
+        ):
+            amplified = capped * cycle_stagnation_factor
+            capped = min(amplified, cap)
+            if not stagnation_logged_this_outage:
+                stagnation_logged_this_outage = True
+                try:
+                    self.context.log.log(
+                        "info",
+                        f"Chat cascade stagnation detected — "
+                        f"{consecutive_no_success_cycles} consecutive cycles "
+                        f"with 0 successes; amplifying cycle sleep by "
+                        f"{cycle_stagnation_factor:.1f}x to {int(capped)}s.",
+                    )
+                except Exception:
+                    pass
         if backoff_jitter_s > 0:
             capped += random.uniform(0.0, backoff_jitter_s)
         return capped
@@ -2896,6 +3075,126 @@ async def _patched_call_chat_model(
         idx = (current_idx + attempt) % n
         label = _get_model_label(candidates[idx], model_obj)
         cand_api_base = _get_candidate_api_base(candidates[idx], model_obj)
+
+        # v2.8.5: pass-boundary check -- moved ABOVE the dead/cooldown skip
+        # checks, mirroring the utility cascade fix. It previously sat
+        # below them and only ran when the landing candidate
+        # (idx == current_idx) was live, which broke two ways:
+        #   1. All-skipped roster: every iteration exited via a skip
+        #      `continue` containing NO `await` -- a sync-only tight loop
+        #      that froze the ENTIRE event loop until the shortest
+        #      cooldown/dead TTL expired.
+        #   2. Mixed roster with a cooled STARTING candidate: the boundary
+        #      never fired, so cycle_count stayed 0 and max_cycles /
+        #      stagnation backoff / RetryAfterHours never engaged while
+        #      live fallbacks were re-attempted every attempt_delay.
+        # Every branch below ends in `continue`, so for a live starting
+        # candidate the order of operations is unchanged; skips still
+        # `continue` instantly (the attempt_delay sleep stays after the
+        # skip checks).
+        if attempt > 0 and attempt % n == 0:
+            if tried_this_cycle == 0:
+                # Every model in this pass was skipped (all in cooldown or
+                # dead-marked). Don't count it as a "cycle" -- just wait a
+                # bit and try the same set again.
+                # v2.8.3: bound the flat 2s spin (same as the utility
+                # cascade): escalate with the stagnation factor, capped at
+                # max_cycle_delay_s; legacy mode exhausts instead of
+                # looping every 2s for a 24h dead-label TTL.
+                empty_passes += 1
+                spin_s = min(
+                    2.0 * (cycle_stagnation_factor ** empty_passes),
+                    max_cycle_delay_s,
+                )
+                # v2.8.5 (Y): mirror _compute_cycle_sleep's router probe
+                # cap -- a router-primary cascade re-probes every
+                # router_max_cycle_delay_s (default 30s); the all-skipped
+                # spin must not back off toward max_cycle_delay_s (300s)
+                # and stretch the gateway's re-probe with it.
+                if primary_is_router:
+                    try:
+                        spin_s = min(
+                            spin_s,
+                            float(_get_plugin_cfg(self).get(
+                                "router_max_cycle_delay_s",
+                                _DEFAULT_ROUTER_MAX_CYCLE_DELAY_S,
+                            )),
+                        )
+                    except Exception:
+                        spin_s = min(spin_s, _DEFAULT_ROUTER_MAX_CYCLE_DELAY_S)
+                if backoff_jitter_s > 0:
+                    spin_s += random.uniform(0.0, backoff_jitter_s)
+                if not continuous_mode and empty_passes >= 3:
+                    cycle_count += 1
+                    _emit_fallback_summary(self, "chat", candidates)
+                    _maybe_raise_retry_after_hours(self, cycle_count, n, attempt, max_cycles=max_cycles)
+                    raise RuntimeError(
+                        f"All chat model candidates skipped "
+                        f"(cooldown/dead) for {empty_passes} consecutive "
+                        f"passes; exhausted."
+                    )
+                await asyncio.sleep(spin_s)
+                attempt = 0
+                tried_this_cycle = 0
+                cycle_permanent_count = 0
+                continue
+
+            # Early-exit: if every attempted model in this cycle was a
+            # permanent failure, skip the cycle-and-sleep ritual and go
+            # straight to extended-retry mode. See _patched_call_utility_model
+            # for the same logic + rationale.
+            if (
+                early_exit_enabled
+                and cycle_permanent_count > 0
+                and cycle_permanent_count == tried_this_cycle
+            ):
+                cycle_count += 1
+                _emit_fallback_summary(self, "chat", candidates)
+                # Continuous mode: never raise RetryAfterHours; the cascade
+                # must keep cycling so the agent stays alive across multi-hour
+                # rate-limit windows. In legacy mode, raise if applicable.
+                if not continuous_mode:
+                    _maybe_raise_retry_after_hours(self, cycle_count, n, attempt, max_cycles=max_cycles)
+                consecutive_full_cycles += 1
+                sleep_s = _compute_cycle_sleep() if continuous_mode else cycle_delay
+                cycle_msg = (
+                    f"Chat models cycling (all permanent). "
+                    f"Sleeping {sleep_s:.0f}s "
+                    f"(cycle {cycle_count}, consecutive={consecutive_full_cycles})..."
+                )
+                self.context.log.log("warning", content=cycle_msg)
+                PrintStyle(font_color="orange", padding=True).print(cycle_msg)
+                await _yielding_sleep(sleep_s)
+                _set_model_idx(self, use_utility_models, idx=0)
+                attempt = 0
+                tried_this_cycle = 0
+                cycle_permanent_count = 0
+                continue
+
+            cycle_count += 1
+            # Continuous mode: skip the max_cycles cap. See AGENTS.md.
+            if not continuous_mode and max_cycles > 0 and cycle_count >= max_cycles:
+                _maybe_raise_retry_after_hours(self, cycle_count, n, attempt, max_cycles=max_cycles)
+                break
+            consecutive_full_cycles += 1
+            # v2.6: Phase 3 — stagnation counter increments on every
+            # cycle iteration that didn't produce a success. _succeed
+            # resets it. _compute_cycle_sleep applies the stagnation
+            # amplification factor once it crosses the threshold.
+            consecutive_no_success_cycles += 1
+            sleep_s = _compute_cycle_sleep() if continuous_mode else cycle_delay
+            cycle_msg = (
+                f"Chat models cycling (all attempted). "
+                f"Sleeping {sleep_s:.0f}s "
+                f"(cycle {cycle_count}, consecutive={consecutive_full_cycles})..."
+            )
+            self.context.log.log("warning", content=cycle_msg)
+            PrintStyle(font_color="orange", padding=True).print(cycle_msg)
+            await _yielding_sleep(sleep_s)
+            _set_model_idx(self, use_utility_models, idx=0)
+            attempt = 0
+            tried_this_cycle = 0
+            cycle_permanent_count = 0
 
         # Skip models in cooldown
         # v2.6.8: cross-agent permanent-fail blocklist. Mirrors the
@@ -2944,94 +3243,7 @@ async def _patched_call_chat_model(
         if _last_skip_log_until.get(label) is not None:
             _last_skip_log_until.pop(label, None)
 
-        if attempt > 0 and attempt % n == 0:
-            if tried_this_cycle == 0:
-                # Every model in this pass was skipped (all in cooldown or
-                # dead-marked). Don't count it as a "cycle" -- just wait a
-                # bit and try the same set again.
-                # v2.8.3: bound the flat 2s spin (same as the utility
-                # cascade): escalate with the stagnation factor, capped at
-                # max_cycle_delay_s; legacy mode exhausts instead of
-                # looping every 2s for a 24h dead-label TTL.
-                empty_passes += 1
-                spin_s = min(
-                    2.0 * (cycle_stagnation_factor ** empty_passes),
-                    max_cycle_delay_s,
-                )
-                if backoff_jitter_s > 0:
-                    spin_s += random.uniform(0.0, backoff_jitter_s)
-                if not continuous_mode and empty_passes >= 3:
-                    cycle_count += 1
-                    _emit_fallback_summary(self, "chat", candidates)
-                    _maybe_raise_retry_after_hours(self, cycle_count, n, attempt)
-                    raise RuntimeError(
-                        f"All chat model candidates skipped "
-                        f"(cooldown/dead) for {empty_passes} consecutive "
-                        f"passes; exhausted."
-                    )
-                await asyncio.sleep(spin_s)
-                attempt = 0
-                tried_this_cycle = 0
-                cycle_permanent_count = 0
-                continue
-
-            # Early-exit: if every attempted model in this cycle was a
-            # permanent failure, skip the cycle-and-sleep ritual and go
-            # straight to extended-retry mode. See _patched_call_utility_model
-            # for the same logic + rationale.
-            if (
-                early_exit_enabled
-                and cycle_permanent_count > 0
-                and cycle_permanent_count == tried_this_cycle
-            ):
-                cycle_count += 1
-                _emit_fallback_summary(self, "chat", candidates)
-                # Continuous mode: never raise RetryAfterHours; the cascade
-                # must keep cycling so the agent stays alive across multi-hour
-                # rate-limit windows. In legacy mode, raise if applicable.
-                if not continuous_mode:
-                    _maybe_raise_retry_after_hours(self, cycle_count, n, attempt)
-                consecutive_full_cycles += 1
-                sleep_s = _compute_cycle_sleep() if continuous_mode else cycle_delay
-                cycle_msg = (
-                    f"Chat models cycling (all permanent). "
-                    f"Sleeping {sleep_s:.0f}s "
-                    f"(cycle {cycle_count}, consecutive={consecutive_full_cycles})..."
-                )
-                self.context.log.log("warning", content=cycle_msg)
-                PrintStyle(font_color="orange", padding=True).print(cycle_msg)
-                await _yielding_sleep(sleep_s)
-                _set_model_idx(self, use_utility_models, idx=0)
-                attempt = 0
-                tried_this_cycle = 0
-                cycle_permanent_count = 0
-                continue
-
-            cycle_count += 1
-            # Continuous mode: skip the max_cycles cap. See AGENTS.md.
-            if not continuous_mode and max_cycles > 0 and cycle_count >= max_cycles:
-                _maybe_raise_retry_after_hours(self, cycle_count, n, attempt)
-                break
-            consecutive_full_cycles += 1
-            # v2.6: Phase 3 — stagnation counter increments on every
-            # cycle iteration that didn't produce a success. _succeed
-            # resets it. _compute_cycle_sleep applies the stagnation
-            # amplification factor once it crosses the threshold.
-            consecutive_no_success_cycles += 1
-            sleep_s = _compute_cycle_sleep() if continuous_mode else cycle_delay
-            cycle_msg = (
-                f"Chat models cycling (all attempted). "
-                f"Sleeping {sleep_s:.0f}s "
-                f"(cycle {cycle_count}, consecutive={consecutive_full_cycles})..."
-            )
-            self.context.log.log("warning", content=cycle_msg)
-            PrintStyle(font_color="orange", padding=True).print(cycle_msg)
-            await _yielding_sleep(sleep_s)
-            _set_model_idx(self, use_utility_models, idx=0)
-            attempt = 0
-            tried_this_cycle = 0
-            cycle_permanent_count = 0
-        elif attempt > 0:
+        if attempt > 0:
             await _yielding_sleep(attempt_delay)
 
         tried_this_cycle += 1
@@ -3258,6 +3470,27 @@ async def _patched_call_chat_model(
                     ),
                 )
                 try:
+                    # v2.8.5: the first attempt already consumed `_inner_coro`,
+                    # and that coroutine captured its kwargs -- including the
+                    # transport mode -- at creation time, BEFORE
+                    # force_chat_completions_mode above mutated the model. The
+                    # old retry re-awaited the consumed coroutine, raised
+                    # "cannot reuse already awaited coroutine", was swallowed
+                    # by the except below, and the "retrying once" log never
+                    # did anything. Build a FRESH coroutine now that the model
+                    # is in chat-completions mode.
+                    _inner_coro = call_data["model"].unified_call(
+                        messages=call_data["messages"],
+                        reasoning_callback=call_data["reasoning_callback"],
+                        response_callback=call_data["response_callback"],
+                        rate_limiter_callback=(
+                            self.rate_limiter_callback
+                            if not call_data["background"]
+                            else None
+                        ),
+                        explicit_caching=call_data["explicit_caching"],
+                        fallbacks=None,
+                    )
                     response, reasoning = await _call_chat_model()
                     return await _succeed(response, reasoning)
                 except Exception:
@@ -3278,7 +3511,7 @@ async def _patched_call_chat_model(
         attempt += 1
 
     _emit_fallback_summary(self, "chat", candidates)
-    _maybe_raise_retry_after_hours(self, cycle_count, n, attempt)
+    _maybe_raise_retry_after_hours(self, cycle_count, n, attempt, max_cycles=max_cycles)
 
     exhausted = (
         f"All chat model candidates exhausted after {cycle_count} cycle(s) "
@@ -3357,14 +3590,76 @@ async def _patched_call_chat_model_turn(
     n = len(candidates)
     if n <= 1:
         # No fallbacks configured -- nothing to rotate; single attempt.
-        return await original(
-            self,
-            messages=messages,
-            response_callback=response_callback,
-            reasoning_callback=reasoning_callback,
-            background=background,
-            explicit_caching=explicit_caching,
-        )
+        # v2.8.5: with no fallback candidates, a sustained outage surfaced
+        # the raw error to handle_exception on every turn; _60 swallowed it
+        # at most 5 consecutive times (300s window) and then let it reach
+        # _90 -- the agent stopped ~5 minutes into a quota outage even with
+        # continuous_fallback on, and the documented "sleep and retry"
+        # contract never engaged because the turn cascade only raises
+        # RetryAfterHours on its n>1 exhaustion path. Book the normal
+        # cooldown and raise RetryAfterHours (owned by _70) here too.
+        # Permanent failures (401/404/invalid key) still re-raise as-is so
+        # the user actually sees the misconfiguration; partial output that
+        # already streamed is never retried (streamed_any guard below).
+        streamed_any0 = False
+
+        async def _resp_cb0(chunk: str, total: str):
+            nonlocal streamed_any0
+            if chunk:
+                streamed_any0 = True
+            if response_callback is None:
+                return None
+            return await response_callback(chunk, total)
+
+        async def _reas_cb0(chunk: str, total: str):
+            nonlocal streamed_any0
+            if chunk:
+                streamed_any0 = True
+            if reasoning_callback is None:
+                return None
+            return await reasoning_callback(chunk, total)
+
+        try:
+            return await original(
+                self,
+                messages=messages,
+                response_callback=_resp_cb0,
+                reasoning_callback=_reas_cb0,
+                background=background,
+                explicit_caching=explicit_caching,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            if _is_code_error(e):
+                raise
+            label0 = _get_model_label(candidates[0], model_obj)
+            api0 = _get_candidate_api_base(candidates[0], model_obj)
+            store0 = _get_cooldown_store(self)
+            if not isinstance(store0, dict):
+                store0 = {}
+            _evict_warm_on_timeout(e, label0)
+            _handle_error_cooldown(e, label0, store0, self, api0)
+            if streamed_any0:
+                # Partial output reached the UI -- never auto-retry.
+                raise
+            if _is_permanently_failed_model(e) and _classify_capacity(
+                label0, self, api0
+            ) != "router":
+                raise
+            try:
+                cfg0 = _get_plugin_cfg(self)
+                extended_on = bool(cfg0.get("extended_retry_enabled", True))
+                continuous_on = bool(cfg0.get("continuous_fallback", False))
+            except Exception:
+                extended_on, continuous_on = True, False
+            if not (extended_on or continuous_on):
+                # Legacy contract: extended retry disabled -> surface the
+                # error instead of looping (matches the chat/utility gate).
+                raise
+            hint = extract_retry_after_seconds(e)
+            delay = max(10.0, min(float(hint) if hint and hint > 0 else 60.0, 3600.0))
+            raise RetryAfterHours(retry_after=delay)
 
     # --- Config knobs (same keys as the chat cascade) ----------------------
     plugin_cfg = _get_plugin_cfg(self)
@@ -3405,12 +3700,29 @@ async def _patched_call_chat_model_turn(
     _last_dead_log_until: dict = {}
 
     primary_label = _get_model_label(candidates[0], model_obj)
-    _consecutive_primary_failures = 0
+    # v2.8.5: persist the strike counter across turns. The turn cascade is
+    # a single pass (idx==0 is visited exactly once per invocation), so a
+    # closure-local counter maxed at 1 and `_maybe_extend_primary_cooldown`
+    # (primary_skip_strikes >= 2 by default) returned early every time --
+    # the v2.8.4 turn escalation was dead code on this path. Chat/utility
+    # accumulate within one invocation (while-loop cycles re-visit idx==0),
+    # so they keep closure-locals; the turn path stores the counter in
+    # agent data.
+    try:
+        _consecutive_primary_failures = int(
+            self.get_data(DATA_KEY_TURN_PRIMARY_FAILS) or 0
+        )
+    except Exception:  # noqa: BLE001
+        _consecutive_primary_failures = 0
 
     def _reset_primary_strikes() -> None:
         nonlocal _consecutive_primary_failures
         if _consecutive_primary_failures > 0:
             _consecutive_primary_failures = 0
+            try:
+                self.set_data(DATA_KEY_TURN_PRIMARY_FAILS, 0)
+            except Exception:  # noqa: BLE001
+                pass
 
     def _maybe_extend_primary_cooldown(reason: str) -> None:
         """v2.8.4: turn-path primary-skip escalation (parity with the chat
@@ -3452,6 +3764,10 @@ async def _patched_call_chat_model_turn(
         # local strikes (only-cleared-never-overwritten invariant).
         if _maybe_clear_cooldown_for_healthy_label(self, label):
             _consecutive_primary_failures = 0
+            try:
+                self.set_data(DATA_KEY_TURN_PRIMARY_FAILS, 0)
+            except Exception:  # noqa: BLE001
+                pass
             return
         prev_until = model_cooldowns.get(label) or 0.0
         target_until = time.monotonic() + cooldown_s
@@ -3478,6 +3794,15 @@ async def _patched_call_chat_model_turn(
         ``finally``. Instance attributes shadow class attributes, so the
         original body (and anything it calls) picks up the candidate.
         """
+        # v2.8.5: capture any pre-existing instance shadow before
+        # overwriting. Two turns interleaving on one Agent instance
+        # share the instance attribute: turn B's assignment overwrites
+        # A's shadow, and an unconditional delete in B's finally left A
+        # resolving the class default mid-call (with A's bookkeeping
+        # attributed to the wrong label). Restore-previous, delete only
+        # when we installed the shadow ourselves. Captured OUTSIDE the
+        # try so `finally` can never hit an UnboundLocalError.
+        prev_shadow = self.__dict__.get("get_chat_model")
         try:
             self.get_chat_model = lambda: current_model  # type: ignore[method-assign]
             effective_timeout = (
@@ -3493,10 +3818,14 @@ async def _patched_call_chat_model_turn(
             )
             return await asyncio.wait_for(coro, timeout=effective_timeout)
         finally:
-            # Remove the shadow (don't restore a bound copy -- the class
-            # attribute must stay untouched so reloads don't stack layers).
+            # Restore-previous (see capture above); delete only if no prior
+            # shadow existed. The class attribute itself must stay untouched
+            # so reloads don't stack layers.
             try:
-                del self.__dict__["get_chat_model"]
+                if prev_shadow is not None:
+                    self.__dict__["get_chat_model"] = prev_shadow
+                else:
+                    del self.__dict__["get_chat_model"]
             except KeyError:
                 pass
 
@@ -3566,18 +3895,36 @@ async def _patched_call_chat_model_turn(
         # provider-specific kwargs (see _PROVIDER_SPECIFIC_KWARGS).
         _strip_a0_only_kwargs(current_model, is_primary=(idx == 0))
 
-        # Per-candidate warm/cold timeout (same policy as the chat cascade).
-        # A user TIMEOUT= model kwarg was already folded into ``timeout_s``
-        # above; the warm fast-path applies to kwarg-less presets. Mirrors
-        # the chat cascade's user_kwarg_set guard: an explicit TIMEOUT=
-        # kwarg must win over the warm ceiling even on the turn path.
+        # v2.8.5: the Option-B/D transport forcing normally fires via the
+        # chat_model_call_before extension (extensions/.../_01_force_chat...),
+        # but the turn path never triggers that extension point -- agent.py
+        # fires it only inside the call_chat_model / call_utility_model
+        # bodies. Apply the same sticky force here so an ollama-cloud
+        # primary that 500s on /v1/responses gets chat-completions on the
+        # main loop too, not just on utility/chat-cascade calls.
+        try:
+            from usr.plugins._model_fallback.models_ext import (
+                force_chat_completions_mode,
+                should_force_chat_completions,
+            )
+
+            if should_force_chat_completions(current_model, self):
+                force_chat_completions_mode(current_model)
+        except Exception:
+            pass
+
+        # Per-candidate warm/cold timeout. A user TIMEOUT= model kwarg was
+        # already folded into ``timeout_s`` above. v2.8.5: the warm
+        # fast-path is DISABLED on the turn path (allow_warm=False) -- the
+        # main loop legitimately streams for tens of seconds, and the 20s
+        # warm ceiling killed every other long turn mid-stream.
         user_kwarg_set = "TIMEOUT" in model_kwargs or "timeout" in model_kwargs
         if user_kwarg_set:
             effective_timeout_s = timeout_s
         else:
             effective_timeout_s = _resolve_per_call_timeout(
                 label, timeout_s, warm_timeout_s, warm_window_s,
-                self, cand_api_base,
+                self, cand_api_base, allow_warm=False,
             )
 
         if idx > 0:
@@ -3608,6 +3955,10 @@ async def _patched_call_chat_model_turn(
                 )
                 self.context.log.log("error", content=err_msg)
                 PrintStyle(font_color="red", padding=True).print(err_msg)
+                # v2.8.5: book the cooldown before failing fast (parity with
+                # the chat/utility CodeError paths, which book then raise).
+                # Without it the broken label was re-paid in full next turn.
+                _handle_error_cooldown(e, label, model_cooldowns, self, cand_api_base)
                 raise
             # Timeout handling: evict the warm label (fix A) so the retry
             # uses the cold timeout, and book the error cooldown.
@@ -3615,6 +3966,12 @@ async def _patched_call_chat_model_turn(
             _handle_error_cooldown(e, label, model_cooldowns, self, cand_api_base)
             if idx == 0:
                 _consecutive_primary_failures += 1
+                try:
+                    self.set_data(
+                        DATA_KEY_TURN_PRIMARY_FAILS, _consecutive_primary_failures
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
                 # v2.8.4: escalate the primary's cooldown once the strike
                 # threshold is crossed (previously tracked but never acted
                 # on -- see _maybe_extend_primary_cooldown above).
@@ -3647,22 +4004,43 @@ async def _patched_call_chat_model_turn(
 
     # --- One pass over all candidates failed --------------------------------
     _emit_fallback_summary(self, "chat", candidates)
-    # Bump the cooldown floor so the next pass (after the handler's 60s
-    # sleep) doesn't immediately re-try a just-failed 429 label: the
-    # cooldowns were already written by _handle_error_cooldown.
+    # Bump the cooldown floor so the next pass (after the handler's sleep)
+    # doesn't immediately re-try a just-failed 429 label: the cooldowns
+    # were already written by _handle_error_cooldown.
     retry_after = 60.0
     if last_error is not None:
         hint = extract_retry_after_seconds(last_error)
         if hint and 0 < hint <= 300.0:
             retry_after = max(retry_after, float(hint))
+    # v2.8.5: last_error is None when every candidate was skipped
+    # (cooldown/dead) -- the old message printed "last failure: NoneType".
+    if last_error is not None:
+        last_fail = (
+            f"last failure: {type(last_error).__name__} on [{last_idx}] "
+            f"after {int(retry_after)}s cooldown"
+        )
+    else:
+        last_fail = "all candidates were skipped (cooldown/dead)"
+    # v2.8.5: honor extended_retry_enabled=False on the turn path too (it
+    # was bypassed here -- the knob only gated the chat/utility cascades,
+    # so a user who disabled extended retry still got infinite soft
+    # retries on the main loop).
+    try:
+        cfg_ex = _get_plugin_cfg(self)
+        extended_on = bool(cfg_ex.get("extended_retry_enabled", True))
+        continuous_on = bool(cfg_ex.get("continuous_fallback", False))
+    except Exception:  # noqa: BLE001
+        extended_on, continuous_on = True, False
     exhausted = (
-        f"All chat model candidates exhausted after {attempted} turn attempt(s) "
-        f"(last failure: {type(last_error).__name__} on "
-        f"[{last_idx}] after {int(retry_after)}s cooldown). "
-        f"Retrying automatically."
+        f"All chat model candidates exhausted after {attempted} turn "
+        f"attempt(s) ({last_fail})."
     )
     self.context.log.log("warning", content=exhausted)
     PrintStyle(font_color="yellow", padding=True).print(exhausted)
+    if not (extended_on or continuous_on):
+        # Legacy contract: extended retry disabled -> raise RuntimeError so
+        # handle_exception surfaces it (same as the chat/utility cascades).
+        raise RuntimeError(exhausted + " (extended retry disabled)")
     raise RetryAfterHours(retry_after=retry_after)
 
 

@@ -8,14 +8,15 @@ Flow when all models fail and extended retry is enabled:
      a. Prints a user-friendly yellow message (not a red error)
      b. Adds the message to chat history once (first time only)
      c. Logs to internal log as warning
-     d. Injects a 60-second sleep to prevent tight looping
+     d. Sleeps for the exception's retry_after (clamped [30, 7200]s;
+        v2.8.5 -- was a hardcoded 60s that ignored the phase A/B delays)
      e. Swallows the exception (data["exception"] = None)
   5. Message loop exits cleanly, monologue loop continues
-  6. Next iteration: call_chat_model → _run_fallback_loop resume check
-     raises RetryAfterHours immediately (no API call). This extension
-     fires again, sleeps 60s, swallows.
+  6. Next iteration re-enters the cascade; cooled-down candidates are
+     skipped cheaply. On renewed exhaustion it raises RetryAfterHours
+     again and this handler sleeps/swallows once more.
   7. Steps 5-6 repeat until cooldown elapses
-  8. When cooldown elapses: normal flow resumes, fresh 60-attempt burst
+  8. When cooldown elapses: normal flow resumes, fresh attempt burst
 
 When the user sends a new message after the cooldown:
   - Agent restarts, loads persisted extended-retry state
@@ -49,7 +50,17 @@ class HandleRetryAfterHours(Extension):
         message = str(exc)
 
         # Only add to chat history and print once (check if already notified)
-        already_notified = self.agent.get_data("_ext_retry_notified") or False
+        # v2.8.5: read the key via the fallback module's constant instead of
+        # a literal -- the constant was renamed (non-underscore prefix so
+        # persist_chat stops stripping it) and the old literal now reads a
+        # key nothing writes.
+        try:
+            from usr.plugins._model_fallback import fallback as _fb
+
+            notified_key = _fb.DATA_KEY_EXT_RETRY_NOTIFIED
+        except ImportError:
+            notified_key = "mfb_ext_retry_notified"
+        already_notified = self.agent.get_data(notified_key) or False
         if not already_notified:
             PrintStyle(font_color="yellow", padding=True).print(message)
 
@@ -59,7 +70,7 @@ class HandleRetryAfterHours(Extension):
             except Exception:
                 pass
 
-            self.agent.set_data("_ext_retry_notified", True)
+            self.agent.set_data(notified_key, True)
 
         # Always log as warning
         try:
@@ -67,19 +78,32 @@ class HandleRetryAfterHours(Extension):
         except Exception:
             pass
 
-        # Throttle: sleep 60 seconds to prevent tight looping.
-        # During extended retry cooldown, the monologue loop will keep
-        # starting message loop iterations. Without this sleep, we'd
-        # burn CPU in a tight loop.  With it, we get ~1 iteration/minute,
-        # which is negligible overhead.
+        # Throttle: sleep before the next attempt to prevent tight looping.
+        # v2.8.5: honor the retry_after the cascade computed instead of a
+        # hardcoded 60s. The phase A (900s) / phase B (3600s) delays from
+        # _maybe_raise_retry_after_hours and the turn cascade's
+        # Retry-After-derived hint were calculated and then ignored here --
+        # every exhaustion re-entered a full cascade pass ~60s later,
+        # hammering exhausted providers. Clamped to [30, 7200]s so a bogus
+        # header can't wedge the loop for hours; sliced so cancellation
+        # (user intervention) is honored promptly.
         try:
-            await asyncio.sleep(60)
+            delay = float(getattr(exc, "retry_after", 0) or 0)
         except Exception:
-            pass
+            delay = 0.0
+        if delay <= 0:
+            delay = 60.0
+        delay = max(30.0, min(delay, 7200.0))
+        remaining = delay
+        while remaining > 0:
+            try:
+                await asyncio.sleep(min(2.0, remaining))
+            except Exception:
+                pass
+            remaining -= 2.0
 
         # Swallow the exception — exit this message loop iteration cleanly.
         # The monologue loop will continue to the next iteration, where
-        # call_chat_model → _run_fallback_loop resume check will raise
-        # RetryAfterHours immediately (no API call), and this handler fires
-        # again. The 60s sleep prevents tight looping.
+        # candidates in cooldown are skipped cheaply and the cascade either
+        # recovers or re-raises RetryAfterHours (this handler sleeps again).
         data["exception"] = None

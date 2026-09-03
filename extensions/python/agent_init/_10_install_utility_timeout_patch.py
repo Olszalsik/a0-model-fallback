@@ -75,6 +75,21 @@ def _resolve_config(agent) -> Dict[str, Any]:
     overrides = cfg.get("utility_timeout_guard") if isinstance(cfg, dict) else None
     if not isinstance(overrides, dict):
         overrides = {}
+    # v2.8.5: the outer guard's budget must accommodate the inner cascade's
+    # largest legitimate per-call timeout -- a COLD router call gets
+    # router_cold_call_timeout_s (150s warm-up budget, v2.7.0). With the
+    # flat default the outer guard fired first on every utility call to a
+    # cold router, killed the call, and (before v2.8.5 booked nothing)
+    # the next utility call re-tried the same router for another full
+    # budget -- utility traffic starved while chat/turn traffic worked.
+    # Injected as a private key; guarded_call raises its effective budget
+    # to max(default, router cold), still capped by max_wait_s.
+    try:
+        router_cold_s = float(cfg.get("router_cold_call_timeout_s") or 0.0)
+    except (TypeError, ValueError):
+        router_cold_s = 0.0
+    if router_cold_s > 0:
+        overrides["_router_cold_s"] = router_cold_s
     from usr.plugins._model_fallback.helpers import utility_timeout
     return utility_timeout.resolve_config(overrides)
 
@@ -92,6 +107,17 @@ def _model_name(agent) -> str:
     return ""
 
 
+def _plugin_version() -> str:
+    """Best-effort plugin version for the install-guard stamp (AD)."""
+    try:
+        from helpers import plugins as _plugins
+        return str(
+            getattr(_plugins.get_plugin_meta("_model_fallback"), "version", "") or ""
+        )
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _install(agent: Agent | None) -> bool:
     """Install the timeout guard on ``Agent.call_utility_model``.
 
@@ -99,18 +125,38 @@ def _install(agent: Agent | None) -> bool:
     was already wrapped or the config is disabled.
     """
     cfg = _resolve_config(agent)
+    from usr.plugins._model_fallback.helpers import utility_timeout
     if not cfg.get("enabled", True):
-        return False
-
-    current = Agent.call_utility_model
-    if getattr(current, "_utility_timeout_patched", False):
-        # Already wrapped. Refresh the resolved config so the next
-        # call uses the latest values.
-        from usr.plugins._model_fallback.helpers import utility_timeout
+        # v2.8.5: refresh the resolved config BEFORE returning so a
+        # wrapper that is already live (installed by an earlier agent_init
+        # while the guard was enabled) sees the toggle-off -- guarded_call
+        # re-checks ``cfg.get("enabled")`` per call against this cache.
+        # The old code returned False with the stale enabled=True config
+        # still cached, so disabling the guard never took effect until a
+        # process restart.
         utility_timeout.set_resolved(cfg)
         return False
 
-    from usr.plugins._model_fallback.helpers import utility_timeout
+    stamp = _plugin_version()
+    current = Agent.call_utility_model
+    if getattr(current, "_utility_timeout_patched", False):
+        # Already wrapped.
+        # v2.8.5 (AD): version-stamp the wrapper. After a plugin UPDATE the
+        # old version's wrapper (closure over old code) would stay live for
+        # the rest of the process; on a version mismatch, unwrap back to
+        # the true original and fall through to a fresh install.
+        if getattr(current, "_utility_timeout_patch_version", "") == stamp:
+            utility_timeout.set_resolved(cfg)
+            return False
+        original = getattr(current, "_utility_timeout_original", None)
+        if original is not None:
+            Agent.call_utility_model = original  # type: ignore[assignment]
+            current = Agent.call_utility_model
+            if getattr(current, "_utility_timeout_patched", False):
+                # Original itself was a stale wrapper (shouldn't happen:
+                # re-installs always wrap the true original). Leave it.
+                utility_timeout.set_resolved(cfg)
+                return False
 
     async def wrapped(self: Agent, *args: Any, **kwargs: Any) -> Any:
         # Re-resolve the model name at call time; the agent's
@@ -129,10 +175,15 @@ def _install(agent: Agent | None) -> bool:
             # later config change (refreshed via set_resolved on the
             # sentinel branch) never reached the wrapper.
             config_overrides=None,
+            # v2.8.5: needed so a guard timeout can book a cooldown for
+            # this utility label (see guarded_call) -- without it the
+            # outer guard killed the call and left no state behind.
+            agent=self,
         )
 
     wrapped._utility_timeout_patched = True  # type: ignore[attr-defined]
     wrapped._utility_timeout_original = current  # type: ignore[attr-defined]
+    wrapped._utility_timeout_patch_version = stamp  # type: ignore[attr-defined]
     Agent.call_utility_model = wrapped  # type: ignore[assignment]
     utility_timeout.set_resolved(cfg)
     _log.info(

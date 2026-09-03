@@ -158,7 +158,10 @@ def isolation(monkeypatch):
     monkeypatch.setattr(
         fallback,
         "_resolve_per_call_timeout",
-        lambda label, base, warm, window, agent=None, api_base="": 5.0,
+        # v2.8.5: the turn cascade passes allow_warm=False (kill-path fix),
+        # so the stub must accept the kwarg.
+        lambda label, base, warm, window, agent=None, api_base="",
+        allow_warm=True: 5.0,
         raising=True,
     )
     monkeypatch.setattr(

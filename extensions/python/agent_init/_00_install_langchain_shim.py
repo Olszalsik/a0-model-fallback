@@ -57,8 +57,14 @@ class InstallLangchainCompatShim(Extension):
             if langchain_compat.already_installed_in_process():
                 return
             results = langchain_compat.install_shim()
-            langchain_compat.mark_installed()
             installed = [k for k, v in results.items() if v]
+            # v2.8.5 (wiring#12): mark the install marker only when at
+            # least one shim actually installed -- an unconditional mark
+            # made already_installed_in_process() True after a total
+            # failure, so the defensive retry was skipped for the life
+            # of the process.
+            if installed:
+                langchain_compat.mark_installed()
             if installed:
                 _log.info(
                     "langchain compat shim installed for: %s",
