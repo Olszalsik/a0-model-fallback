@@ -160,8 +160,11 @@ def test_turn_cascade_defines_and_calls_primary_skip():
     # v2.8.5: widened from 400 -- the strike counter now also persists to
     # agent data (DATA_KEY_TURN_PRIMARY_FAILS) between the increment and
     # the escalation call, which pushed the call past the old window.
+    # v2.8.6: widened again to 2400 -- the strike-decay block (Z fix:
+    # timestamp read + decay + persist) sits between the increment and
+    # the escalation call.
     site = turn_src.index("if idx == 0:")
-    assert "_maybe_extend_primary_cooldown(reason=" in turn_src[site : site + 800]
+    assert "_maybe_extend_primary_cooldown(reason=" in turn_src[site : site + 2400]
 
 
 # ---------------------------------------------------------------------------

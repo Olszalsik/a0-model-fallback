@@ -23,6 +23,59 @@ provider going dark for hours is normal operating conditions, not a failure.
 Both wrappers share the same contract: build a candidate list from the active
 preset (`_build_candidates`), then loop through candidates until one succeeds.
 
+### v2.8.6 — round-3 flagged fixes (2026-09-03)
+
+The five findings the v2.8.5 pass flagged but did not fix (user-approved).
+Full suite 222/222 (+9 new tests in `test_v286_flagged_fixes.py`).
+
+- **(X) 429 is no longer "rotation-permanent".** New helper
+  `_is_permanent_for_rotation(e)` (fallback.py, after `_is_timeout_shaped`):
+  permanent-shaped AND NOT rate-limited. Used at the three ROTATION sites:
+  `cycle_permanent_count += 1` in both cascades and the turn path's n<=1
+  fail-fast gate. Before: a 429 hitting the turn gate raised the RAW
+  `RateLimitError`, bypassing the structured `RetryAfterHours` raise below
+  it, and the summary lines printed contradictory
+  "permanent failure" + "rate limited" pairs. `_handle_error_cooldown`'s
+  own `_is_permanently_failed_model` check is UNCHANGED — there a 429 has
+  already returned via the rate-limit branch, and cooldown policy correctly
+  treats quota errors like permanent ones (book + move on).
+- **(Z) Strike counters decay.** New knob `primary_strike_decay_s`
+  (default 300s, 0 = pre-v2.8.6 never-expire). Utility + chat cascades:
+  closure-local `_last_primary_failure_at` (added to the `nonlocal` in
+  `_maybe_extend_primary_cooldown` and `_reset_primary_strikes`); before
+  the increment, strikes older than the window are discarded. Turn path:
+  the persisted counter (`mfb_turn_primary_fails`) now has a persisted
+  monotonic timestamp next to it (`DATA_KEY_TURN_PRIMARY_FAILS_AT` =
+  `mfb_turn_primary_fails_at`); the increment site reads the knob lazily
+  and decays before counting. `hooks.reset_fallback_settings` resets the
+  timestamp with the counter.
+- **(V) Per-method, version-stamped install guards.**
+  `_00_install_fallback_patches.execute` no longer early-returns on
+  utility's sentinel before checking chat — a partial state (utility
+  patched, chat not) is now repairable, and each method re-installs
+  independently when its `_fallback_patched_version` stamp differs from
+  `get_plugin_meta("_model_fallback").version` (same `_plugin_version()`
+  pattern as the v2.8.5 AD fix in `_10`). `install_chat_turn_patch` takes
+  an optional `version=`: a stale turn cascade is re-assigned WITHOUT
+  overwriting the captured original (module global
+  `_ORIGINAL_CALL_CHAT_MODEL_TURN` is only written on first install).
+- **(N) Full uninstall chain.** `_00` captures the TRUE originals on the
+  Agent class (`Agent._mfb_original_call_utility_model` /
+  `..._call_chat_model`) on first install, and gained a module-level
+  `uninstall()`: unwrap the `_10` utility-timeout wrapper FIRST (it wraps
+  the cascade), then restore the true originals, then the turn original
+  from the fallback global. `hooks.uninstall()` calls the chain (falls
+  back to the old `_10`-only restore if `_00` predates v2.8.6). Previously
+  a plugin disable left the plugin's own cascades installed on the class.
+- **(wiring#11) Cross-context cooldown clear.**
+  `clear_all_cooldowns(agent, *, cross_context=False)` — with the flag it
+  wipes EVERY context's in-memory store (the dead/warm indexes were
+  already process-global); `hooks.clear_cooldowns(agent, cross_context=)`
+  passes it through. Only the calling agent's persisted copy is wiped —
+  peer in-memory dicts ARE the live store, so that is sufficient. A
+  per-context clear could not reach sub-agents / other chats sharing a
+  broken credential before.
+
 ### v2.8.5 — third-pass audit fixes (2026-09-03)
 
 Deep-dive pass over the cascades. Findings fixed (all verified in source

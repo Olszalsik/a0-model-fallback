@@ -147,6 +147,14 @@ primary_skip_cooldown_s: 120    # 2 min (lowered from 600s on 2026-07-27,
                                 # hung primary, but routes around a
                                 # temporarily-hung primary within one
                                 # cascade rotation.
+primary_strike_decay_s: 300     # v2.8.6 (Z): time-decay window (s) for the
+                                # strike counter. A primary failure older
+                                # than this no longer counts toward
+                                # primary_skip_strikes, so two isolated
+                                # failures hours apart don't lock the
+                                # primary out for primary_skip_cooldown_s.
+                                # 0 disables the decay (pre-v2.8.6
+                                # behavior: strikes never expire).
 
 # --- v2.5.2 Rate-limit cooldown tuning (added 2026-07-27) -----------------
 # When a rate-limit error (HTTP 429) has no Retry-After header (e.g.

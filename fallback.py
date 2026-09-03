@@ -104,6 +104,11 @@ DATA_KEY_EXT_RETRY_ATTEMPTS = "mfb_ext_retry_attempts"
 # primary_skip_strikes>=2 escalation could never fire. This key persists
 # the counter across turns.
 DATA_KEY_TURN_PRIMARY_FAILS = "mfb_turn_primary_fails"
+# v2.8.6 (Z): wall-clock (monotonic) stamp of the last counted primary
+# failure, persisted next to the counter so the strike decay window
+# (primary_strike_decay_s) survives a turn boundary. Without it the
+# turn cascade could not tell a fresh strike from one booked hours ago.
+DATA_KEY_TURN_PRIMARY_FAILS_AT = "mfb_turn_primary_fails_at"
 
 # In-memory cooldown store, keyed by (agent_id, model_label).
 # Reset on every Python process restart -> resets on every run_ui bounce.
@@ -433,7 +438,7 @@ def snapshot_cooldowns(agent) -> dict:
     return dict(store) if isinstance(store, dict) else {}
 
 
-def clear_all_cooldowns(agent) -> int:
+def clear_all_cooldowns(agent, *, cross_context: bool = False) -> int:
     """Wipe the agent's live cooldown store (and persist the empty set).
 
     v2.8.3 public API (hooks.clear_cooldowns). Returns the number of
@@ -454,16 +459,33 @@ def clear_all_cooldowns(agent) -> int:
     ("dead cross-agent") for the rest of the TTL. Warm labels and the
     last-status map are cleared too so the first post-clear retry takes
     the cold timeout and the UI status map matches the empty store.
+
+    v2.8.6 (wiring#11): ``cross_context=True`` wipes EVERY context's
+    in-memory store, not just this agent's. The store is keyed by context
+    id, so the default per-context clear left peer agents (sub-agents,
+    other chats sharing the same broken credential) honoring their
+    pre-clear cooldowns for the full TTL. The dead/warm indexes were
+    already process-global; the per-context stores were the last
+    unreachable piece. Only this agent's persisted copy is wiped (peer
+    copies re-seed from the now-empty live store only after a restart,
+    which is fine -- their in-memory dicts ARE the live store).
     """
-    agent_id = getattr(agent, "context", None)
-    agent_id = getattr(agent_id, "id", None) or id(agent)
-    key = ("__global__",) if agent_id is None else (str(agent_id),)
-    store = _INMEM_COOLDOWNS.get(key)
-    if not isinstance(store, dict):
-        store = {}
-        _INMEM_COOLDOWNS[key] = store
-    cleared = len(store)
-    store.clear()
+    if cross_context:
+        cleared = 0
+        for store in list(_INMEM_COOLDOWNS.values()):
+            if isinstance(store, dict):
+                cleared += len(store)
+                store.clear()
+    else:
+        agent_id = getattr(agent, "context", None)
+        agent_id = getattr(agent_id, "id", None) or id(agent)
+        key = ("__global__",) if agent_id is None else (str(agent_id),)
+        store = _INMEM_COOLDOWNS.get(key)
+        if not isinstance(store, dict):
+            store = {}
+            _INMEM_COOLDOWNS[key] = store
+        cleared = len(store)
+        store.clear()
     # Cross-agent indexes are process-global by design (same credentials
     # process-wide), so a user-initiated clear resets them process-wide.
     _INMEM_DEAD_LABELS.clear()
@@ -507,6 +529,29 @@ def _is_timeout_shaped(exc) -> bool:
         return isinstance(exc, _le.Timeout)
     except Exception:  # noqa: BLE001
         return False
+
+
+def _is_permanent_for_rotation(e) -> bool:
+    """v2.8.6 (X): permanent-for-ROTATION check.
+
+    ``_is_permanently_failed_model`` returns True for rate-limited (429)
+    errors too, because for COOLDOWN policy a quota error behaves like a
+    permanent one (book the label, move on). But the three ROTATION
+    decisions that used it -- the per-cycle ``cycle_permanent_count`` in
+    both cascades and the turn path's n<=1 fail-fast gate -- need the
+    opposite split: a 429 is transient (the quota window resets), so
+    counting it as "permanent" produced contradictory summary lines
+    ("permanent failure" next to "rate limited, backing off") and, worse,
+    made the turn gate raise the RAW RateLimitError past the structured
+    RetryAfterHours handling. Rotation-permanent = permanent-shaped AND
+    not rate-limited.
+    """
+    try:
+        if _is_rate_limited_error(e):
+            return False
+    except Exception:  # noqa: BLE001
+        pass
+    return bool(_is_permanently_failed_model(e))
 
 
 def _is_format_error(exc) -> bool:
@@ -2074,6 +2119,17 @@ async def _patched_call_utility_model(
         30.0, float(plugin_cfg.get("primary_skip_cooldown_s", 120.0))
     )
     _consecutive_primary_failures: int = 0
+    # v2.8.6 (Z): time-decay window for the strike counter. Without it a
+    # strike booked hours ago still counted toward escalation -- two
+    # isolated failures spread across a session locked the primary out
+    # for the full primary_skip_cooldown_s. Strikes older than this many
+    # seconds are discarded before the increment, so the window restarts
+    # from the newest failure. 0 disables the decay.
+    # Tunable via config (primary_strike_decay_s).
+    primary_strike_decay_s: float = max(
+        0.0, float(plugin_cfg.get("primary_strike_decay_s", 300.0))
+    )
+    _last_primary_failure_at: float = 0.0
 
     def _maybe_extend_primary_cooldown(reason: str) -> None:
         """If the primary (candidate 0) has failed ``primary_skip_strikes``
@@ -2091,7 +2147,7 @@ async def _patched_call_utility_model(
         another agent's success on the same label would have cleared
         the cooldown entirely.
         """
-        nonlocal _consecutive_primary_failures
+        nonlocal _consecutive_primary_failures, _last_primary_failure_at
         if not primary_skip_enabled:
             return
         if idx != 0:
@@ -2115,6 +2171,17 @@ async def _patched_call_utility_model(
         if _maybe_clear_cooldown_for_healthy_label(self, label):
             _consecutive_primary_failures = 0
             return
+        # v2.8.6 (Z): decay stale strikes before counting this one. A
+        # failure older than primary_strike_decay_s no longer counts as
+        # "consecutive" -- the window restarts from the newest failure.
+        _now = time.monotonic()
+        if (
+            primary_strike_decay_s > 0.0
+            and _last_primary_failure_at > 0.0
+            and (_now - _last_primary_failure_at) > primary_strike_decay_s
+        ):
+            _consecutive_primary_failures = 0
+        _last_primary_failure_at = _now
         _consecutive_primary_failures += 1
         if _consecutive_primary_failures < primary_skip_strikes:
             return
@@ -2148,9 +2215,10 @@ async def _patched_call_utility_model(
         either the primary recovered, or a fallback succeeded and proves
         the cascade is healthy (next primary attempt is no longer a
         'consecutive failure')."""
-        nonlocal _consecutive_primary_failures
+        nonlocal _consecutive_primary_failures, _last_primary_failure_at
         if _consecutive_primary_failures > 0:
             _consecutive_primary_failures = 0
+            _last_primary_failure_at = 0.0
 
     def _compute_cycle_sleep() -> float:
         """Backoff envelope: cycle_delay * multiplier^consecutive_full_cycles,
@@ -2722,7 +2790,10 @@ async def _patched_call_utility_model(
             # v2.5.1: same primary-skip escalation for the general error
             # path. The helper is a no-op when idx != 0.
             _maybe_extend_primary_cooldown(reason=type(e).__name__)
-            if _is_permanently_failed_model(e):
+            # v2.8.6 (X): rotation-permanent, not cooldown-permanent -- a
+            # 429 books a cooldown but is NOT a dead model, so it must not
+            # count toward the all-permanent summary/escalation path.
+            if _is_permanent_for_rotation(e):
                 cycle_permanent_count += 1
 
         attempt += 1
@@ -2937,6 +3008,17 @@ async def _patched_call_chat_model(
         30.0, float(plugin_cfg.get("primary_skip_cooldown_s", 120.0))
     )
     _consecutive_primary_failures: int = 0
+    # v2.8.6 (Z): time-decay window for the strike counter. Without it a
+    # strike booked hours ago still counted toward escalation -- two
+    # isolated failures spread across a session locked the primary out
+    # for the full primary_skip_cooldown_s. Strikes older than this many
+    # seconds are discarded before the increment, so the window restarts
+    # from the newest failure. 0 disables the decay.
+    # Tunable via config (primary_strike_decay_s).
+    primary_strike_decay_s: float = max(
+        0.0, float(plugin_cfg.get("primary_strike_decay_s", 300.0))
+    )
+    _last_primary_failure_at: float = 0.0
 
     def _maybe_extend_primary_cooldown(reason: str) -> None:
         """If the primary (candidate 0) has failed ``primary_skip_strikes``
@@ -2954,7 +3036,7 @@ async def _patched_call_chat_model(
         another agent's success on the same label would have cleared
         the cooldown entirely.
         """
-        nonlocal _consecutive_primary_failures
+        nonlocal _consecutive_primary_failures, _last_primary_failure_at
         if not primary_skip_enabled:
             return
         if idx != 0:
@@ -2978,6 +3060,17 @@ async def _patched_call_chat_model(
         if _maybe_clear_cooldown_for_healthy_label(self, label):
             _consecutive_primary_failures = 0
             return
+        # v2.8.6 (Z): decay stale strikes before counting this one. A
+        # failure older than primary_strike_decay_s no longer counts as
+        # "consecutive" -- the window restarts from the newest failure.
+        _now = time.monotonic()
+        if (
+            primary_strike_decay_s > 0.0
+            and _last_primary_failure_at > 0.0
+            and (_now - _last_primary_failure_at) > primary_strike_decay_s
+        ):
+            _consecutive_primary_failures = 0
+        _last_primary_failure_at = _now
         _consecutive_primary_failures += 1
         if _consecutive_primary_failures < primary_skip_strikes:
             return
@@ -3011,9 +3104,10 @@ async def _patched_call_chat_model(
         either the primary recovered, or a fallback succeeded and proves
         the cascade is healthy (next primary attempt is no longer a
         'consecutive failure')."""
-        nonlocal _consecutive_primary_failures
+        nonlocal _consecutive_primary_failures, _last_primary_failure_at
         if _consecutive_primary_failures > 0:
             _consecutive_primary_failures = 0
+            _last_primary_failure_at = 0.0
 
     def _compute_cycle_sleep() -> float:
         """Same envelope as the utility cascade. See _patched_call_utility_model.
@@ -3505,7 +3599,10 @@ async def _patched_call_chat_model(
             # v2.5.1: same primary-skip escalation for the general error
             # path. The helper is a no-op when idx != 0.
             _maybe_extend_primary_cooldown(reason=type(e).__name__)
-            if _is_permanently_failed_model(e):
+            # v2.8.6 (X): rotation-permanent, not cooldown-permanent -- a
+            # 429 books a cooldown but is NOT a dead model, so it must not
+            # count toward the all-permanent summary/escalation path.
+            if _is_permanent_for_rotation(e):
                 cycle_permanent_count += 1
 
         attempt += 1
@@ -3643,7 +3740,13 @@ async def _patched_call_chat_model_turn(
             if streamed_any0:
                 # Partial output reached the UI -- never auto-retry.
                 raise
-            if _is_permanently_failed_model(e) and _classify_capacity(
+            # v2.8.6 (X): rotation-permanent check. A 429 here used to hit
+            # _is_permanently_failed_model (True for rate-limited) and
+            # re-raise the RAW RateLimitError, bypassing the structured
+            # RetryAfterHours raise below. Quota errors are transient --
+            # only genuinely permanent shapes (context overflow, invalid
+            # key, 404 gone, ...) fail fast here.
+            if _is_permanent_for_rotation(e) and _classify_capacity(
                 label0, self, api0
             ) != "router":
                 raise
@@ -3721,6 +3824,7 @@ async def _patched_call_chat_model_turn(
             _consecutive_primary_failures = 0
             try:
                 self.set_data(DATA_KEY_TURN_PRIMARY_FAILS, 0)
+                self.set_data(DATA_KEY_TURN_PRIMARY_FAILS_AT, 0)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -3766,6 +3870,7 @@ async def _patched_call_chat_model_turn(
             _consecutive_primary_failures = 0
             try:
                 self.set_data(DATA_KEY_TURN_PRIMARY_FAILS, 0)
+                self.set_data(DATA_KEY_TURN_PRIMARY_FAILS_AT, 0)
             except Exception:  # noqa: BLE001
                 pass
             return
@@ -3965,8 +4070,38 @@ async def _patched_call_chat_model_turn(
             _evict_warm_on_timeout(e, label)
             _handle_error_cooldown(e, label, model_cooldowns, self, cand_api_base)
             if idx == 0:
+                # v2.8.6 (Z): decay stale strikes. The counter persists
+                # across turns (DATA_KEY_TURN_PRIMARY_FAILS); without a
+                # timestamp a strike booked hours ago still escalated on
+                # the next isolated failure. Same window the chat/utility
+                # cascades use (primary_strike_decay_s, 0 = disabled).
+                _now = time.monotonic()
+                try:
+                    _last_at = float(
+                        self.get_data(DATA_KEY_TURN_PRIMARY_FAILS_AT) or 0.0
+                    )
+                except Exception:  # noqa: BLE001
+                    _last_at = 0.0
+                try:
+                    _decay_s = max(
+                        0.0,
+                        float(
+                            _get_plugin_cfg(self).get(
+                                "primary_strike_decay_s", 300.0
+                            )
+                        ),
+                    )
+                except Exception:  # noqa: BLE001
+                    _decay_s = 300.0
+                if (
+                    _decay_s > 0.0
+                    and _last_at > 0.0
+                    and (_now - _last_at) > _decay_s
+                ):
+                    _consecutive_primary_failures = 0
                 _consecutive_primary_failures += 1
                 try:
+                    self.set_data(DATA_KEY_TURN_PRIMARY_FAILS_AT, _now)
                     self.set_data(
                         DATA_KEY_TURN_PRIMARY_FAILS, _consecutive_primary_failures
                     )
@@ -4044,18 +4179,38 @@ async def _patched_call_chat_model_turn(
     raise RetryAfterHours(retry_after=retry_after)
 
 
-def install_chat_turn_patch(agent_cls) -> bool:
+def install_chat_turn_patch(agent_cls, version: str | None = None) -> bool:
     """Monkey-patch ``Agent.call_chat_model_turn`` with the turn cascade.
 
     Idempotent (guards on the ``_fallback_turn_patched`` marker, same as
     _00_install_fallback_patches does for the other two methods). Captures
     the ``@extensible`` wrapper so the original's start/end extension
     points and Responses-state handling keep working under the cascade.
+
+    v2.8.6 (V): with ``version`` set, an already-patched class whose
+    stamp differs from the current plugin version is RE-assigned with the
+    fresh cascade -- previously the forever-True sentinel protected a
+    stale cascade from an older plugin version until restart. The
+    captured original (module global) is only written on a first install
+    and is never overwritten by a re-assign, so uninstall keeps restoring
+    the true original.
     """
     global _ORIGINAL_CALL_CHAT_MODEL_TURN
-    if getattr(agent_cls.call_chat_model_turn, "_fallback_turn_patched", False):
-        return False
-    _ORIGINAL_CALL_CHAT_MODEL_TURN = agent_cls.call_chat_model_turn
+    existing = getattr(agent_cls.call_chat_model_turn, "_fallback_turn_patched", False)
+    if existing:
+        if version is None or getattr(
+            agent_cls.call_chat_model_turn, "_fallback_turn_version", None
+        ) == version:
+            return False
+        # Stale cascade from an older plugin version: fall through to a
+        # re-assign WITHOUT touching the captured original.
+    else:
+        _ORIGINAL_CALL_CHAT_MODEL_TURN = agent_cls.call_chat_model_turn
     agent_cls.call_chat_model_turn = _patched_call_chat_model_turn
     _patched_call_chat_model_turn._fallback_turn_patched = True  # type: ignore[attr-defined]
+    if version is not None:
+        try:
+            _patched_call_chat_model_turn._fallback_turn_version = version  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            pass
     return True

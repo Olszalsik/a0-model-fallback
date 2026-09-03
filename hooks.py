@@ -144,13 +144,29 @@ def uninstall():
     # Best-effort cleanup. Each piece catches its own errors so a
     # bug in one does not block the others. Synchronous helpers
     # because uninstall is fired from a sync context in v2.5.
+    # v2.8.6 (N): the full patch-restore chain lives in
+    # _00_install_fallback_patches.uninstall() -- it unwraps the utility
+    # timeout wrapper FIRST (it wraps the cascade installed by _00), then
+    # restores the true originals for call_utility_model / call_chat_model
+    # / call_chat_model_turn. Previously only the top wrapper was undone,
+    # so a "disable" left the plugin's own cascades on the Agent class.
+    # Falls back to the old _10-only restore if _00 predates v2.8.6.
+    restored_chain = False
     try:
         from usr.plugins._model_fallback.extensions.python.agent_init import (
-            _10_install_utility_timeout_patch,
+            _00_install_fallback_patches,
         )
-        _10_install_utility_timeout_patch.uninstall()
+        restored_chain = bool(_00_install_fallback_patches.uninstall())
     except Exception:  # noqa: BLE001
         pass
+    if not restored_chain:
+        try:
+            from usr.plugins._model_fallback.extensions.python.agent_init import (
+                _10_install_utility_timeout_patch,
+            )
+            _10_install_utility_timeout_patch.uninstall()
+        except Exception:  # noqa: BLE001
+            pass
     try:
         from usr.plugins._model_fallback.helpers import langchain_compat
         langchain_compat.uninstall_shim()
@@ -210,22 +226,30 @@ def reset_fallback_settings(agent):
         agent.set_data(_fb.DATA_KEY_EXT_RETRY_ATTEMPTS, 0)
         agent.set_data(_fb.DATA_KEY_EXT_RETRY_NOTIFIED, False)
         agent.set_data(_fb.DATA_KEY_TURN_PRIMARY_FAILS, 0)
+        # v2.8.6 (Z): the strike-decay timestamp must reset with the
+        # counter, or a stale stamp keeps the decay check armed.
+        agent.set_data(_fb.DATA_KEY_TURN_PRIMARY_FAILS_AT, 0)
     except Exception:  # noqa: BLE001
         pass
     return get_fallback_settings(agent)
 
 
-def clear_cooldowns(agent):
+def clear_cooldowns(agent, cross_context: bool = False):
     """Clear all model cooldowns (useful for testing or after adding credits).
 
     v2.8.3: the authoritative store is the in-memory _INMEM_COOLDOWNS
     dict (seeded from agent.data only on first use after a restart) --
     the old version wiped the legacy ``_model_cooldowns`` data key and
     left the live store untouched, making this a silent no-op.
+
+    v2.8.6 (wiring#11): ``cross_context=True`` clears every context's
+    in-memory store (plus the process-global dead/warm indexes), not just
+    this agent's -- sub-agents and other chats sharing a broken
+    credential were unreachable from a per-context clear.
     """
     try:
         from usr.plugins._model_fallback import fallback as _fb
-        cleared = _fb.clear_all_cooldowns(agent)
+        cleared = _fb.clear_all_cooldowns(agent, cross_context=bool(cross_context))
     except Exception:  # noqa: BLE001
         cleared = 0
     # v2.8.5: also wipe the persisted key by its current name. The old
