@@ -1453,7 +1453,9 @@ def _capacity_skips_cooldown(label: str, agent=None, api_base: str = "") -> bool
     return _classify_capacity(label, agent, api_base) in ("concurrent_paid", "router")
 
 
-def _handle_error_cooldown(e, label, model_cooldowns, agent, api_base: str = ""):
+def _handle_error_cooldown(
+    e, label, model_cooldowns, agent, api_base: str = "", probe_model=None
+):
     """Apply cooldown logic to a failed model. Returns True if model was cooldowned.
 
     Cooldown duration policy (see _DEFAULT_COOLDOWNS_S for full table):
@@ -1476,7 +1478,19 @@ def _handle_error_cooldown(e, label, model_cooldowns, agent, api_base: str = "")
     waiting 24h meant the user would be locked out until the next day even
     though the upstream was ready again. The new policy keeps the model in
     cooldown only for the duration the upstream actually needs.
+
+    v2.9.0: ``probe_model`` (the candidate wrapper that just failed) is
+    registered with helpers/recovery_probe.py so a background probe can
+    clear the cooldown early when the provider recovers. Call sites that
+    cannot pass a wrapper (code-error fail-fasts, the _60 safety net)
+    leave it None and the label simply gets no probe.
     """
+    if probe_model is not None:
+        try:
+            from usr.plugins._model_fallback.helpers import recovery_probe
+            recovery_probe.register_probe_target(agent, label, probe_model, api_base)
+        except Exception:  # noqa: BLE001
+            pass
     store = _get_cooldown_store(agent)
     status_code = getattr(e, "status_code", None)
     if not api_base:
@@ -2686,7 +2700,10 @@ async def _patched_call_utility_model(
             # timeout instead of looping on the 20s warm ceiling. See
             # _evict_warm_on_timeout for the full rationale.
             _evict_warm_on_timeout(e, label)
-            _handle_error_cooldown(e, label, model_cooldowns, self, cand_api_base)
+            _handle_error_cooldown(
+                e, label, model_cooldowns, self, cand_api_base,
+                probe_model=call_data["model"],
+            )
             # v2.5.1: track consecutive primary failures. If [0] has just
             # timed out, escalate its cooldown so the cascade routes around
             # it for the next ``primary_skip_cooldown_s`` seconds instead of
@@ -2718,7 +2735,10 @@ async def _patched_call_utility_model(
             # compute and write the identical cooldown a second time.
             if _is_timeout_shaped(e):
                 _evict_warm_on_timeout(e, label)
-                _handle_error_cooldown(e, label, model_cooldowns, self, cand_api_base)
+                _handle_error_cooldown(
+                    e, label, model_cooldowns, self, cand_api_base,
+                    probe_model=call_data["model"],
+                )
                 timeout_cooldown_booked = True
 
             is_json_err = isinstance(e, ValueError) and "valid JSON" in str(e)
@@ -2786,7 +2806,10 @@ async def _patched_call_utility_model(
             # v2.8.4: skip when the litellm.Timeout branch above already
             # booked the identical cooldown (was a benign double-write).
             if not timeout_cooldown_booked:
-                _handle_error_cooldown(e, label, model_cooldowns, self, cand_api_base)
+                _handle_error_cooldown(
+                    e, label, model_cooldowns, self, cand_api_base,
+                    probe_model=call_data["model"],
+                )
             # v2.5.1: same primary-skip escalation for the general error
             # path. The helper is a no-op when idx != 0.
             _maybe_extend_primary_cooldown(reason=type(e).__name__)
@@ -3506,7 +3529,10 @@ async def _patched_call_chat_model(
             # timeout instead of the 20s warm ceiling (see the utility
             # timeout handler + _evict_warm_on_timeout for the rationale).
             _evict_warm_on_timeout(e, label)
-            _handle_error_cooldown(e, label, model_cooldowns, self, cand_api_base)
+            _handle_error_cooldown(
+                e, label, model_cooldowns, self, cand_api_base,
+                probe_model=call_data["model"],
+            )
             # v2.8.4: the utility cascade escalates the primary on repeated
             # timeouts (v2.5.1); this branch never did, so a chat primary
             # that hangs every cycle re-paid the full timeout tax each
@@ -3533,7 +3559,10 @@ async def _patched_call_chat_model(
             # of this handler used to write the identical cooldown twice.
             if _is_timeout_shaped(e):
                 _evict_warm_on_timeout(e, label)
-                _handle_error_cooldown(e, label, model_cooldowns, self, cand_api_base)
+                _handle_error_cooldown(
+                    e, label, model_cooldowns, self, cand_api_base,
+                    probe_model=call_data["model"],
+                )
                 timeout_cooldown_booked = True
 
             is_overflow = _is_context_overflow_error(e)
@@ -3595,7 +3624,10 @@ async def _patched_call_chat_model(
             # v2.8.4: skip when the litellm.Timeout branch above already
             # booked the identical cooldown (was a benign double-write).
             if not timeout_cooldown_booked:
-                _handle_error_cooldown(e, label, model_cooldowns, self, cand_api_base)
+                _handle_error_cooldown(
+                    e, label, model_cooldowns, self, cand_api_base,
+                    probe_model=call_data["model"],
+                )
             # v2.5.1: same primary-skip escalation for the general error
             # path. The helper is a no-op when idx != 0.
             _maybe_extend_primary_cooldown(reason=type(e).__name__)
@@ -3736,7 +3768,9 @@ async def _patched_call_chat_model_turn(
             if not isinstance(store0, dict):
                 store0 = {}
             _evict_warm_on_timeout(e, label0)
-            _handle_error_cooldown(e, label0, store0, self, api0)
+            _handle_error_cooldown(
+                e, label0, store0, self, api0, probe_model=model_obj
+            )
             if streamed_any0:
                 # Partial output reached the UI -- never auto-retry.
                 raise
@@ -4068,7 +4102,10 @@ async def _patched_call_chat_model_turn(
             # Timeout handling: evict the warm label (fix A) so the retry
             # uses the cold timeout, and book the error cooldown.
             _evict_warm_on_timeout(e, label)
-            _handle_error_cooldown(e, label, model_cooldowns, self, cand_api_base)
+            _handle_error_cooldown(
+                e, label, model_cooldowns, self, cand_api_base,
+                probe_model=current_model,
+            )
             if idx == 0:
                 # v2.8.6 (Z): decay stale strikes. The counter persists
                 # across turns (DATA_KEY_TURN_PRIMARY_FAILS); without a

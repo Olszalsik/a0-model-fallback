@@ -167,6 +167,14 @@ def uninstall():
             _10_install_utility_timeout_patch.uninstall()
         except Exception:  # noqa: BLE001
             pass
+    # v2.9.0: the background recovery-probe loop holds a process-global
+    # asyncio task + a weakref registry -- cancel and drop on disable so a
+    # re-enable starts fresh and no probe fires while the plugin is off.
+    try:
+        from usr.plugins._model_fallback.helpers import recovery_probe
+        recovery_probe.shutdown_probes()
+    except Exception:  # noqa: BLE001
+        pass
     try:
         from usr.plugins._model_fallback.helpers import langchain_compat
         langchain_compat.uninstall_shim()

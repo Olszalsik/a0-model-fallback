@@ -156,6 +156,23 @@ primary_strike_decay_s: 300     # v2.8.6 (Z): time-decay window (s) for the
                                 # 0 disables the decay (pre-v2.8.6
                                 # behavior: strikes never expire).
 
+# --- v2.9.0 Background recovery probes (added 2026-09-03) ------------------
+# A cooled-down label is normally re-probed only by REAL agent traffic --
+# the first post-cooldown call pays the full timeout/429 again. When a
+# cooldown is booked, the plugin remembers the failed candidate's model
+# wrapper and a background task pings the label cheaply (same transport,
+# api_key and provider kwargs as the real path) every
+# recovery_probe_interval_s. A successful probe clears the cooldown EARLY
+# and marks the label healthy cross-agent. Bounded burn: at most
+# max_targets_per_cycle probes per sweep, only labels whose REMAINING
+# cooldown exceeds min_cooldown_s, and dead-marked labels are never
+# probed (recovery there needs a user action, e.g. a fixed API key).
+recovery_probe_enabled: true
+recovery_probe_interval_s: 45    # sweep cadence; clamped >= 10s
+recovery_probe_min_cooldown_s: 120  # only probe cooldowns longer than this
+recovery_probe_timeout_s: 15     # per-probe budget; clamped to 5-60s
+recovery_probe_max_targets_per_cycle: 2  # max probes per sweep (quota guard)
+
 # --- v2.5.2 Rate-limit cooldown tuning (added 2026-07-27) -----------------
 # When a rate-limit error (HTTP 429) has no Retry-After header (e.g.
 # NVIDIA NIM's plain {"status":429,"title":"Too Many Requests"}), the

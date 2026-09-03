@@ -73,9 +73,21 @@ class Stats(ApiHandler):
         except Exception:  # noqa: BLE001
             pass
 
+        # v2.9.0: background recovery-probe counters + registry size. The
+        # loop_alive flag lets the WebUI tile show whether the sweep task
+        # is actually running (it only starts with the first booked
+        # cooldown, so "alive: false" right after a restart is normal).
+        recovery_probes: Dict[str, Any] = {"enabled": False}
+        try:
+            from usr.plugins._model_fallback.helpers import recovery_probe
+            recovery_probes = recovery_probe.snapshot()
+        except Exception:  # noqa: BLE001
+            pass
+
         return {
             "version": version,
             "utility_timeout": ut,
             "context_size_guard": context_size,
             "langchain_compat": langchain_shim,
+            "recovery_probes": recovery_probes,
         }

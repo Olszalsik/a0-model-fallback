@@ -23,6 +23,60 @@ provider going dark for hours is normal operating conditions, not a failure.
 Both wrappers share the same contract: build a candidate list from the active
 preset (`_build_candidates`), then loop through candidates until one succeeds.
 
+### v2.9.0 — background recovery probes (2026-09-03)
+
+New capability (first proactive feature — the plugin previously acted only
+AFTER a failure). Full suite 236/236 (+14 tests in
+`test_recovery_probes.py`).
+
+**Problem.** A cooled-down label was re-probed only by real agent traffic:
+the first post-cooldown call paid the full timeout/429 again. If a
+provider recovered 5 minutes into a 10-minute cooldown, every cascade in
+every agent kept routing around a healthy label for the rest of the TTL.
+
+**Mechanism** (`helpers/recovery_probe.py`, wired from `_handle_error_cooldown`):
+
+- **Registration**: the 8 probe-able `_handle_error_cooldown` call sites
+  (utility timeout / litellm-timeout / general, chat ditto, turn
+  n<=1 + general) pass `probe_model=<candidate wrapper>` — the wrapper
+  that just failed, carrying api_key/api_base/provider kwargs, so a probe
+  replays the exact same transport via `model.unified_call(...)`. Code-error
+  fail-fasts and the `_60` safety net leave it None (no probe: a code bug
+  would fail every probe).
+- **Sweep**: one background asyncio task (started lazily on first
+  registration; idempotent; no running loop = no-op) sweeps every
+  `recovery_probe_interval_s` (45s default, min 10). Per target: label not
+  in cooldown → drop; remaining cooldown < `recovery_probe_min_cooldown_s`
+  (120s) → skip (real traffic re-probes soon anyway); dead-marked label →
+  skip (recovery needs a user action, e.g. a fixed key; probing a 404
+  every 45s is pure waste). Otherwise ONE cheap call
+  (`system_message="You are a health check.", user_message="ping"`,
+  no streaming/rate-limiter callbacks) under
+  `recovery_probe_timeout_s` (15s, clamped 5-60).
+- **Success** clears the cooldown EARLY — in place on the live store
+  object (v2.8.4 invariant), persisted, `_mark_label_healthy` cross-agent,
+  info log, target dropped. **Failure** changes nothing but counters; the
+  original expiry stands (a probe never books or extends a cooldown).
+- **Burn bound**: max `recovery_probe_max_targets_per_cycle` (2) probes
+  per sweep.
+- **STRONG ref to the wrapper is load-bearing**: per-call wrappers are
+  usually unreachable after the booking iteration, so a weakref would be
+  collected before the first sweep and the feature would be a silent
+  no-op (caught by the test suite only because FakeModels are kept alive
+  by the test frame — in production the wrapper ref must be strong).
+  Registry is bounded by distinct (context, label) pairs. The AGENT is a
+  weakref: once the context is gone, probing is pointless.
+- **Lifecycle**: `hooks.uninstall()` calls `recovery_probe.shutdown_probes()`
+  (cancels task, drops registry). Counters + `loop_alive` exposed via
+  `helpers.recovery_probe.snapshot()` in `api/stats.py` as
+  `recovery_probes` (`loop_alive: false` right after a restart is normal —
+  the task starts with the first booked cooldown).
+- Knobs (all in default_config.yaml, read through `_get_plugin_cfg`):
+  `recovery_probe_enabled`, `recovery_probe_interval_s`,
+  `recovery_probe_min_cooldown_s`, `recovery_probe_timeout_s`,
+  `recovery_probe_max_targets_per_cycle`. Disable with
+  `recovery_probe_enabled: false`.
+
 ### v2.8.6 — round-3 flagged fixes (2026-09-03)
 
 The five findings the v2.8.5 pass flagged but did not fix (user-approved).
