@@ -363,6 +363,32 @@ unlimited_paid_api_bases:
 cascade_warm_timeout_s: 20
 cascade_warm_window_s: 600
 
+# --- v3.1.0 Latency-adaptive timeouts -----------------------------------------
+# The warm/cold tiers above only know two sizes: 20s (warm) and the full
+# cold base (300s). A COLD label with historically fast calls keeps paying
+# the full cold timeout on a hung connection before the cascade rotates.
+# When enough successful calls are on file, the cold budget is sized from
+# observed reality: p95 x latency_p95_margin, clamped to
+# [latency_floor_s, base_timeout_s] -- it can only SHRINK the wait, never
+# grow it beyond the configured base, and never below the floor.
+#
+# Conservative by design:
+#   - Routers (omniroute/* + api_base-detected) and unlimited_paid labels
+#     return BEFORE the adaptive path -- their warm-up budgets and
+#     no-ceiling behavior are untouched.
+#   - The warm fast-path still wins whenever it applies.
+#   - Samples accumulate only on SUCCESS (a timed-out call is censored
+#     data). A genuine timeout CLEARS the label's samples, so one bad
+#     sizing falls back to the full base until fresh samples rebuild.
+#   - Fewer than latency_min_samples successes on file -> plain base.
+# Set latency_adaptive_enabled: false to restore exact v3.0.0 behavior
+# (no sizing, no sample recording). Routers keep their budgets either way.
+latency_adaptive_enabled: true
+latency_min_samples: 5
+latency_p95_margin: 1.5
+latency_floor_s: 45.0
+latency_max_samples: 20
+
 # --- v2.6 Cascade stagnation amplification (added 2026-07-28) -----------------
 # When `cycle_stagnation_threshold` consecutive full cycles complete
 # without ANY candidate succeeding (every model still in cooldown),

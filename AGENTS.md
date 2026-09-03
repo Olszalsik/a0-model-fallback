@@ -23,6 +23,62 @@ provider going dark for hours is normal operating conditions, not a failure.
 Both wrappers share the same contract: build a candidate list from the active
 preset (`_build_candidates`), then loop through candidates until one succeeds.
 
+### v3.1.0 — latency-adaptive timeouts (2026-09-03)
+
+Roadmap item 1. User decision: **ON by default, conservative** (clamped,
+tightens only after enough samples, kill-switch knob). Full suite
+287/287 (+18 tests in `test_latency_adaptive_v310.py`).
+
+**Problem.** The warm/cold two-tier timeout
+(`_resolve_per_call_timeout`) only knows two sizes: the 20s warm
+ceiling and the full cold base (300s default). A COLD label with
+historically fast calls keeps paying the full cold timeout on a hung
+connection before the cascade rotates — the timeout tax the cascade
+pays most often.
+
+**Mechanism.** New `helpers/latency.py` — process-global, thread-safe
+`dict[label -> list[float]]` of successful-call durations (rolling,
+capped at `latency_max_samples`, default 20). Samples are recorded ONLY
+on success — a timed-out call is censored data (we only know it
+exceeded the budget) and is never used to size anything. Recording
+points: engine `_call_inner` right after the successful `wait_for`
+(covers BOTH call sites — the primary attempt and the Responses-5xx
+chat-completions retry) and the turn cascade's success block (next to
+the `_WARM_LABELS` write; the turn body previously had no `started_at`).
+
+Sizing: inside `_resolve_per_call_timeout`, in the block AFTER the warm
+check and BEFORE the final `return base_timeout_s` (inside the existing
+try — any failure falls back to base). `p95 × latency_p95_margin`
+(nearest-rank p95), clamped to `[latency_floor_s, base_timeout_s]` — it
+can only SHRINK the cold wait, never grow it beyond the configured base
+and never below the floor. Below `latency_min_samples` (default 5) or
+with `latency_adaptive_enabled: false` → plain base (true no-op: the
+knob also gates recording, so a disabled plugin accumulates no state).
+
+**Precedence preserved (do not regress).** Router labels (warm-up
+budgets incl. `router_cold_call_timeout_s`) and `unlimited_paid`
+(no-ceiling) return BEFORE the adaptive block; the warm fast-path
+returns before it too. The user `TIMEOUT=` kwarg never reaches the
+helper. Routers and paid models are unaffected by samples.
+
+**Clear-on-timeout (conservative self-correction).** A genuine timeout
+drops the label's samples entirely (`latency.clear_label`) — the sizing
+that just fired was too tight, so the next resolution falls back to the
+full base until fresh samples rebuild. Sites: engine TimeoutError
+branch, engine timeout-shaped branch (`_is_timeout_shaped`), turn
+cascade — **gated on `_is_timeout_shaped(e)` because the turn except
+block catches every non-code error (429s, 5xx) and clearing samples on
+those would discard good latency data** — and the outer utility-timeout
+guard (`helpers/utility_timeout.py`).
+
+**Observability.** `GET /stats` gained a `latency_adaptive` block
+(per-label samples/p50/p95/last). No new event kind (log lines + stats
+only). `latency.reset()` registered in `hooks.uninstall`.
+
+Knobs: `latency_adaptive_enabled` (true) · `latency_min_samples` (5) ·
+`latency_p95_margin` (1.5) · `latency_floor_s` (45.0) ·
+`latency_max_samples` (20).
+
 ### v3.0.0 — cascade unification (2026-09-03)
 
 Roadmap item 2. **`fallback.py` net −590 lines** (4,364 → 3,774). Full

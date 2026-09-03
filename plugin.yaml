@@ -13,9 +13,12 @@ description: >
   ui_loader_optimizer plugin in v2.6.6.) v3.0.0 unifies the utility and
   chat rotation cascades into ONE engine (_run_rotation_cascade) behind
   two thin adapters, eliminating the "fixed in one cascade, missed in
-  the other" bug class. Self-contained; no official agent-zero file is
+  the other" bug class. v3.1.0 adds conservative latency-adaptive cold
+  timeouts: per-label observed p95 x margin, clamped to a floor and the
+  config base — never applied to routers or unlimited_paid labels.
+  Self-contained; no official agent-zero file is
   modified.
-version: 3.0.0
+version: 3.1.0
 settings_sections:
   - agent
   - developer

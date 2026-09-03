@@ -213,6 +213,16 @@ async def guarded_call(
                     f"{elapsed:.1f}s"
                 )
                 _fb._evict_warm_on_timeout(timeout_exc, model_name)
+                # v3.1.0: parity with the cascade timeout sites -- drop the
+                # label's latency samples so the next sizing falls back to
+                # the full base timeout (the budget that just fired was too
+                # tight).
+                try:
+                    from usr.plugins._model_fallback.helpers import latency as _lat
+
+                    _lat.clear_label(model_name)
+                except Exception:  # noqa: BLE001
+                    pass
                 _fb._handle_error_cooldown(
                     timeout_exc, model_name, _fb._get_cooldown_store(agent),
                     agent,

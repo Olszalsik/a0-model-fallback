@@ -46,6 +46,10 @@ from helpers.print_style import PrintStyle
 # imports nothing from the plugin).
 from usr.plugins._model_fallback.helpers import events
 
+# v3.1.0: per-label latency samples for adaptive cold timeouts (same
+# no-import-cycle property).
+from usr.plugins._model_fallback.helpers import latency
+
 # All model-related helpers are now local to the plugin (models_ext.py)
 from usr.plugins._model_fallback.models_ext import (
     _is_code_error,
@@ -268,6 +272,13 @@ def _resolve_per_call_timeout(
     and the escaped TimeoutError stopped the whole run at _90. Router
     warm-up budgets are unaffected (they key off the same warm window
     but produce the COLD budget).
+
+    v3.1.0: when the label is COLD and enough successful calls are on
+    file (helpers/latency.py), the cold budget is sized from observed
+    p95 x latency_p95_margin, clamped to [latency_floor_s,
+    base_timeout_s] -- it can only shrink the wait, never grow it.
+    Routers and unlimited_paid return before this point; a genuine
+    timeout clears the label's samples (conservative fallback to base).
     """
     try:
         # v2.8.5: register label -> api_base for later api_base-less callers
@@ -334,6 +345,31 @@ def _resolve_per_call_timeout(
             last_warm_at = _WARM_LABELS.get(label, 0.0)
             if time.monotonic() - last_warm_at < warm_window_s:
                 return warm_timeout_s
+        # v3.1.0: latency-adaptive COLD budget. Only reached for cold
+        # non-router, non-unlimited_paid labels -- the router branch
+        # (warm-up budget) and the unlimited_paid no-ceiling return both
+        # happened above, and the warm fast-path just returned too. When
+        # enough successful calls are on file, size the cold budget from
+        # observed p95 x margin instead of paying the full base on a hung
+        # connection; clamped to [latency_floor_s, base_timeout_s] so it
+        # can only shrink the wait, never grow it. Insufficient samples
+        # (or the kill-switch knob) -> None -> plain base below.
+        try:
+            lat_cfg = _get_plugin_cfg(agent)
+            lat_enabled = bool(lat_cfg.get("latency_adaptive_enabled", True))
+        except Exception:
+            lat_cfg = {}
+            lat_enabled = True
+        adaptive = latency.p95_timeout_s(
+            label,
+            min_samples=lat_cfg.get("latency_min_samples", 5),
+            margin=lat_cfg.get("latency_p95_margin", 1.5),
+            floor_s=lat_cfg.get("latency_floor_s", 45.0),
+            base_timeout_s=base_timeout_s,
+            enabled=lat_enabled,
+        )
+        if adaptive is not None:
+            return adaptive
     except Exception:
         # Defensive: if _WARM_LABELS access fails for any reason, fall
         # back to the legacy cold-timeout. Better to over-wait once than
@@ -2788,7 +2824,25 @@ async def _run_rotation_cascade(self, spec: _CascadeSpec, model_obj):
             # boundary, not after, so elapsed is always >= timeout_s.
             started_at = time.monotonic()
             try:
-                return await asyncio.wait_for(_inner_coro, timeout=effective_timeout_s)
+                result = await asyncio.wait_for(_inner_coro, timeout=effective_timeout_s)
+                # v3.1.0: the vestigial started_at is now real -- record
+                # the successful call's duration so the resolver can size
+                # the COLD budget from observed p95. Recorded here (not at
+                # the success path) so BOTH call sites -- the primary
+                # attempt and the v3.0.0 Responses-5xx chat-completions
+                # retry -- feed the same window; both are real requests.
+                # A timed-out call is censored data and is never recorded.
+                try:
+                    _lat_cfg = _get_plugin_cfg(self)
+                    latency.record(
+                        label,
+                        time.monotonic() - started_at,
+                        enabled=bool(_lat_cfg.get("latency_adaptive_enabled", True)),
+                        max_samples=_lat_cfg.get("latency_max_samples", 20),
+                    )
+                except Exception:
+                    pass
+                return result
             except asyncio.CancelledError:
                 # External cancellation -- don't preempt the inner coro.
                 # The outer guard / container shutdown is the source of
@@ -2828,6 +2882,13 @@ async def _run_rotation_cascade(self, spec: _CascadeSpec, model_obj):
             # timeout instead of looping on the 20s warm ceiling. See
             # _evict_warm_on_timeout for the full rationale.
             _evict_warm_on_timeout(e, label)
+            # v3.1.0: the sizing that just timed out was too tight -- drop
+            # the label's latency samples so the next resolution falls back
+            # to the full base timeout until fresh samples accumulate.
+            try:
+                latency.clear_label(label)
+            except Exception:
+                pass
             _handle_error_cooldown(
                 e, label, model_cooldowns, self, cand_api_base,
                 probe_model=call_data["model"],
@@ -2863,6 +2924,12 @@ async def _run_rotation_cascade(self, spec: _CascadeSpec, model_obj):
             # compute and write the identical cooldown a second time.
             if _is_timeout_shaped(e):
                 _evict_warm_on_timeout(e, label)
+                # v3.1.0: same clear-on-timeout parity as the wait_for
+                # TimeoutError branch above.
+                try:
+                    latency.clear_label(label)
+                except Exception:
+                    pass
                 _handle_error_cooldown(
                     e, label, model_cooldowns, self, cand_api_base,
                     probe_model=call_data["model"],
@@ -3591,6 +3658,9 @@ async def _patched_call_chat_model_turn(
         # Retry-After we already know. The cascade owns retries now.
         # NOTE: the shadowed get_chat_model makes the original build its
         # Responses state and call kwargs from the candidate wrapper.
+        # v3.1.0: stamp the call so the success block can record the real
+        # duration (the turn cascade had no started_at).
+        _turn_started_at = time.monotonic()
         try:
             llm_result = await _call_original_with_model(
                 current_model,
@@ -3617,6 +3687,15 @@ async def _patched_call_chat_model_turn(
             # Timeout handling: evict the warm label (fix A) so the retry
             # uses the cold timeout, and book the error cooldown.
             _evict_warm_on_timeout(e, label)
+            # v3.1.0: clear the label's latency samples ONLY on a genuine
+            # timeout -- this except block fires for every non-code error
+            # (429s, 5xx), and clearing samples on those would discard
+            # perfectly good latency data.
+            if _is_timeout_shaped(e):
+                try:
+                    latency.clear_label(label)
+                except Exception:
+                    pass
             _handle_error_cooldown(
                 e, label, model_cooldowns, self, cand_api_base,
                 probe_model=current_model,
@@ -3685,6 +3764,18 @@ async def _patched_call_chat_model_turn(
         _save_cooldown_store(self, model_cooldowns)
         _mark_label_healthy(self, label)
         _WARM_LABELS[label] = time.monotonic()
+        # v3.1.0: record the real call duration (stamped above) so the
+        # turn path feeds the same latency window the cascades do.
+        try:
+            _lat_cfg = _get_plugin_cfg(self)
+            latency.record(
+                label,
+                time.monotonic() - _turn_started_at,
+                enabled=bool(_lat_cfg.get("latency_adaptive_enabled", True)),
+                max_samples=_lat_cfg.get("latency_max_samples", 20),
+            )
+        except Exception:
+            pass
         _reset_primary_strikes()
         self.set_data(DATA_KEY_EXT_RETRY_ATTEMPTS, 0)
         self.set_data(DATA_KEY_EXT_RETRY_PHASE, 0)

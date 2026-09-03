@@ -84,10 +84,20 @@ class Stats(ApiHandler):
         except Exception:  # noqa: BLE001
             pass
 
+        # v3.1.0: per-label latency samples backing the adaptive cold
+        # timeouts (samples / p50 / p95 / last per label).
+        latency_adaptive: Dict[str, Any] = {}
+        try:
+            from usr.plugins._model_fallback.helpers import latency
+            latency_adaptive = latency.snapshot()
+        except Exception:  # noqa: BLE001
+            pass
+
         return {
             "version": version,
             "utility_timeout": ut,
             "context_size_guard": context_size,
             "langchain_compat": langchain_shim,
             "recovery_probes": recovery_probes,
+            "latency_adaptive": latency_adaptive,
         }

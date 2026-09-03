@@ -186,6 +186,13 @@ def uninstall():
         stats.reset()
     except Exception:  # noqa: BLE001
         pass
+    # v3.1.0: per-label latency samples are process-global runtime state
+    # -- drop them on disable so a re-enable starts fresh.
+    try:
+        from usr.plugins._model_fallback.helpers import latency
+        latency.reset()
+    except Exception:  # noqa: BLE001
+        pass
     return None
 
 
