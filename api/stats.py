@@ -63,8 +63,19 @@ class Stats(ApiHandler):
         except Exception:  # noqa: BLE001
             pass
 
+        # v2.8.4: read the version from plugin.yaml instead of a hardcoded
+        # string that silently drifts out of date on every release.
+        version: str = "unknown"
+        try:
+            from helpers import plugins as _plugins
+
+            meta = _plugins.get_plugin_meta("_model_fallback")
+            version = str(getattr(meta, "version", "") or "unknown")
+        except Exception:  # noqa: BLE001
+            pass
+
         return {
-            "version": "2.6.8",
+            "version": version,
             "utility_timeout": ut,
             "context_size_guard": context_size,
             "langchain_compat": langchain_shim,

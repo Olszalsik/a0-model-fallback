@@ -95,6 +95,44 @@ module globals mid-suite. Anything resolved via import-time from-imports
 (`_INMEM_COOLDOWNS`, `RetryAfterHours`, ...) is a stale object afterwards.
 New tests must read module state through `fallback.<name>` at call time.
 
+### v2.8.4 — round-2 flagged fixes: format-slip cooldown, dead config paths, turn primary-skip (2026-09-03)
+
+Second pass (fixing the items the v2.8.3 audit flagged-not-fixed):
+
+- **F8 — malformed-JSON no longer books 300s.** A `require_json` utility
+  response DirtyJson can't parse raised `ValueError("... not valid JSON")`
+  from `_succeed` into the generic `except Exception` → `status_code=None`
+  → the 300s unknown-error cooldown. Two slips ~5 min apart effectively
+  rotated away from a healthy model. New `_is_format_error()` detects
+  parse/format-shaped exceptions; `_handle_error_cooldown` books
+  `format_error_cooldown_s` (default **20s**, new knob in
+  default_config.yaml) for them, bypassing the 30s minimum floor (that
+  floor exists for real endpoint errors; a format slip should be retryable
+  next cycle). `0` disables booking (pure rotation). Also honored in
+  `_cooldown_seconds_for_status` for any other call path.
+- **`force_chat_completions_providers` was dead at runtime.**
+  `_force_chat_config` (models_ext.py) read only
+  `get_plugin_config`, which does NOT merge default_config.yaml with
+  config.json (same gotcha as the v2.6.7 router-detection fix) — and all
+  three force-chat lists live only in the YAML. Now merged (defaults under
+  live config).
+- **Turn-path primary-skip escalation wired.** The turn cascade counted
+  `_consecutive_primary_failures` (and reset on success) but never
+  escalated — the counter was write-only. `_maybe_extend_primary_cooldown`
+  now exists in the turn cascade too (knobs read lazily; does NOT
+  increment — the caller increments for idx==0; same router/concurrent
+  exemptions and only-cleared healthy-label check as chat).
+- **`_strip_a0_only_kwargs(is_primary=)` guard.** At idx==0 the candidate
+  IS the live primary model object, and popping `venice_parameters` off it
+  silently disabled the primary's own Venice features on every call. New
+  `_PROVIDER_SPECIFIC_KWARGS` survive on the primary, still stripped from
+  fallback wrappers. (`usage` stays always-stripped — the OpenAI SDK
+  rejects it as a top-level arg.)
+- **api/stats.py `version`** now read from plugin.yaml via
+  `plugins.get_plugin_meta` (was hardcoded "2.6.8").
+
+Tests: `tests/test_v284_flagged_fixes.py`.
+
 ### v2.8.3 — audit fixes: timeout parity, config-merge, spin backoff (2026-09-03)
 
 Full-audit pass (independent code review of fallback.py + all extensions;

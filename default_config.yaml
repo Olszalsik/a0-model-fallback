@@ -283,6 +283,17 @@ router_cold_call_timeout_s: 150.0
 # longer; set to ~30 to retry faster. Clamped to >= 0.
 timeout_cooldown_s: 45.0
 
+# --- v2.8.4 Malformed-output (format-error) cooldown ------------------------
+# When require_json is set and the utility model returns unparseable output
+# (DirtyJson can't recover it), the slip used to fall through to the 300s
+# unknown-error cooldown -- locking a HEALTHY endpoint out for 5 minutes
+# over a stochastic format slip (the model answered fast; connection and
+# auth are fine). `format_error_cooldown_s` (default 20s) books a short
+# cooldown instead so the cascade rotates for this call but the label is
+# retryable on the very next cycle. Bypasses the generic 30s minimum-cooldown
+# floor. Set to 0 to disable the booking entirely (pure rotation).
+format_error_cooldown_s: 20.0
+
 # --- v2.6.8 unlimited_paid api_base matcher (a0_venice / Agent Zero API) ---
 # The paid-model warm-path exemption above only reaches a label that
 # _classify_capacity returns ``unlimited_paid`` for. The a0_venice provider

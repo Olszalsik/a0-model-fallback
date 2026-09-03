@@ -438,6 +438,33 @@ def _is_timeout_shaped(exc) -> bool:
         return False
 
 
+def _is_format_error(exc) -> bool:
+    """True for malformed-output errors: the model answered quickly and
+    healthily, but the response body isn't parseable (v2.8.4, F8).
+
+    A format slip is NOT an endpoint failure -- connection, auth and
+    latency are all fine, only this response is unusable. Booking the
+    300s unknown-error default on it locked a working model out for 5
+    minutes over a stochastic slip (two slips ~5min apart effectively
+    rotated away from a healthy model). Callers book the short
+    ``format_error_cooldown_s`` instead.
+    """
+    try:
+        import json as _json
+        if isinstance(exc, _json.JSONDecodeError):
+            # Message text is unreliable here ("bad: line 1 column 1").
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    if isinstance(exc, ValueError):
+        msg = str(exc).lower()
+        return "json" in msg or "parse" in msg or "format" in msg
+    return False
+
+
+_DEFAULT_FORMAT_ERROR_COOLDOWN_S = 20.0
+
+
 def _cooldown_seconds_for_status(status_code, exc) -> float:
     """Return the cooldown duration for a given exception, in seconds.
 
@@ -461,6 +488,18 @@ def _cooldown_seconds_for_status(status_code, exc) -> float:
             return _DEFAULT_TIMEOUT_COOLDOWN_S
     if isinstance(status_code, int):
         return _DEFAULT_COOLDOWNS_S.get(status_code, 300.0)
+    # v2.8.4 (F8): malformed-output slips get the short format cooldown,
+    # not the 300s unknown-error default (see _is_format_error).
+    if _is_format_error(exc):
+        try:
+            return float(
+                _get_plugin_cfg(None).get(
+                    "format_error_cooldown_s",
+                    _DEFAULT_FORMAT_ERROR_COOLDOWN_S,
+                )
+            )
+        except Exception:  # noqa: BLE001
+            return _DEFAULT_FORMAT_ERROR_COOLDOWN_S
     return 300.0
 
 
@@ -589,14 +628,31 @@ _A0_ONLY_KWARGS = (
     "a0_api_mode",
 )
 
+# v2.8.4: provider-specific nested kwargs that are LEGITIMATE on the model
+# they were injected into (_merge_provider_defaults puts venice_parameters on
+# the a0_venice primary itself) but poison every OTHER provider's wrapper.
+# The primary call site passes is_primary=True so these survive on the live
+# primary model object; fallback wrappers (which copied parent kwargs) still
+# get them stripped. "usage" stays in the always-strip list above: the OpenAI
+# SDK rejects it as a top-level chat.completions argument, so keeping it on
+# the primary would just guarantee a 400.
+_PROVIDER_SPECIFIC_KWARGS = ("venice_parameters",)
 
-def _strip_a0_only_kwargs(model) -> None:
+
+def _strip_a0_only_kwargs(model, is_primary: bool = False) -> None:
     """Mutate model.kwargs in place: pop every A0-only / provider-invalid key.
 
     Safe to call on the primary (which carries FALLBACK_CYCLE_DELAY etc. for
     the plugin to read locally) AFTER the plugin has finished reading them
     -- the order is: plugin reads at the top of the patched function, then
     this strip is called just before the first unified_call.
+
+    v2.8.4: pass ``is_primary=True`` at the idx==0 call sites. The primary
+    candidate IS the live model object (not a wrapper copy), and its
+    provider-specific nested kwargs (venice_parameters on a0_venice) are a
+    real part of that provider's API contract -- stripping them silently
+    degraded the primary (Venice lost its web-search/venice_parameters
+    features) on every call. Fallback wrappers still get the full strip.
     """
     if model is None:
         return
@@ -604,6 +660,8 @@ def _strip_a0_only_kwargs(model) -> None:
     if not isinstance(kwargs, dict):
         return
     for k in _A0_ONLY_KWARGS:
+        if is_primary and k in _PROVIDER_SPECIFIC_KWARGS:
+            continue
         kwargs.pop(k, None)
 
 
@@ -1285,6 +1343,8 @@ def _handle_error_cooldown(e, label, model_cooldowns, agent, api_base: str = "")
       - 429 (rate limited): Retry-After if present, else 60 s
       - 5xx / transient: 60-120 s
       - Context overflow: 24 h
+      - Malformed output / format slip (v2.8.4): format_error_cooldown_s
+        (default 20s -- bypasses the 30s floor; endpoint is healthy)
       - Unknown: 5 min
 
     The previous 24-hour blanket cooldown for ALL permanent-looking errors
@@ -1426,6 +1486,29 @@ def _handle_error_cooldown(e, label, model_cooldowns, agent, api_base: str = "")
         # health is the authority. This agent's short cooldown above
         # still spaces retries.
         return True
+    # v2.8.4 (F8): a malformed-output slip books the SHORT format
+    # cooldown, bypassing the 30s floor below (that floor exists for real
+    # endpoint errors where sub-30s cooldowns are cleared by attempt_delay
+    # anyway -- a format slip should stay retryable on the very next
+    # cycle since the endpoint itself is healthy). dur=0 disables the
+    # booking entirely (pure rotation, no cooldown).
+    if _is_format_error(e):
+        try:
+            dur = float(
+                _get_plugin_cfg(agent).get(
+                    "format_error_cooldown_s",
+                    _DEFAULT_FORMAT_ERROR_COOLDOWN_S,
+                )
+            )
+        except Exception:  # noqa: BLE001
+            dur = _DEFAULT_FORMAT_ERROR_COOLDOWN_S
+        dur = max(0.0, min(dur, 300.0))
+        if dur > 0.0:
+            store[label] = time.monotonic() + dur
+            _record_last_status(agent, store, label, status_code)
+            _save_cooldown_store(agent, store)
+        return True
+
     dur = _cooldown_seconds_for_status(status_code, e)
     # Don't apply cooldowns shorter than 30s -- they'd be cleared by the
     # attempt_delay anyway, and writing them just adds IO overhead.
@@ -2156,7 +2239,9 @@ async def _patched_call_utility_model(
         # Strip A0-only / provider-invalid keys from the wrapper's kwargs right
         # before the first acompletion() so they never reach the request body.
         # The plugin has already read cycle_delay / max_cycles / timeout above.
-        _strip_a0_only_kwargs(current_model)
+        # v2.8.4: idx==0 IS the live primary model object -- keep its own
+        # provider-specific kwargs (see _PROVIDER_SPECIFIC_KWARGS).
+        _strip_a0_only_kwargs(current_model, is_primary=(idx == 0))
 
         if attempt > 0:
             warn = f"Utility model switching to [{idx}/{n - 1}]: {label}"
@@ -2885,7 +2970,9 @@ async def _patched_call_chat_model(
         # Strip A0-only / provider-invalid keys from the wrapper's kwargs right
         # before the first acompletion() so they never reach the request body.
         # The plugin has already read cycle_delay / max_cycles / timeout above.
-        _strip_a0_only_kwargs(current_model)
+        # v2.8.4: idx==0 IS the live primary model object -- keep its own
+        # provider-specific kwargs (see _PROVIDER_SPECIFIC_KWARGS).
+        _strip_a0_only_kwargs(current_model, is_primary=(idx == 0))
 
         if attempt > 0:
             warn = f"Chat model switching to [{idx}/{n - 1}]: {label}"
@@ -3242,6 +3329,64 @@ async def _patched_call_chat_model_turn(
         if _consecutive_primary_failures > 0:
             _consecutive_primary_failures = 0
 
+    def _maybe_extend_primary_cooldown(reason: str) -> None:
+        """v2.8.4: turn-path primary-skip escalation (parity with the chat
+        and utility cascades). The turn cascade already counted consecutive
+        primary failures (``_consecutive_primary_failures``) and reset them
+        on success, but never ESCALATED -- the counter was write-only, so a
+        repeatedly failing primary kept costing its full timeout on every
+        turn instead of being routed around for
+        ``primary_skip_cooldown_s``.
+
+        Unlike the chat/utility versions this does NOT increment the
+        counter -- the caller (the per-candidate exception handler) has
+        already incremented it for idx == 0. Knobs are read lazily from
+        plugin config; all read failures leave escalation disabled.
+        """
+        # The healthy-label branch below assigns it (strike reset);
+        # without nonlocal that assignment makes the name closure-local
+        # and the read above raises UnboundLocalError (same class of bug
+        # as the v2.8.0 stagnation nonlocal fix -- see memory:
+        # model-fallback stagnation nonlocal).
+        nonlocal _consecutive_primary_failures
+        if _consecutive_primary_failures < 1:
+            return
+        try:
+            cfg = _get_plugin_cfg(self)
+            if not bool(cfg.get("primary_skip_enabled", True)):
+                return
+            strikes = max(1, int(cfg.get("primary_skip_strikes", 2)))
+            cooldown_s = max(30.0, float(cfg.get("primary_skip_cooldown_s", 600.0)))
+        except Exception:  # noqa: BLE001
+            return
+        if _consecutive_primary_failures < strikes:
+            return
+        # Routers / concurrent-capacity providers re-route or free up in
+        # seconds -- never escalate against them (same rule as chat).
+        if _capacity_skips_cooldown(label, self, cand_api_base):
+            return
+        # A peer agent's recent success on this label supersedes our
+        # local strikes (only-cleared-never-overwritten invariant).
+        if _maybe_clear_cooldown_for_healthy_label(self, label):
+            _consecutive_primary_failures = 0
+            return
+        prev_until = model_cooldowns.get(label) or 0.0
+        target_until = time.monotonic() + cooldown_s
+        if target_until <= prev_until:
+            return  # existing cooldown is already longer, don't shorten
+        model_cooldowns[label] = target_until
+        _save_cooldown_store(self, model_cooldowns)
+        try:
+            self.context.log.log(
+                "warning",
+                f"Chat primary (turn) [{label}] has failed "
+                f"{_consecutive_primary_failures} time(s) in a row -- "
+                f"escalating cooldown to {int(cooldown_s)}s "
+                f"(reason: {reason}). Cascade will route around it.",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
     async def _call_original_with_model(current_model, *, timeout_s_override=None):
         """Run the original turn method against a specific candidate model.
 
@@ -3334,7 +3479,9 @@ async def _patched_call_chat_model_turn(
             continue
 
         current_model = _build_model(spec, model_obj)
-        _strip_a0_only_kwargs(current_model)
+        # v2.8.4: idx==0 IS the live primary model object -- keep its own
+        # provider-specific kwargs (see _PROVIDER_SPECIFIC_KWARGS).
+        _strip_a0_only_kwargs(current_model, is_primary=(idx == 0))
 
         # Per-candidate warm/cold timeout (same policy as the chat cascade).
         # A user TIMEOUT= model kwarg was already folded into ``timeout_s``
@@ -3385,6 +3532,10 @@ async def _patched_call_chat_model_turn(
             _handle_error_cooldown(e, label, model_cooldowns, self, cand_api_base)
             if idx == 0:
                 _consecutive_primary_failures += 1
+                # v2.8.4: escalate the primary's cooldown once the strike
+                # threshold is crossed (previously tracked but never acted
+                # on -- see _maybe_extend_primary_cooldown above).
+                _maybe_extend_primary_cooldown(reason=type(e).__name__)
             if streamed_any:
                 # Partial output already reached the UI -- rotating now would
                 # duplicate it. Book the cooldown (done above) and let the

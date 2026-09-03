@@ -310,6 +310,20 @@ def _force_chat_config(agent) -> tuple:
         cfg = _plugins.get_plugin_config("_model_fallback", agent) or {}
         if not isinstance(cfg, dict):
             cfg = {}
+        # v2.8.4: get_plugin_config does NOT merge default_config.yaml with
+        # config.json (same gotcha the v2.6.7 router-detection fix hit). All
+        # three force-chat lists live ONLY in default_config.yaml, so without
+        # this merge the static option-B matcher was dead at runtime -- the
+        # lists never reached this code unless the user duplicated them into
+        # config.json by hand. Default YAML first, live config.json on top.
+        try:
+            defaults = _plugins.get_default_plugin_config("_model_fallback")
+            if isinstance(defaults, dict):
+                merged = dict(defaults)
+                merged.update(cfg)
+                cfg = merged
+        except Exception:  # noqa: BLE001
+            pass
         providers = cfg.get("force_chat_completions_providers") or []
         patterns = cfg.get("force_chat_completions_patterns") or []
         api_bases = cfg.get("force_chat_completions_api_bases") or []
