@@ -250,12 +250,22 @@ def _resolve_runtime_config(agent) -> Dict[str, Any]:
     # over the nested section's ``enabled``. The piece defaults
     # to OFF, so an explicit True in either place turns it on.
     from usr.plugins._model_fallback.helpers import toggles
-    if not toggles.resolve_toggle(cfg, "context_size_guard", default=False):
+    toggle_on = toggles.resolve_toggle(cfg, "context_size_guard", default=False)
+    if not toggle_on:
         return {"enabled": False}
     overrides = cfg.get("context_size_guard") if isinstance(cfg, dict) else None
     if not isinstance(overrides, dict):
         overrides = {}
-    return resolve_config(overrides)
+    # v2.8.3: get_plugin_config returns config.json WITHOUT merging
+    # default_config.yaml, so a config.json that only carries the
+    # WebUI toggle (no nested ``context_size_guard:`` section) used to
+    # resolve to DEFAULTS.enabled=False -- the toggle said ON while the
+    # runtime said OFF. When the top-level toggle is ON, it wins over
+    # the nested section's ``enabled`` (same precedence rule the
+    # utility guard documents).
+    resolved = resolve_config(overrides)
+    resolved["enabled"] = True
+    return resolved
 
 
 class ContextSizeGuard(Extension):

@@ -378,6 +378,34 @@ def _save_cooldown_store(agent, store: dict) -> None:
         pass  # best-effort persistence
 
 
+def snapshot_cooldowns(agent) -> dict:
+    """Return a copy of the agent's live in-memory cooldown store.
+
+    v2.8.3 public API (hooks.get_cooldowns): the legacy data key is only
+    a persisted backup, so inspection must read the live store.
+    """
+    agent_id = getattr(agent, "context", None)
+    agent_id = getattr(agent_id, "id", None) or id(agent)
+    key = ("__global__",) if agent_id is None else (str(agent_id),)
+    store = _INMEM_COOLDOWNS.get(key)
+    return dict(store) if isinstance(store, dict) else {}
+
+
+def clear_all_cooldowns(agent) -> int:
+    """Wipe the agent's live cooldown store (and persist the empty set).
+
+    v2.8.3 public API (hooks.clear_cooldowns). Returns the number of
+    labels that were in cooldown.
+    """
+    agent_id = getattr(agent, "context", None)
+    agent_id = getattr(agent_id, "id", None) or id(agent)
+    key = ("__global__",) if agent_id is None else (str(agent_id),)
+    store = _INMEM_COOLDOWNS.get(key)
+    cleared = len(store) if isinstance(store, dict) else 0
+    _save_cooldown_store(agent, {})
+    return cleared
+
+
 # Pure-timeout cooldown. A ``TimeoutError`` (no HTTP status_code) used to fall
 # through to the 300s "unknown error" default below, which meant a single slow
 # (but healthy) call on a non-router model locked it out for 5 minutes -- the
@@ -390,13 +418,34 @@ def _save_cooldown_store(agent, store: dict) -> None:
 _DEFAULT_TIMEOUT_COOLDOWN_S = 45.0
 
 
+def _is_timeout_shaped(exc) -> bool:
+    """True for pure timeouts, INCLUDING litellm's Timeout family.
+
+    ``litellm.Timeout`` subclasses ``APITimeoutError -> APIConnectionError
+    -> APIError``, not the builtin ``TimeoutError``, so a provider-side
+    pure timeout (no HTTP status) that escapes ``unified_call`` before the
+    cascade's own ``wait_for`` fires used to fall through to the 300s
+    "unknown error" default AND keep its warm label -- recreating the
+    20s warm-ceiling loop that fix A (v2.6.4) closed for wait_for
+    timeouts.
+    """
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return True
+    try:
+        import litellm.exceptions as _le  # type: ignore
+        return isinstance(exc, _le.Timeout)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _cooldown_seconds_for_status(status_code, exc) -> float:
     """Return the cooldown duration for a given exception, in seconds.
 
     Priority:
       1. Retry-After header from the exception (respects server's own hint)
-      2. Pure timeout (no status_code, TimeoutError) -> ``timeout_cooldown_s``
-         (default 45s) -- a slow call is not a broken model.
+      2. Pure timeout (no status_code, TimeoutError or litellm.Timeout)
+         -> ``timeout_cooldown_s`` (default 45s) -- a slow call is not a
+         broken model.
       3. Per-status default from _DEFAULT_COOLDOWNS_S
       4. 300.0 (5 min) -- conservative default for unknown errors
     """
@@ -405,9 +454,7 @@ def _cooldown_seconds_for_status(status_code, exc) -> float:
         # Cap at 1 hour to avoid the previous 24h-bug if a server returns
         # an absurd Retry-After.
         return float(min(retry_after, 3600.0))
-    if not isinstance(status_code, int) and isinstance(
-        exc, (asyncio.TimeoutError, TimeoutError)
-    ):
+    if not isinstance(status_code, int) and _is_timeout_shaped(exc):
         try:
             return float(_get_plugin_cfg(None).get("timeout_cooldown_s", _DEFAULT_TIMEOUT_COOLDOWN_S))
         except Exception:
@@ -1693,6 +1740,7 @@ async def _patched_call_utility_model(
     cycle_count = 0
     attempt = 0
     tried_this_cycle = 0  # how many models we actually CALLed (not skipped)
+    empty_passes = 0  # v2.8.3: consecutive all-skipped passes (spin backoff)
     cycle_permanent_count = 0  # subset of tried_this_cycle that hit a permanent error
     early_exit_enabled: bool = bool(plugin_cfg.get("early_exit_on_all_permanent", True))
     responses_5xx_retry_enabled: bool = bool(
@@ -1997,11 +2045,36 @@ async def _patched_call_utility_model(
         # candidate index exactly once without hitting the `continue` above.
         if attempt > 0 and attempt % n == 0:
             if tried_this_cycle == 0:
-                # Every model in this pass was skipped (all in cooldown).
-                # Don't count it as a "cycle" -- just wait a bit and try
-                # the same set again. The shortest cooldown among them
-                # determines when the next real attempt can happen.
-                await asyncio.sleep(2.0)
+                # Every model in this pass was skipped (all in cooldown or
+                # dead-marked). Don't count it as a "cycle" -- just wait a
+                # bit and try the same set again. The shortest cooldown
+                # among them determines when the next real attempt can
+                # happen.
+                # v2.8.3: bound the flat 2s spin. When EVERY candidate is
+                # dead-marked (e.g. a 24h cross-agent 404 entry), this path
+                # used to loop every 2s for the entire dead TTL with no
+                # backoff and, in legacy mode, no exit at all. Escalate the
+                # spin with the stagnation factor (capped at
+                # max_cycle_delay_s); in legacy mode, treat persistent
+                # all-skipped as exhaustion so max_cycles /
+                # RetryAfterHours govern again.
+                empty_passes += 1
+                spin_s = min(
+                    2.0 * (cycle_stagnation_factor ** empty_passes),
+                    max_cycle_delay_s,
+                )
+                if backoff_jitter_s > 0:
+                    spin_s += random.uniform(0.0, backoff_jitter_s)
+                if not continuous_mode and empty_passes >= 3:
+                    cycle_count += 1
+                    _emit_fallback_summary(self, "utility", candidates)
+                    _maybe_raise_retry_after_hours(self, cycle_count, n, attempt)
+                    raise RuntimeError(
+                        f"All utility model candidates skipped "
+                        f"(cooldown/dead) for {empty_passes} consecutive "
+                        f"passes; exhausted."
+                    )
+                await asyncio.sleep(spin_s)
                 attempt = 0
                 tried_this_cycle = 0
                 cycle_permanent_count = 0
@@ -2077,6 +2150,7 @@ async def _patched_call_utility_model(
             await _yielding_sleep(attempt_delay)
 
         tried_this_cycle += 1
+        empty_passes = 0
         current_model = _build_model(candidates[idx], model_obj)
 
         # Strip A0-only / provider-invalid keys from the wrapper's kwargs right
@@ -2250,7 +2324,15 @@ async def _patched_call_utility_model(
             response, _reasoning = await _call_utility_model()
             return await _succeed(response)
 
-        except (asyncio.TimeoutError, TimeoutError, asyncio.CancelledError) as e:
+        except asyncio.CancelledError:
+            # External cancellation (user intervention, container shutdown,
+            # the outer utility-timeout guard's wait_for). Never treat it as
+            # a model timeout: bookkeeping a cooldown on a healthy label and
+            # rotating on would both swallow the cancel and let the outer
+            # wait_for keep awaiting us. The turn cascade already does this.
+            raise
+
+        except (asyncio.TimeoutError, TimeoutError) as e:
             warn = f"Utility model [{idx}] timed out after {int(effective_timeout_s)}s: {label}"
             self.context.log.log("warning", content=warn)
             PrintStyle(font_color="orange", padding=True).print(warn)
@@ -2279,6 +2361,15 @@ async def _patched_call_utility_model(
                 # Mark as permanent so it's not retried, then raise
                 _handle_error_cooldown(e, label, model_cooldowns, self, cand_api_base)
                 raise CodeError(e, f"utility model [{label}]")
+
+            # v2.8.3: a litellm.Timeout that escaped unified_call before our
+            # wait_for fired lands here (it is NOT a TimeoutError subclass).
+            # Evict the warm label and book the short timeout cooldown so
+            # provider-side timeouts follow the same policy as wait_for
+            # timeouts (fix A parity).
+            if _is_timeout_shaped(e):
+                _evict_warm_on_timeout(e, label)
+                _handle_error_cooldown(e, label, model_cooldowns, self, cand_api_base)
 
             is_json_err = isinstance(e, ValueError) and "valid JSON" in str(e)
             is_overflow = _is_context_overflow_error(e)
@@ -2460,6 +2551,7 @@ async def _patched_call_chat_model(
     cycle_count = 0
     attempt = 0
     tried_this_cycle = 0  # how many models we actually CALLed (not skipped)
+    empty_passes = 0  # v2.8.3: consecutive all-skipped passes (spin backoff)
     cycle_permanent_count = 0
     early_exit_enabled: bool = bool(plugin_cfg.get("early_exit_on_all_permanent", True))
     responses_5xx_retry_enabled: bool = bool(
@@ -2698,10 +2790,30 @@ async def _patched_call_chat_model(
 
         if attempt > 0 and attempt % n == 0:
             if tried_this_cycle == 0:
-                # Every model in this pass was skipped (all in cooldown).
-                # Don't count it as a "cycle" -- just wait a bit and try
-                # the same set again.
-                await asyncio.sleep(2.0)
+                # Every model in this pass was skipped (all in cooldown or
+                # dead-marked). Don't count it as a "cycle" -- just wait a
+                # bit and try the same set again.
+                # v2.8.3: bound the flat 2s spin (same as the utility
+                # cascade): escalate with the stagnation factor, capped at
+                # max_cycle_delay_s; legacy mode exhausts instead of
+                # looping every 2s for a 24h dead-label TTL.
+                empty_passes += 1
+                spin_s = min(
+                    2.0 * (cycle_stagnation_factor ** empty_passes),
+                    max_cycle_delay_s,
+                )
+                if backoff_jitter_s > 0:
+                    spin_s += random.uniform(0.0, backoff_jitter_s)
+                if not continuous_mode and empty_passes >= 3:
+                    cycle_count += 1
+                    _emit_fallback_summary(self, "chat", candidates)
+                    _maybe_raise_retry_after_hours(self, cycle_count, n, attempt)
+                    raise RuntimeError(
+                        f"All chat model candidates skipped "
+                        f"(cooldown/dead) for {empty_passes} consecutive "
+                        f"passes; exhausted."
+                    )
+                await asyncio.sleep(spin_s)
                 attempt = 0
                 tried_this_cycle = 0
                 cycle_permanent_count = 0
@@ -2767,6 +2879,7 @@ async def _patched_call_chat_model(
             await _yielding_sleep(attempt_delay)
 
         tried_this_cycle += 1
+        empty_passes = 0
         current_model = _build_model(candidates[idx], model_obj)
 
         # Strip A0-only / provider-invalid keys from the wrapper's kwargs right
@@ -2915,7 +3028,13 @@ async def _patched_call_chat_model(
             response, reasoning = await _call_chat_model()
             return await _succeed(response, reasoning)
 
-        except (asyncio.TimeoutError, TimeoutError, asyncio.CancelledError) as e:
+        except asyncio.CancelledError:
+            # External cancellation (user intervention, container shutdown).
+            # Never book a cooldown on a healthy label or rotate on -- the
+            # turn cascade already re-raises; mirror it here.
+            raise
+
+        except (asyncio.TimeoutError, TimeoutError) as e:
             warn = f"Chat model [{idx}] timed out after {int(effective_timeout_s)}s: {label}"
             self.context.log.log("warning", content=warn)
             PrintStyle(font_color="orange", padding=True).print(warn)
@@ -2938,6 +3057,11 @@ async def _patched_call_chat_model(
                 PrintStyle(font_color="red", padding=True).print(err_msg)
                 _handle_error_cooldown(e, label, model_cooldowns, self, cand_api_base)
                 raise CodeError(e, f"chat model [{label}]")
+
+            # v2.8.3: litellm.Timeout parity -- see the utility cascade.
+            if _is_timeout_shaped(e):
+                _evict_warm_on_timeout(e, label)
+                _handle_error_cooldown(e, label, model_cooldowns, self, cand_api_base)
 
             is_overflow = _is_context_overflow_error(e)
             err_type = "ContextOverflow" if is_overflow else type(e).__name__
@@ -3214,11 +3338,17 @@ async def _patched_call_chat_model_turn(
 
         # Per-candidate warm/cold timeout (same policy as the chat cascade).
         # A user TIMEOUT= model kwarg was already folded into ``timeout_s``
-        # above; the warm fast-path applies to kwarg-less presets.
-        effective_timeout_s = _resolve_per_call_timeout(
-            label, timeout_s, warm_timeout_s, warm_window_s,
-            self, cand_api_base,
-        )
+        # above; the warm fast-path applies to kwarg-less presets. Mirrors
+        # the chat cascade's user_kwarg_set guard: an explicit TIMEOUT=
+        # kwarg must win over the warm ceiling even on the turn path.
+        user_kwarg_set = "TIMEOUT" in model_kwargs or "timeout" in model_kwargs
+        if user_kwarg_set:
+            effective_timeout_s = timeout_s
+        else:
+            effective_timeout_s = _resolve_per_call_timeout(
+                label, timeout_s, warm_timeout_s, warm_window_s,
+                self, cand_api_base,
+            )
 
         if idx > 0:
             warn = f"Chat model (turn) switching to [{idx}/{n - 1}]: {label}"

@@ -16,7 +16,24 @@ class InstallFallbackPatches(Extension):
         # A stale fallback.py (e.g. a .pyc left over after a partial update on
         # a slow bind mount) must degrade gracefully -- an ImportError here
         # would kill Agent.__init__ and with it every new chat.
-        import usr.plugins._model_fallback.fallback as fb
+        # v2.8.3: the import itself is guarded too -- call_extensions_sync
+        # does not catch exceptions, so a SyntaxError/ImportError raised BY
+        # the fallback module import (broken sibling import chain, truncated
+        # file on a slow mount) would still kill Agent.__init__ for every
+        # new chat. No fallback coverage is better than no agent at all.
+        try:
+            import usr.plugins._model_fallback.fallback as fb
+        except Exception as import_exc:  # noqa: BLE001
+            try:
+                self.agent.context.log.log(
+                    "error",
+                    "Model Fallback System: failed to import fallback.py "
+                    f"({type(import_exc).__name__}: {import_exc}). No "
+                    "fallback coverage active this session.",
+                )
+            except Exception:
+                pass
+            return
 
         _patched_call_utility_model = getattr(
             fb, "_patched_call_utility_model", None)

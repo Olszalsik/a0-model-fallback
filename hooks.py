@@ -1,5 +1,11 @@
 """Public API and lifecycle hooks for the Model Fallback System plugin."""
 
+# v2.8.3: real data-key names (the old literal strings
+# "ext_retry_phase"/"ext_retry_at" didn't match what the cascade
+# reads/writes, so reset_fallback_settings never cleared them).
+DATA_KEY_EXT_RETRY_PHASE = "_mfb_ext_retry_phase"
+DATA_KEY_EXT_RETRY_AT = "_mfb_ext_retry_at"
+
 
 async def install():
     """Plugin installation hook.
@@ -148,8 +154,8 @@ def get_fallback_settings(agent) -> dict:
         "max_cycles": int(agent.get_data("fallback_max_cycles") or 4),
         "cycle_delay": float(agent.get_data("fallback_cycle_delay") or 5.0),
         "extended_retry_enabled": bool(agent.get_data("extended_retry_enabled") or True),
-        "phase_a_delay_s": float(agent.get_data("phase_a_delay_s") or 9000.0),
-        "phase_b_delay_s": float(agent.get_data("phase_b_delay_s") or 43200.0),
+        "phase_a_delay_s": float(agent.get_data("phase_a_delay_s") or 900.0),
+        "phase_b_delay_s": float(agent.get_data("phase_b_delay_s") or 3600.0),
         "initial_cycle_attempts": int(agent.get_data("initial_cycle_attempts") or 60),
     }
 
@@ -159,21 +165,43 @@ def reset_fallback_settings(agent):
     agent.set_data("fallback_max_cycles", 4)
     agent.set_data("fallback_cycle_delay", 5.0)
     agent.set_data("extended_retry_enabled", True)
-    agent.set_data("phase_a_delay_s", 9000.0)
-    agent.set_data("phase_b_delay_s", 43200.0)
+    agent.set_data("phase_a_delay_s", 900.0)
+    agent.set_data("phase_b_delay_s", 3600.0)
     agent.set_data("initial_cycle_attempts", 60)
-    agent.set_data("_model_cooldowns", {})
-    agent.set_data("ext_retry_phase", None)
-    agent.set_data("ext_retry_substep", None)
-    agent.set_data("ext_retry_at", None)
+    clear_cooldowns(agent)
+    agent.set_data(DATA_KEY_EXT_RETRY_PHASE, None)
+    agent.set_data(DATA_KEY_EXT_RETRY_AT, None)
     return get_fallback_settings(agent)
 
 
 def clear_cooldowns(agent):
-    """Clear all model cooldowns (useful for testing or after adding credits)."""
+    """Clear all model cooldowns (useful for testing or after adding credits).
+
+    v2.8.3: the authoritative store is the in-memory _INMEM_COOLDOWNS
+    dict (seeded from agent.data only on first use after a restart) --
+    the old version wiped the legacy ``_model_cooldowns`` data key and
+    left the live store untouched, making this a silent no-op.
+    """
+    try:
+        from usr.plugins._model_fallback import fallback as _fb
+        cleared = _fb.clear_all_cooldowns(agent)
+    except Exception:  # noqa: BLE001
+        cleared = 0
     agent.set_data("_model_cooldowns", {})
+    return cleared
 
 
 def get_cooldowns(agent) -> dict:
-    """Get current model cooldowns for inspection."""
+    """Get current model cooldowns for inspection.
+
+    v2.8.3: reads the live in-memory store (falling back to the
+    persisted snapshot) instead of the legacy data key nothing writes.
+    """
+    try:
+        from usr.plugins._model_fallback import fallback as _fb
+        live = _fb.snapshot_cooldowns(agent)
+        if live:
+            return live
+    except Exception:  # noqa: BLE001
+        pass
     return agent.get_data("_model_cooldowns") or {}

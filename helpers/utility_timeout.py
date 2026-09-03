@@ -64,10 +64,15 @@ _log = logging.getLogger("model_fallback.utility_timeout")
 
 # Default config. Mirrored from default_config.yaml so unit tests that
 # don't load the plugin config still get sane numbers.
+# v2.8.3: synced to the YAML values (60s/180s, raised from 30/120 on
+# 2026-07-23). The YAML raise never took effect at runtime because
+# get_plugin_config does not merge default_config.yaml and config.json
+# had no nested section -- _resolve_config now merges the YAML, and
+# these DEFAULTS stay in sync as the last fallback.
 DEFAULTS: Dict[str, Any] = {
     "enabled": True,
-    "default_timeout_s": 30.0,
-    "max_wait_s": 120.0,
+    "default_timeout_s": 60.0,
+    "max_wait_s": 180.0,
     "jitter_s": 1.0,
     "close_inner_on_timeout": True,
 }

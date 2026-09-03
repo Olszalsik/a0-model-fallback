@@ -47,6 +47,23 @@ def _resolve_config(agent) -> Dict[str, Any]:
     try:
         from helpers import plugins as plugin_helpers  # type: ignore
         cfg = plugin_helpers.get_plugin_config("_model_fallback", agent) or {}
+        # v2.8.3: get_plugin_config returns config.json WITHOUT merging
+        # default_config.yaml, so the YAML's ``utility_timeout_guard:``
+        # section (60s/180s, raised 2026-07-23) never reached the
+        # runtime and DEFAULTS' stale 30s/120s won instead. Merge the
+        # YAML defaults UNDER config.json so YAML edits are effective
+        # and user config.json values still win.
+        try:
+            defaults = plugin_helpers.get_default_plugin_config(
+                "_model_fallback"
+            ) or {}
+            if isinstance(defaults, dict):
+                merged = dict(defaults)
+                if isinstance(cfg, dict):
+                    merged.update(cfg)
+                cfg = merged
+        except Exception:  # noqa: BLE001
+            pass
     except Exception:  # noqa: BLE001
         cfg = {}
     # v2.5 WebUI: top-level ``utility_timeout_guard_enabled`` wins
@@ -107,7 +124,11 @@ def _install(agent: Agent | None) -> bool:
         return await utility_timeout.guarded_call(
             _inner,
             model_name=model_name,
-            config_overrides=cfg,
+            # v2.8.3: pass None so guarded_call reads get_resolved() --
+            # the closure dict ``cfg`` is frozen at install time, so a
+            # later config change (refreshed via set_resolved on the
+            # sentinel branch) never reached the wrapper.
+            config_overrides=None,
         )
 
     wrapped._utility_timeout_patched = True  # type: ignore[attr-defined]

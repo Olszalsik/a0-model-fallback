@@ -31,7 +31,14 @@ import os
 import sys
 from pathlib import Path
 
-REPO_ROOT = Path(os.environ.get("REPO_ROOT_OVERRIDE") or "/a0")
+REPO_ROOT = Path(
+    os.environ.get("REPO_ROOT_OVERRIDE")
+    # v2.8.3: default to THIS FILE's repo root (works on both the
+    # container's /a0 mount and a Windows host checkout) instead of
+    # hardcoding /a0, which made all four tests FileNotFoundError on
+    # the host. REPO_ROOT_OVERRIDE still wins for container runs.
+    or Path(__file__).resolve().parents[4]
+)
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 

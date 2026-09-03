@@ -95,6 +95,91 @@ module globals mid-suite. Anything resolved via import-time from-imports
 (`_INMEM_COOLDOWNS`, `RetryAfterHours`, ...) is a stale object afterwards.
 New tests must read module state through `fallback.<name>` at call time.
 
+### v2.8.3 — audit fixes: timeout parity, config-merge, spin backoff (2026-09-03)
+
+Full-audit pass (independent code review of fallback.py + all extensions;
+203/203 tests). Nine findings, seven fixed:
+
+- **Utility guard ran at 30s, not the YAML's 60s (F1, HIGH).**
+  `get_plugin_config` returns config.json WITHOUT merging
+  `default_config.yaml`, config.json has no nested
+  `utility_timeout_guard:` section, and `DEFAULTS` still held the stale
+  30s/120s values — so the 2026-07-23 raise to 60/180 never took effect
+  at runtime and the outer guard killed cold-start cascades at ~31s
+  (the known "cascade cold-start timeout" symptom). Fixed three ways:
+  `_resolve_config` now merges `get_default_plugin_config()` under
+  config.json; `DEFAULTS` synced to 60/180; nested block added to
+  config.json.
+- **Stale closure on the utility guard (F6).** `wrapped` passed
+  `config_overrides=cfg` — the dict frozen at install time — so config
+  changes never reached `guarded_call` until process restart. Now
+  `config_overrides=None` (reads the refreshed `get_resolved()`).
+- **Turn cascade ignored the user `TIMEOUT=` kwarg (F2, HIGH).** The
+  chat/utility cascades skip the warm fast-path when the model kwargs
+  carry `TIMEOUT=`/`timeout=` ("user-set TIMEOUT= still wins"); the
+  v2.8.0 turn cascade omitted the guard, so a warm label capped an
+  explicit 300s TIMEOUT at the 20s warm ceiling on the MAIN agent loop,
+  then booked a cooldown and rotated. Guard mirrored.
+- **`CancelledError` swallowed by both cascade outer handlers (F4).**
+  `except (TimeoutError, ..., CancelledError)` treated external
+  cancellation (user intervention, the outer guard's wait_for) as a
+  model timeout — booked a 300s cooldown on a healthy label, rotated on,
+  and let the outer `wait_for` keep awaiting the suppressed cancel. Both
+  cascades now re-raise `CancelledError` before the timeout tuple (the
+  turn cascade already did).
+- **`litellm.Timeout` is not a `TimeoutError` (F5).** Its MRO runs
+  `Timeout → APITimeoutError → APIConnectionError → APIError`, so a
+  provider-side pure timeout that escaped `unified_call` before the
+  cascade's `wait_for` hit the 300s unknown-error default AND kept its
+  warm label — recreating the 20s warm-ceiling loop fix A (v2.6.4)
+  closed, for provider-side timeouts. New `_is_timeout_shaped()`
+  recognizes it: `_cooldown_seconds_for_status` books the short
+  `timeout_cooldown_s` and both cascades' generic `except` branch now
+  evicts the warm label for timeout-shaped errors.
+- **Context-size guard toggle was a silent no-op (F3).** config.json
+  carries only `context_size_guard_enabled: true`; with no nested
+  section and no YAML merge, `resolve_config({})` → `enabled: False`
+  from DEFAULTS while the WebUI toggle said ON. The toggle now wins
+  over the nested section (same precedence rule as the utility guard).
+- **All-skipped spin livelock (F7).** When every candidate was
+  cooldown-skipped or dead-marked, both cascades slept a flat 2.0s
+  forever — no backoff, no exit even in legacy mode (a 24h cross-agent
+  404 mark = 2s spin for a day). Empty passes now escalate with
+  `cycle_stagnation_factor` (capped at `max_cycle_delay_s`, jitter
+  applied); legacy mode exhausts after 3 empty passes via
+  `_maybe_raise_retry_after_hours` + `RuntimeError`, matching the
+  documented legacy contract. Continuous mode keeps cycling (liveness
+  invariant) but with the escalated sleeps.
+- **hooks.py cooldown API was dead (F9).** `clear_cooldowns` wiped the
+  legacy `_model_cooldowns` data key while the live
+  `_INMEM_COOLDOWNS` store kept running; `get_cooldowns` read a key
+  nothing writes; reset used the wrong ext-retry key names and stale
+  9000/43200 defaults. Now operates on the live store via new public
+  helpers `fallback.snapshot_cooldowns()` / `fallback.clear_all_cooldowns()`
+  and the real `DATA_KEY_EXT_RETRY_*` names; defaults match config.json
+  (900/3600).
+- **Hardening (v2.8.1 residual):** `_00_install_fallback_patches.py` now
+  guards the `import fallback` itself — `call_extensions_sync` does not
+  catch exceptions, so an import-time SyntaxError/ImportError in the
+  module chain still killed `Agent.__init__` for every new chat.
+
+Flagged, NOT fixed (policy/feature calls, per "flag not autofix"):
+- F8: a malformed-JSON response books the 300s unknown-error cooldown on
+  a healthy model (two slips ≈ rotate away from a working model for
+  5 min). Deliberate rotation; the *duration* is the questionable part.
+- Side-findings: `api/stats.py` hardcodes `"version": "2.6.8"`;
+  `force_chat_completions_providers` is dead at runtime (only the
+  `api_bases` matcher is wired); the turn path tracks
+  `_consecutive_primary_failures` but never escalates (primary-skip not
+  wired on the turn path); `_strip_a0_only_kwargs` runs on idx=0 too and
+  permanently pops `venice_parameters` off the live primary model object.
+
+Tests: `tests/test_v283_audit_fixes.py` (9 tests: litellm.Timeout
+classification, turn-kwarg tripwire, DEFAULTS sync, YAML merge reach,
+toggle-wins, hooks live-store API). Suite 203/203. Also fixed
+`test_utility_timeout_floor.py` hardcoding `/a0` (now repo-relative, so
+the 4 floor tests run on host checkouts too).
+
 ### v2.8.2 — memory recall patches must bind the FRAMEWORK classes (2026-09-01)
 
 `extensions/python/monologue_start/_10_memory_recall_patches.py` had the
