@@ -273,6 +273,15 @@ def _clear_cooldown_early(fb, agent, label: str) -> None:
             _counters["cooldowns_cleared_early"] = (
                 _counters["cooldowns_cleared_early"] + 1
             )
+            # v2.9.1: route event -- distinguishes probe recovery from a
+            # live-call recovery (cooldown_cleared_by_success).
+            try:
+                from usr.plugins._model_fallback.helpers import events
+                events.record_event(
+                    "cooldown_cleared_early", agent=agent, label=label
+                )
+            except Exception:  # noqa: BLE001
+                pass
         fb._mark_label_healthy(agent, label)
         try:
             agent.context.log.log(

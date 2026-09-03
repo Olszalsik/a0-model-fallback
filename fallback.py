@@ -41,6 +41,10 @@ from helpers import extract_tools, extension, plugins
 from helpers.dirty_json import DirtyJson
 from helpers.print_style import PrintStyle
 
+# v2.9.1: routing event log (ring buffer; no import cycle -- events.py
+# imports nothing from the plugin).
+from usr.plugins._model_fallback.helpers import events
+
 # All model-related helpers are now local to the plugin (models_ext.py)
 from usr.plugins._model_fallback.models_ext import (
     _is_code_error,
@@ -496,6 +500,14 @@ def clear_all_cooldowns(agent, *, cross_context: bool = False) -> int:
         agent.set_data(DATA_KEY_COOLDOWN_LAST_STATUS, {})
     except Exception:  # noqa: BLE001
         pass  # best-effort persistence
+    # v2.9.1: route event -- user-initiated clears (button / hooks API)
+    # reset rotation state and should be visible in the event timeline.
+    events.record_event(
+        "cooldowns_cleared",
+        agent=agent,
+        count=cleared,
+        cross_context=bool(cross_context),
+    )
     return cleared
 
 
@@ -1181,6 +1193,15 @@ def _mark_label_dead(label: str, exc, agent=None, api_base: str = "") -> None:
     # A fresh dead-mark supersedes any stale healthy signal (symmetric
     # with _mark_label_healthy clearing the dead index).
     _INMEM_HEALTHY_LABELS.pop(label, None)
+    # v2.9.1: route event -- a dead-mark starves every agent for `dur`
+    # seconds and is otherwise invisible until the TTL log line.
+    events.record_event(
+        "label_dead",
+        agent=agent,
+        label=label,
+        status_code=status_code,
+        dead_s=round(dur, 1),
+    )
     try:
         log_fn = getattr(getattr(agent, "context", None), "log", None)
         if log_fn is not None:
@@ -1454,6 +1475,41 @@ def _capacity_skips_cooldown(label: str, agent=None, api_base: str = "") -> bool
 
 
 def _handle_error_cooldown(
+    e, label, model_cooldowns, agent, api_base: str = "", probe_model=None
+):
+    """Thin wrapper around _handle_error_cooldown_impl (v2.9.1).
+
+    Records a ``cooldown_booked`` event whenever the call writes a NEW or
+    EXTENDED cooldown for ``label``. Booking is detected by comparing the
+    store entry before/after, so every branch (rate limit, permanent,
+    router, format slip, overflow) is covered without touching any of
+    them -- and a dur=0 "no cooldown" outcome records nothing.
+    """
+    had_before = (
+        model_cooldowns.get(label) if isinstance(model_cooldowns, dict) else None
+    )
+    booked = _handle_error_cooldown_impl(
+        e, label, model_cooldowns, agent, api_base, probe_model
+    )
+    try:
+        until = (
+            model_cooldowns.get(label) if isinstance(model_cooldowns, dict) else None
+        )
+        if booked and until is not None and until != had_before:
+            events.record_event(
+                "cooldown_booked",
+                agent=agent,
+                label=label,
+                cooldown_s=round(max(0.0, until - time.monotonic()), 1),
+                status_code=getattr(e, "status_code", None),
+                error=type(e).__name__,
+            )
+    except Exception:  # noqa: BLE001
+        pass
+    return booked
+
+
+def _handle_error_cooldown_impl(
     e, label, model_cooldowns, agent, api_base: str = "", probe_model=None
 ):
     """Apply cooldown logic to a failed model. Returns True if model was cooldowned.
@@ -1925,6 +1981,16 @@ def _emit_fallback_summary(agent, kind: str, candidates: list) -> None:
             f"{sum(permanent_buckets.values())} permanent ({breakdown}), "
             f"{transient_count} transient, {unknown_count} unknown."
         )
+        # v2.9.1: route event -- exhaustion is the plugin's worst outcome;
+        # the event carries the same breakdown the error log line does.
+        events.record_event(
+            "cascade_exhausted",
+            agent=agent,
+            cascade_kind=kind,
+            candidates=len(labels),
+            permanent=sum(permanent_buckets.values()),
+            transient=transient_count,
+        )
         try:
             agent.context.log.log("error", content=msg)
         except Exception:
@@ -2208,6 +2274,15 @@ async def _patched_call_utility_model(
             return  # existing cooldown is already longer, don't shorten
         model_cooldowns[label] = target_until
         _save_cooldown_store(self, model_cooldowns)
+        # v2.9.1: route event -- the escalation is invisible in counters
+        # (it only extends an existing cooldown), so log it explicitly.
+        events.record_event(
+            "primary_skip_escalated",
+            agent=self,
+            label=label,
+            cooldown_s=round(target_until - time.monotonic(), 1),
+            strikes=int(_consecutive_primary_failures),
+        )
         # ``use_utility_models`` is a parameter of the chat cascade (default
         # False) and is implicit True inside the utility cascade. We
         # disambiguate via the caller-supplied label so the helper stays
@@ -2544,7 +2619,13 @@ async def _patched_call_utility_model(
             # rotation index, clear extended-retry state, emit after-hook.
             _validate_json_response(response, call_data)
             # Success -- clear cooldown for this model
-            model_cooldowns.pop(label, None)
+            _popped_until = model_cooldowns.pop(label, None)
+            if _popped_until is not None:
+                # v2.9.1: real recovery -- a live call succeeded on a label
+                # that was in cooldown (distinct from a probe clearing it).
+                events.record_event(
+                    "cooldown_cleared_by_success", agent=self, label=label
+                )
             _save_cooldown_store(self, model_cooldowns)
             # v2.5.2: cross-agent healthy-label reset. Mark this label
             # healthy for `health_horizon_s` so other agents' cooldowns
@@ -3106,6 +3187,15 @@ async def _patched_call_chat_model(
             return  # existing cooldown is already longer, don't shorten
         model_cooldowns[label] = target_until
         _save_cooldown_store(self, model_cooldowns)
+        # v2.9.1: route event -- the escalation is invisible in counters
+        # (it only extends an existing cooldown), so log it explicitly.
+        events.record_event(
+            "primary_skip_escalated",
+            agent=self,
+            label=label,
+            cooldown_s=round(target_until - time.monotonic(), 1),
+            strikes=int(_consecutive_primary_failures),
+        )
         # ``use_utility_models`` is a parameter of the chat cascade (default
         # False) and is implicit True inside the utility cascade. We
         # disambiguate via the caller-supplied label so the helper stays
@@ -3399,7 +3489,13 @@ async def _patched_call_chat_model(
                 if tool_request is not None:
                     await self.validate_tool_request(tool_request)
             # Success -- clear cooldown for this model
-            model_cooldowns.pop(label, None)
+            _popped_until = model_cooldowns.pop(label, None)
+            if _popped_until is not None:
+                # v2.9.1: real recovery -- a live call succeeded on a label
+                # that was in cooldown (distinct from a probe clearing it).
+                events.record_event(
+                    "cooldown_cleared_by_success", agent=self, label=label
+                )
             _save_cooldown_store(self, model_cooldowns)
             # v2.5.2: cross-agent healthy-label reset. See
             # _mark_label_healthy / _maybe_clear_cooldown_for_healthy_label.
@@ -3914,6 +4010,15 @@ async def _patched_call_chat_model_turn(
             return  # existing cooldown is already longer, don't shorten
         model_cooldowns[label] = target_until
         _save_cooldown_store(self, model_cooldowns)
+        # v2.9.1: route event -- the escalation is invisible in counters
+        # (it only extends an existing cooldown), so log it explicitly.
+        events.record_event(
+            "primary_skip_escalated",
+            agent=self,
+            label=label,
+            cooldown_s=round(target_until - time.monotonic(), 1),
+            strikes=int(_consecutive_primary_failures),
+        )
         try:
             self.context.log.log(
                 "warning",
@@ -4160,7 +4265,13 @@ async def _patched_call_chat_model_turn(
             continue
 
         # --- Success ---------------------------------------------------------
-        model_cooldowns.pop(label, None)
+        _popped_until = model_cooldowns.pop(label, None)
+        if _popped_until is not None:
+            # v2.9.1: real recovery -- a live call succeeded on a label
+            # that was in cooldown (distinct from a probe clearing it).
+            events.record_event(
+                "cooldown_cleared_by_success", agent=self, label=label
+            )
         _save_cooldown_store(self, model_cooldowns)
         _mark_label_healthy(self, label)
         _WARM_LABELS[label] = time.monotonic()

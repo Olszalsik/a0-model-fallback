@@ -239,6 +239,12 @@ def reset_fallback_settings(agent):
         agent.set_data(_fb.DATA_KEY_TURN_PRIMARY_FAILS_AT, 0)
     except Exception:  # noqa: BLE001
         pass
+    # v2.9.1: the event timeline is runtime state -- reset goes with it.
+    try:
+        from usr.plugins._model_fallback.helpers import events
+        events.reset_events()
+    except Exception:  # noqa: BLE001
+        pass
     return get_fallback_settings(agent)
 
 

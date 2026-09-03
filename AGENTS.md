@@ -23,6 +23,40 @@ provider going dark for hours is normal operating conditions, not a failure.
 Both wrappers share the same contract: build a candidate list from the active
 preset (`_build_candidates`), then loop through candidates until one succeeds.
 
+### v2.9.1 — routing event log (2026-09-03)
+
+Observability (roadmap item 1). Full suite 253/253 (+17 tests in
+`test_events_log.py`).
+
+**Problem.** Routing state lived in three disconnected places: counters
+(`/stats`), context log lines (die with the context), and in-memory dicts.
+Answering "what happened to model routing in the last hour" required
+reconstructing from all three.
+
+**Mechanism** (`helpers/events.py`): a bounded in-memory ring buffer
+(`deque(maxlen=500)`), thread-safe, `record_event` never raises and
+coerces every field to JSON-safe values. No persistence by design —
+routing decisions are transient state and a restart resets them anyway.
+
+Event kinds (all recorded by fallback.py / recovery_probe.py):
+
+| Kind | Meaning | Recorded at |
+|---|---|---|
+| `cooldown_booked` | candidate entered/extended cooldown | thin wrapper around `_handle_error_cooldown_impl` — detects a booking by comparing the store entry before/after, so ALL booking branches are covered without touching them (dur=0 no-book outcomes record nothing) |
+| `cooldown_cleared_early` | recovery probe succeeded (v2.9.0) | `recovery_probe._clear_cooldown_early` |
+| `cooldown_cleared_by_success` | a LIVE call succeeded on a label that was in cooldown (real recovery — distinct from probe recovery) | all 3 cascade success paths (utility/chat/turn) |
+| `primary_skip_escalated` | primary-skip escalation wrote a long cooldown for candidate 0 | all 3 `_maybe_extend_primary_cooldown` closures |
+| `label_dead` | cross-agent dead-mark written | `_mark_label_dead` |
+| `cooldowns_cleared` | user-initiated clear (button / hooks API) | `clear_all_cooldowns` (carries `count` + `cross_context`) |
+| `cascade_exhausted` | all candidates failed, RetryAfterHours imminent | `_emit_fallback_summary` (field `cascade_kind`, NOT `kind` — `kind` is `record_event`'s own positional param; passing `kind=kind` raises `TypeError` which the summary's blanket `except` swallows → silently no event. GOTCHA.) |
+
+**Endpoint** (`api/events.py`, route `POST /api/plugins/_model_fallback/events`):
+returns `{"version", "kinds", "count", "events": [...]}` newest-first.
+Optional filters: `limit` (1..500, default 100), `kind`, `context`,
+`label`. Auth+CSRF inherited defaults (same as `/stats`). Runtime only —
+`hooks.reset_fallback_settings` clears the buffer alongside the other
+reset state.
+
 ### v2.9.0 — background recovery probes (2026-09-03)
 
 New capability (first proactive feature — the plugin previously acted only
