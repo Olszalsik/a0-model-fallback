@@ -33,6 +33,7 @@ Fixes bundled here:
 """
 
 import asyncio
+import os
 import time
 from typing import Any, Callable, Awaitable, List, Tuple, Optional
 
@@ -396,13 +397,28 @@ def clear_all_cooldowns(agent) -> int:
 
     v2.8.3 public API (hooks.clear_cooldowns). Returns the number of
     labels that were in cooldown.
+
+    v2.8.4: mutate the EXISTING in-memory dict in place instead of
+    swapping in a fresh literal. A live cascade holds ``model_cooldowns``
+    (the same object) for the duration of a multi-minute call and writes
+    it back on success/escalation -- with the literal swap, a
+    "Clear cooldowns" pressed mid-turn was silently undone and the stale
+    cooldowns resurrected. Same class as the v2.8.1 ``or {}`` wipe.
     """
     agent_id = getattr(agent, "context", None)
     agent_id = getattr(agent_id, "id", None) or id(agent)
     key = ("__global__",) if agent_id is None else (str(agent_id),)
     store = _INMEM_COOLDOWNS.get(key)
-    cleared = len(store) if isinstance(store, dict) else 0
-    _save_cooldown_store(agent, {})
+    if not isinstance(store, dict):
+        store = {}
+        _INMEM_COOLDOWNS[key] = store
+    cleared = len(store)
+    store.clear()
+    try:
+        agent.set_data(DATA_KEY_COOLDOWNS, {})
+        agent.set_data(DATA_KEY_COOLDOWN_SEED_AT, time.time())
+    except Exception:  # noqa: BLE001
+        pass  # best-effort persistence
     return cleared
 
 
@@ -1526,11 +1542,59 @@ def _format_exception(exc: Exception) -> str:
     return f"{name}: {msg}"
 
 
+_PLUGIN_DEFAULTS_CACHE: dict = {"mtime": None, "cfg": None}
+
+
+def _get_merged_defaults() -> dict:
+    """default_config.yaml contents, mtime-keyed cached (v2.8.4).
+
+    get_plugin_config does NOT merge default_config.yaml with config.json
+    (the gotcha that killed the v2.6.7 router detection, then the
+    force_chat_* lists in models_ext, and then this file's own
+    format_error_cooldown_s knob -- every YAML-only knob was dead unless
+    the user hand-copied it into config.json). Merging at _get_plugin_cfg
+    fixes every knob at once. The cache avoids a YAML parse per LLM call;
+    the mtime key means an edited YAML is picked up without a restart.
+    """
+    try:
+        from helpers import files as _files
+
+        path = _files.get_abs_path(
+            "usr", "plugins", "_model_fallback", "default_config.yaml"
+        )
+        mtime = os.path.getmtime(path) if os.path.exists(path) else None
+    except Exception:  # noqa: BLE001
+        mtime = None
+    if mtime is not None and _PLUGIN_DEFAULTS_CACHE["mtime"] == mtime:
+        cached = _PLUGIN_DEFAULTS_CACHE["cfg"]
+        if isinstance(cached, dict):
+            return cached
+    try:
+        defaults = plugins.get_default_plugin_config("_model_fallback")
+        if not isinstance(defaults, dict):
+            defaults = {}
+    except Exception:  # noqa: BLE001
+        defaults = {}
+    _PLUGIN_DEFAULTS_CACHE["mtime"] = mtime
+    _PLUGIN_DEFAULTS_CACHE["cfg"] = defaults
+    return defaults
+
+
 def _get_plugin_cfg(agent) -> dict:
-    """Safely load plugin config (handles None, bad types)."""
+    """Safely load plugin config (handles None, bad types).
+
+    v2.8.4: default_config.yaml is merged UNDER the live config.json/scope
+    result, so every knob documented in the YAML is actually live without
+    being duplicated into config.json.
+    """
     cfg = plugins.get_plugin_config("_model_fallback", agent) or {}
     if not isinstance(cfg, dict):
         cfg = {}
+    defaults = _get_merged_defaults()
+    if defaults:
+        merged = dict(defaults)
+        merged.update(cfg)
+        return merged
     return cfg
 
 
@@ -2435,6 +2499,7 @@ async def _patched_call_utility_model(
 
         except Exception as e:
             # Code-level errors: fail fast -- don't cycle through all candidates
+            timeout_cooldown_booked = False  # v2.8.4: dedupe double-booking
             if _is_code_error(e):
                 err_msg = (
                     f"Utility model [{idx}] CODE ERROR ({type(e).__name__}): "
@@ -2451,10 +2516,13 @@ async def _patched_call_utility_model(
             # wait_for fired lands here (it is NOT a TimeoutError subclass).
             # Evict the warm label and book the short timeout cooldown so
             # provider-side timeouts follow the same policy as wait_for
-            # timeouts (fix A parity).
+            # timeouts (fix A parity). v2.8.4: mark booked -- the
+            # unconditional call at the bottom of this handler used to
+            # compute and write the identical cooldown a second time.
             if _is_timeout_shaped(e):
                 _evict_warm_on_timeout(e, label)
                 _handle_error_cooldown(e, label, model_cooldowns, self, cand_api_base)
+                timeout_cooldown_booked = True
 
             is_json_err = isinstance(e, ValueError) and "valid JSON" in str(e)
             is_overflow = _is_context_overflow_error(e)
@@ -2496,7 +2564,10 @@ async def _patched_call_utility_model(
                     # cooldown + advance. Keep the original exception `e`.
                     pass
 
-            _handle_error_cooldown(e, label, model_cooldowns, self, cand_api_base)
+            # v2.8.4: skip when the litellm.Timeout branch above already
+            # booked the identical cooldown (was a benign double-write).
+            if not timeout_cooldown_booked:
+                _handle_error_cooldown(e, label, model_cooldowns, self, cand_api_base)
             # v2.5.1: same primary-skip escalation for the general error
             # path. The helper is a no-op when idx != 0.
             _maybe_extend_primary_cooldown(reason=type(e).__name__)
@@ -3130,10 +3201,16 @@ async def _patched_call_chat_model(
             # timeout handler + _evict_warm_on_timeout for the rationale).
             _evict_warm_on_timeout(e, label)
             _handle_error_cooldown(e, label, model_cooldowns, self, cand_api_base)
+            # v2.8.4: the utility cascade escalates the primary on repeated
+            # timeouts (v2.5.1); this branch never did, so a chat primary
+            # that hangs every cycle re-paid the full timeout tax each
+            # cycle. Parity now.
+            _maybe_extend_primary_cooldown(reason="timeout")
             # Timeouts are transient.
 
         except Exception as e:
             # Code-level errors: fail fast -- don't cycle through all candidates
+            timeout_cooldown_booked = False  # v2.8.4: dedupe double-booking
             if _is_code_error(e):
                 err_msg = (
                     f"Chat model [{idx}] CODE ERROR ({type(e).__name__}): "
@@ -3146,9 +3223,12 @@ async def _patched_call_chat_model(
                 raise CodeError(e, f"chat model [{label}]")
 
             # v2.8.3: litellm.Timeout parity -- see the utility cascade.
+            # v2.8.4: mark booked -- the unconditional call at the bottom
+            # of this handler used to write the identical cooldown twice.
             if _is_timeout_shaped(e):
                 _evict_warm_on_timeout(e, label)
                 _handle_error_cooldown(e, label, model_cooldowns, self, cand_api_base)
+                timeout_cooldown_booked = True
 
             is_overflow = _is_context_overflow_error(e)
             err_type = "ContextOverflow" if is_overflow else type(e).__name__
@@ -3185,7 +3265,10 @@ async def _patched_call_chat_model(
                     # cooldown + advance. Keep the original exception `e`.
                     pass
 
-            _handle_error_cooldown(e, label, model_cooldowns, self, cand_api_base)
+            # v2.8.4: skip when the litellm.Timeout branch above already
+            # booked the identical cooldown (was a benign double-write).
+            if not timeout_cooldown_booked:
+                _handle_error_cooldown(e, label, model_cooldowns, self, cand_api_base)
             # v2.5.1: same primary-skip escalation for the general error
             # path. The helper is a no-op when idx != 0.
             _maybe_extend_primary_cooldown(reason=type(e).__name__)
@@ -3356,7 +3439,7 @@ async def _patched_call_chat_model_turn(
             if not bool(cfg.get("primary_skip_enabled", True)):
                 return
             strikes = max(1, int(cfg.get("primary_skip_strikes", 2)))
-            cooldown_s = max(30.0, float(cfg.get("primary_skip_cooldown_s", 600.0)))
+            cooldown_s = max(30.0, float(cfg.get("primary_skip_cooldown_s", 120.0)))
         except Exception:  # noqa: BLE001
             return
         if _consecutive_primary_failures < strikes:

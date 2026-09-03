@@ -133,6 +133,27 @@ Second pass (fixing the items the v2.8.3 audit flagged-not-fixed):
 
 Tests: `tests/test_v284_flagged_fixes.py`.
 
+### v2.8.4 follow-up — second-pass audit fixes (same day)
+
+- **`_get_plugin_cfg` now merges default_config.yaml under config.json**
+  (mtime-keyed cache in `_get_merged_defaults`). This was the ROOT CAUSE of
+  several flagged items: the `format_error_cooldown_s` knob, the
+  turn-helper's `primary_skip_*` knobs, and every other YAML-only knob were
+  dead config unless hand-copied into config.json. models_ext's own merge
+  stays (it can't call fallback.py — synthetic-module import direction).
+- Turn helper `primary_skip_cooldown_s` default corrected 600 → 120 (was
+  contradicting the YAML/chat/utility value of 120 — a turn-path chat
+  primary would have been escalated to 10 min while the utility path
+  escalated the same label to 2 min).
+- Chat cascade's dedicated timeout branch now calls
+  `_maybe_extend_primary_cooldown(reason="timeout")` (pre-existing gap:
+  the utility cascade did this since v2.5.1; the chat branch never did).
+- `clear_all_cooldowns` mutates the EXISTING in-memory store in place
+  instead of swapping a literal dict — a live cascade held the old object
+  and would have written stale cooldowns back over a mid-turn "Clear".
+- litellm.Timeout no longer books its cooldown twice in the chat/utility
+  generic handlers (`timeout_cooldown_booked` flag).
+
 ### v2.8.3 — audit fixes: timeout parity, config-merge, spin backoff (2026-09-03)
 
 Full-audit pass (independent code review of fallback.py + all extensions;
