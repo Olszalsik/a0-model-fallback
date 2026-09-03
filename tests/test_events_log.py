@@ -274,9 +274,10 @@ def test_kinds_constant_matches_documented_set():
 
 
 def test_escalation_site_records_event_structure():
-    # Structure check: all three cascade escalation sites (utility, chat,
-    # turn) write the event right after persisting the escalation.
+    # Structure check: the unified rotation engine (utility+chat share one
+    # copy since v3.0.0) and the turn cascade each write the event right
+    # after persisting the escalation.
     src = (Path(fb.__file__)).read_text(encoding="utf-8")
-    assert src.count('"primary_skip_escalated"') == 3
+    assert src.count('"primary_skip_escalated"') == 2
     # Every success-path pop records the cleared_by_success event.
-    assert src.count('"cooldown_cleared_by_success"') == 3
+    assert src.count('"cooldown_cleared_by_success"') == 2

@@ -80,9 +80,11 @@ def test_rotation_sites_use_new_helper():
     src = (Path(__file__).resolve().parent.parent / "fallback.py").read_text(
         encoding="utf-8"
     )
-    assert src.count("if _is_permanent_for_rotation(e):") == 2, (
-        "both cascades' cycle_permanent_count sites must use the "
-        "rotation-permanent helper"
+    assert src.count("if _is_permanent_for_rotation(e):") == 1, (
+        "the unified rotation engine's cycle_permanent_count site must use "
+        "the rotation-permanent helper (v3.0.0: utility+chat share ONE "
+        "engine; the turn cascade's gate is a different expression and "
+        "is asserted below)"
     )
     turn_start = src.index("async def _patched_call_chat_model_turn")
     turn_src = src[turn_start:]
@@ -101,8 +103,9 @@ def test_strike_decay_knob_and_persisted_timestamp():
     yaml_src = (root / "default_config.yaml").read_text(encoding="utf-8")
     assert "primary_strike_decay_s: 300" in yaml_src
     py_src = (root / "fallback.py").read_text(encoding="utf-8")
-    # Knob resolved in both cascades + read in the turn path + decay guard.
-    assert py_src.count("primary_strike_decay_s") >= 4
+    # Knob resolved in the unified engine + read in the turn path + decay
+    # guard (v3.0.0: the two cascades merged, so the site count dropped).
+    assert py_src.count("primary_strike_decay_s") >= 3
     assert 'DATA_KEY_TURN_PRIMARY_FAILS_AT = "mfb_turn_primary_fails_at"' in py_src
     turn_start = py_src.index("async def _patched_call_chat_model_turn")
     turn_src = py_src[turn_start:]

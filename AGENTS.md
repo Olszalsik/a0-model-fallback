@@ -16,12 +16,84 @@ provider going dark for hours is normal operating conditions, not a failure.
 
 | Method | Patched at | Purpose |
 |---|---|---|
-| `Agent.call_utility_model` | `_patched_call_utility_model`, `fallback.py:694` | Wraps the utility model call (used for memory, summarization, JSON validation, tool sub-tasks). |
-| `Agent.call_chat_model` | `_patched_call_chat_model`, `fallback.py:1075+` | Wraps the main chat model call (legacy path; still used by `_email_integration` / `_document_query`). |
+| `Agent.call_utility_model` | `_patched_call_utility_model` (thin adapter → `_run_rotation_cascade`), `fallback.py:2074+` | Wraps the utility model call (used for memory, summarization, JSON validation, tool sub-tasks). |
+| `Agent.call_chat_model` | `_patched_call_chat_model` (thin adapter → `_run_rotation_cascade`), `fallback.py:2062+` | Wraps the main chat model call (legacy path; still used by `_email_integration` / `_document_query`). |
 | `Agent.call_chat_model_turn` | `_patched_call_chat_model_turn` + `install_chat_turn_patch`, installed from the same `agent_init/_00_install_fallback_patches.py` | **v2.8.0** — the turn path. Since the v2.10/2.11 upstream merge the MAIN agent loop calls this (monologue → `unified_turn` → `LiteLLMTransport.astream`), not `call_chat_model`. Without this patch the chat cascade is dead code on every main-loop call and a single 429 kills the agent. |
 
 Both wrappers share the same contract: build a candidate list from the active
 preset (`_build_candidates`), then loop through candidates until one succeeds.
+
+### v3.0.0 — cascade unification (2026-09-03)
+
+Roadmap item 2. **`fallback.py` net −590 lines** (4,364 → 3,774). Full
+suite 269/269 (+16 characterization tests in `test_cascade_v300.py`).
+
+**Problem.** The utility (`_patched_call_utility_model`) and chat
+(`_patched_call_chat_model`) cascades were line-for-line copies differing
+only in ~10 parameters (log prefixes, summary kind, timeout cfg key,
+`use_utility_models` flag, hook names, call_data keys, unified_call
+kwargs, success validation, return shape). Historical bugs were repeatedly
+"fixed in one cascade, missed in the other": the pass-boundary placement
+(v2.8.5), the missing `nonlocal` (stagnation counter), the v2.6.1 chat
+warm-read gap, the v2.8.4 primary-escalation gap in the chat timeout
+branch. Every shared fix cost double review.
+
+**Mechanism.** ONE engine `_run_rotation_cascade(self, spec, model_obj)`
+(fallback.py:2102+) — the verbatim former utility-cascade body with the
+divergences parameterized by a `_CascadeSpec` (fallback.py:2074+). The
+two public functions remain as ~100-line thin adapters that keep the
+EXACT signatures (hard imports in
+`usr\extensions\python\_functions\a0\agent\Agent\{call_utility_model,call_chat_model}\start\_00_fallback_override.py`
+depend on the names) and build the spec's closures:
+
+- `call_data_builder(current_model)` → the per-candidate call_data dict
+- `inner_coro_builder(call_data)` → the fresh `unified_call` coroutine
+  (**SYNC builder returning the coroutine** — an `async def` here returns
+  a bare coroutine object instead and the engine's `await` fails; both
+  the initial call and the Responses-5xx retry rebuild go through it)
+- `success_prepare(call_data, response, reasoning)` → utility JSON
+  validation vs chat tool-request validation
+- `error_msg_fn(e, idx, label)` → the differing log-line shapes
+  (utility "Format Error"/`{err_type}:` vs chat `error ({err_type}):`)
+- `after_hook_fire(call_data, response, reasoning)` → utility's hook
+  contract does NOT receive `reasoning`; chat's does
+
+Preserved divergences (spec flags): `persist_idx_on_success` (utility's
+`_succeed` advances the rotation index via `_set_model_idx`; chat never
+did), `skip_remaining_suffix` (chat's cooldown-skip log appends
+" remaining"), `stagnation_prefix` ("Cascade" vs "Chat cascade"),
+`cycling_prefix`. The engine always returns `(response, reasoning)`;
+continuous-mode exhaustion returns `(None, None)` (the utility adapter
+unwraps to `None`, preserving its old contract).
+
+**In scope / NOT in scope.** The turn cascade (`_patched_call_chat_model_turn`)
+is structurally different (single pass, streaming guards, persisted
+counters) and was deliberately NOT unified — its remaining duplication is
+small and the streaming/persistence behavior of the main agent loop is
+not gambleable without live verification. Engine + spec sit BEFORE the
+turn banner so the turn-slice tests (`src.index("async def
+_patched_call_chat_model_turn")` windows) are unaffected.
+
+**Latent bug fixed (found by the v2.9.1 audit, plan-approved):** the
+empty-pass spin called `random.uniform` with NO `import random` in scope
+in BOTH loops — `NameError` on the first all-skipped pass when
+`backoff_jitter_s > 0` (the default is 2.0, so any real all-skipped
+roster would have crashed the cascade; the `_compute_cycle_sleep`
+closure had its own local import, which masked the bug there). Fix:
+module-level `import random`.
+
+**Safety net.** `tests/test_cascade_v300.py` — 16 characterization tests,
+parametrized utility+chat, written and verified GREEN against the
+pre-refactor v2.9.1 code and left UNCHANGED through the refactor. They
+pin the external contract: return shapes, hook names, rotation,
+cooldown booking, skip logging, exhaustion, continuous-mode sentinel,
+CancelledError propagation, fail-fast code errors, all-skipped spin.
+
+**Test updates required by design** (assertions follow the code, none
+weakened): `test_chat_warm_wiring_v26.py` co_varnames/co_names moved to
+the engine (+ new adapter-delegation test); `test_v286_flagged_fixes.py`
+`if _is_permanent_for_rotation(e):` 2→1, `primary_strike_decay_s` >=4
+→ >=3; `test_events_log.py` event-site counts 3→2 (engine + turn).
 
 ### v2.9.1 — routing event log (2026-09-03)
 
@@ -44,8 +116,8 @@ Event kinds (all recorded by fallback.py / recovery_probe.py):
 |---|---|---|
 | `cooldown_booked` | candidate entered/extended cooldown | thin wrapper around `_handle_error_cooldown_impl` — detects a booking by comparing the store entry before/after, so ALL booking branches are covered without touching them (dur=0 no-book outcomes record nothing) |
 | `cooldown_cleared_early` | recovery probe succeeded (v2.9.0) | `recovery_probe._clear_cooldown_early` |
-| `cooldown_cleared_by_success` | a LIVE call succeeded on a label that was in cooldown (real recovery — distinct from probe recovery) | all 3 cascade success paths (utility/chat/turn) |
-| `primary_skip_escalated` | primary-skip escalation wrote a long cooldown for candidate 0 | all 3 `_maybe_extend_primary_cooldown` closures |
+| `cooldown_cleared_by_success` | a LIVE call succeeded on a label that was in cooldown (real recovery — distinct from probe recovery) | engine + turn success paths (v3.0.0: the unified engine holds the utility+chat copy) |
+| `primary_skip_escalated` | primary-skip escalation wrote a long cooldown for candidate 0 | engine + turn `_maybe_extend_primary_cooldown` closures (v3.0.0: utility+chat share one) |
 | `label_dead` | cross-agent dead-mark written | `_mark_label_dead` |
 | `cooldowns_cleared` | user-initiated clear (button / hooks API) | `clear_all_cooldowns` (carries `count` + `cross_context`) |
 | `cascade_exhausted` | all candidates failed, RetryAfterHours imminent | `_emit_fallback_summary` (field `cascade_kind`, NOT `kind` — `kind` is `record_event`'s own positional param; passing `kind=kind` raises `TypeError` which the summary's blanket `except` swallows → silently no event. GOTCHA.) |

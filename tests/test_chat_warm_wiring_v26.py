@@ -35,45 +35,54 @@ if str(REPO_ROOT) not in sys.path:
 from usr.plugins._model_fallback.fallback import (  # noqa: E402
     _patched_call_chat_model,
     _patched_call_utility_model,
+    _run_rotation_cascade,
 )
 
+# v3.0.0: the warm reads and the per-candidate resolution call site moved
+# into the shared engine; the two adapters delegate to it.
+ENGINE = _run_rotation_cascade
 
-def test_chat_cascade_binds_warm_vars():
-    """``_patched_call_chat_model`` must assign ``warm_timeout_s`` and
+
+def test_engine_binds_warm_vars():
+    """The unified rotation engine must assign ``warm_timeout_s`` and
     ``warm_window_s`` (read them from plugin config) before the per-candidate
-    warm-resolution call site. Before the v2.6.1 fix they were only ever
-    referenced, never assigned, in the chat cascade -> treated as module
-    globals -> ``NameError`` at runtime (no such global exists). After the
-    fix they are locals, so they appear in ``co_varnames``."""
-    chat_varnames = _patched_call_chat_model.__code__.co_varnames
-    assert "warm_timeout_s" in chat_varnames, (
-        "_patched_call_chat_model must read cascade_warm_timeout_s from plugin "
-        "config (the utility cascade does at fallback.py:1153-1158). Without "
-        "this read the chat warm path references an unbound name."
+    warm-resolution call site. Before the v2.6.1 fix the chat cascade only
+    ever referenced them, never assigned them -> treated as module globals
+    -> ``NameError`` at runtime (no such global exists). The v3.0.0 engine
+    owns the single copy of those reads, so the locals appear in its
+    ``co_varnames``."""
+    engine_varnames = ENGINE.__code__.co_varnames
+    assert "warm_timeout_s" in engine_varnames, (
+        "_run_rotation_cascade must read cascade_warm_timeout_s from plugin "
+        "config. Without this read the warm path references an unbound name."
     )
-    assert "warm_window_s" in chat_varnames, (
-        "_patched_call_chat_model must read cascade_warm_window_s from plugin "
-        "config (the utility cascade does at fallback.py:1156-1158)."
+    assert "warm_window_s" in engine_varnames, (
+        "_run_rotation_cascade must read cascade_warm_window_s from plugin "
+        "config."
     )
 
 
-def test_chat_cascade_calls_resolve_per_call_timeout():
-    """The chat cascade must actually invoke ``_resolve_per_call_timeout`` (the
+def test_engine_calls_resolve_per_call_timeout():
+    """The engine must actually invoke ``_resolve_per_call_timeout`` (the
     warm/cold resolution) on its per-candidate path. The call site lives in
-    the loop body of ``_patched_call_chat_model`` (not inside the nested
-    ``_call_chat_model`` closure), so the global lookup lands in ``co_names``.
+    the loop body of ``_run_rotation_cascade`` (not inside the nested
+    ``_call_inner`` closure), so the global lookup lands in ``co_names``.
     Guards against the warm reads existing but the call site being dropped."""
-    assert "_resolve_per_call_timeout" in _patched_call_chat_model.__code__.co_names, (
-        "_patched_call_chat_model must call _resolve_per_call_timeout on its "
+    assert "_resolve_per_call_timeout" in ENGINE.__code__.co_names, (
+        "_run_rotation_cascade must call _resolve_per_call_timeout on its "
         "per-candidate path to apply warm/cold timeouts."
     )
 
 
-def test_utility_cascade_warm_wiring_unchanged():
-    """Sanity: the utility cascade already had the warm reads (the pattern
-    the chat cascade now mirrors). Anchors the regression so a future
-    refactor that drops the utility reads is also caught."""
-    util_varnames = _patched_call_utility_model.__code__.co_varnames
-    assert "warm_timeout_s" in util_varnames
-    assert "warm_window_s" in util_varnames
-    assert "_resolve_per_call_timeout" in _patched_call_utility_model.__code__.co_names
+def test_adapters_delegate_to_engine():
+    """v3.0.0: the utility and chat cascades are thin adapters. Their
+    code objects must NOT carry the warm-resolution loop (that lives in
+    the engine now) -- but they must not have regressed into something
+    unrelated either."""
+    # The engine owns the loop body.
+    assert "_resolve_per_call_timeout" not in _patched_call_utility_model.__code__.co_names
+    assert "_resolve_per_call_timeout" not in _patched_call_chat_model.__code__.co_names
+    # ...and the adapters still reference it (they call the engine by name,
+    # which the engine's closure then uses), so the delegation is real.
+    assert "_run_rotation_cascade" in _patched_call_utility_model.__code__.co_names
+    assert "_run_rotation_cascade" in _patched_call_chat_model.__code__.co_names

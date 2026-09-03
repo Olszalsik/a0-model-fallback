@@ -10,9 +10,12 @@ description: >
   independently toggleable resilience layers — a utility-call timeout
   guard, a context-size guard, and a langchain v0->v1 import shim.
   (The server-side WebUI extensions cache moved to the
-  ui_loader_optimizer plugin in v2.6.6.) Self-contained; no official
-  agent-zero file is modified.
-version: 2.9.1
+  ui_loader_optimizer plugin in v2.6.6.) v3.0.0 unifies the utility and
+  chat rotation cascades into ONE engine (_run_rotation_cascade) behind
+  two thin adapters, eliminating the "fixed in one cascade, missed in
+  the other" bug class. Self-contained; no official agent-zero file is
+  modified.
+version: 3.0.0
 settings_sections:
   - agent
   - developer

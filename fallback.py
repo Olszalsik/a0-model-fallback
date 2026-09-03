@@ -34,6 +34,7 @@ Fixes bundled here:
 
 import asyncio
 import os
+import random
 import time
 from typing import Any, Callable, Awaitable, List, Tuple, Optional
 
@@ -2022,31 +2023,93 @@ def _preflight_check(model_obj, candidates: list, context: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Patched call_utility_model
+# Unified rotation cascade engine (v3.0.0)
 # ---------------------------------------------------------------------------
 
-async def _patched_call_utility_model(
-    self,
-    system: str,
-    message: str,
-    callback: Callable | None = None,
-    background: bool = False,
-    require_json: bool = False,
-):
+
+class _CascadeSpec:
+    """Divergence parameters for the unified rotation cascade.
+
+    The utility and chat cascades are line-for-line identical apart from
+    these knobs, so v3.0.0 merges them into ONE engine
+    (_run_rotation_cascade) parameterized by a _CascadeSpec. Historical
+    bugs were repeatedly "fixed in one cascade, missed in the other"
+    (pass-boundary placement, nonlocal misses, the v2.6.1 chat warm-read
+    gap) -- one engine removes that failure class.
+
+    Function-typed fields:
+      call_data_builder(current_model) -> dict
+      inner_coro_builder(call_data) -> coroutine   (fresh; also used for
+          the Responses-5xx one-shot retry rebuild)
+      success_prepare(call_data, response, reasoning) -> awaitable
+      error_msg_fn(e, idx, label) -> str           (log line shape)
+      after_hook_fire(call_data, response, reasoning) -> awaitable
+
+    The turn cascade (_patched_call_chat_model_turn) is structurally
+    different (single pass, streaming guards, persisted counters) and is
+    deliberately NOT unified."""
+
+    def __init__(
+        self,
+        *,
+        kind: str,
+        log_prefix: str,
+        cycling_prefix: str,
+        stagnation_prefix: str,
+        timeout_cfg_key: str,
+        use_utility_models: bool,
+        is_utility_cascade: bool,
+        persist_idx_on_success: bool,
+        skip_remaining_suffix: str,
+        before_hook: str,
+        preflight_context: str,
+        code_error_ctx: str,
+        call_data_builder,
+        inner_coro_builder,
+        success_prepare,
+        error_msg_fn,
+        after_hook_fire,
+    ):
+        self.kind = kind  # "utility" / "chat" (summary + exhaustion msgs)
+        self.log_prefix = log_prefix  # "Utility model" / "Chat model"
+        self.cycling_prefix = cycling_prefix  # "Utility" / "Chat"
+        self.stagnation_prefix = stagnation_prefix  # "Cascade" / "Chat cascade"
+        self.timeout_cfg_key = timeout_cfg_key
+        self.use_utility_models = use_utility_models
+        self.is_utility_cascade = is_utility_cascade
+        # Utility's _succeed advances the rotation index on success; the
+        # chat cascade historically did NOT (preserved divergence).
+        self.persist_idx_on_success = persist_idx_on_success
+        # Chat's cooldown-skip log appends " remaining"; utility does not.
+        self.skip_remaining_suffix = skip_remaining_suffix
+        self.before_hook = before_hook
+        self.preflight_context = preflight_context
+        self.code_error_ctx = code_error_ctx  # CodeError(e, "<ctx> [label]")
+        self.call_data_builder = call_data_builder
+        self.inner_coro_builder = inner_coro_builder
+        self.success_prepare = success_prepare
+        self.error_msg_fn = error_msg_fn
+        self.after_hook_fire = after_hook_fire
+
+
+async def _run_rotation_cascade(self, spec: _CascadeSpec, model_obj):
+    # The single copy of the rotation cascade (v3.0.0) -- the former
+    # _patched_call_utility_model body, parameterized by `spec`. The two
+    # thin adapters (_patched_call_utility_model / _patched_call_chat_model
+    # below) keep the exact public signatures and unwrap the
+    # (response, reasoning) tuple the engine returns.
+
     # Used by the v2.5.1 primary-skip helper to label its log lines.
-    _is_utility_cascade: bool = True
-    model_obj = self.get_utility_model()
-    if model_obj is None:
-        raise RuntimeError("Agent has no utility model configured")
+    _is_utility_cascade: bool = spec.is_utility_cascade
 
     # Timeout resolution: plugin config > model kwarg > default (300s).
     # v2.6: the user-set TIMEOUT= model kwarg still wins (legacy
     # contract -- tests assume kwarg overrides everything). The warm/
     # cold per-label decision is applied per-candidate inside
-    # _call_utility_model so each fallback candidate gets its own
+    # _call_inner so each fallback candidate gets its own
     # warm-check based on its own label.
     plugin_cfg = _get_plugin_cfg(self)
-    default_timeout = float(plugin_cfg.get("fallback_utility_timeout_s", 300))
+    default_timeout = float(plugin_cfg.get(spec.timeout_cfg_key, 300))
     warm_timeout_s = float(plugin_cfg.get(
         "cascade_warm_timeout_s", _DEFAULT_CASCADE_WARM_TIMEOUT_S,
     ))
@@ -2058,15 +2121,17 @@ async def _patched_call_utility_model(
         model_kwargs.get("TIMEOUT", model_kwargs.get("timeout", default_timeout))
     )
 
-    candidates: list = _build_candidates(model_obj, use_utility_models=True, agent=self)
+    candidates: list = _build_candidates(
+        model_obj, use_utility_models=spec.use_utility_models, agent=self
+    )
     n = len(candidates)
     if n == 0:
-        raise RuntimeError("No utility model candidates available")
+        raise RuntimeError(f"No {spec.kind} model candidates available")
 
     # Pre-flight: catch code errors before entering the loop
-    _preflight_check(model_obj, candidates, "utility model fallback")
+    _preflight_check(model_obj, candidates, spec.preflight_context)
 
-    current_idx: int = _resolve_model_idx(self, use_utility_models=True) % n
+    current_idx: int = _resolve_model_idx(self, spec.use_utility_models) % n
 
     cycle_delay: float = _clamp_delay(
         float(
@@ -2360,7 +2425,7 @@ async def _patched_call_utility_model(
                 try:
                     self.context.log.log(
                         "info",
-                        f"Cascade stagnation detected — "
+                        f"{spec.stagnation_prefix} stagnation detected — "
                         f"{consecutive_no_success_cycles} consecutive cycles "
                         f"with 0 successes; amplifying cycle sleep by "
                         f"{cycle_stagnation_factor:.1f}x to {int(capped)}s.",
@@ -2440,10 +2505,10 @@ async def _patched_call_utility_model(
                     spin_s += random.uniform(0.0, backoff_jitter_s)
                 if not continuous_mode and empty_passes >= 3:
                     cycle_count += 1
-                    _emit_fallback_summary(self, "utility", candidates)
+                    _emit_fallback_summary(self, spec.kind, candidates)
                     _maybe_raise_retry_after_hours(self, cycle_count, n, attempt, max_cycles=max_cycles)
                     raise RuntimeError(
-                        f"All utility model candidates skipped "
+                        f"All {spec.kind} model candidates skipped "
                         f"(cooldown/dead) for {empty_passes} consecutive "
                         f"passes; exhausted."
                     )
@@ -2479,14 +2544,14 @@ async def _patched_call_utility_model(
                 consecutive_full_cycles += 1
                 sleep_s = _compute_cycle_sleep() if continuous_mode else cycle_delay
                 cycle_msg = (
-                    f"Utility models cycling (all permanent). "
+                    f"{spec.cycling_prefix} models cycling (all permanent). "
                     f"Sleeping {sleep_s:.0f}s "
                     f"(cycle {cycle_count}, consecutive={consecutive_full_cycles})..."
                 )
                 self.context.log.log("warning", content=cycle_msg)
                 PrintStyle(font_color="orange", padding=True).print(cycle_msg)
                 await _yielding_sleep(sleep_s)
-                _set_model_idx(self, use_utility_models=True, idx=0)
+                _set_model_idx(self, spec.use_utility_models, idx=0)
                 attempt = 0
                 tried_this_cycle = 0
                 cycle_permanent_count = 0
@@ -2508,14 +2573,14 @@ async def _patched_call_utility_model(
             consecutive_no_success_cycles += 1
             sleep_s = _compute_cycle_sleep() if continuous_mode else cycle_delay
             cycle_msg = (
-                f"Utility models cycling (all attempted). "
+                f"{spec.cycling_prefix} models cycling (all attempted). "
                 f"Sleeping {sleep_s:.0f}s "
                 f"(cycle {cycle_count}, consecutive={consecutive_full_cycles})..."
             )
             self.context.log.log("warning", content=cycle_msg)
             PrintStyle(font_color="orange", padding=True).print(cycle_msg)
             await _yielding_sleep(sleep_s)
-            _set_model_idx(self, use_utility_models=True, idx=0)
+            _set_model_idx(self, spec.use_utility_models, idx=0)
             attempt = 0
             tried_this_cycle = 0
             cycle_permanent_count = 0
@@ -2534,7 +2599,7 @@ async def _patched_call_utility_model(
                 _last_dead_log_until[label] = dead_until
                 self.context.log.log(
                     "info",
-                    f"Utility model [{label}] dead cross-agent "
+                    f"{spec.log_prefix} [{label}] dead cross-agent "
                     f"(status {_status}), skipping "
                     f"{int(dead_until - time.monotonic())}s",
                 )
@@ -2564,7 +2629,8 @@ async def _patched_call_utility_model(
                 _last_skip_log_until[label] = cooldown_until
                 self.context.log.log(
                     "info",
-                    f"Utility model [{label}] in cooldown, skipping ({remaining}s)",
+                    f"{spec.log_prefix} [{label}] in cooldown, "
+                    f"skipping ({remaining}s{spec.skip_remaining_suffix})",
                 )
             # Advance idx so the NEXT iteration considers a different model,
             # but do NOT count this slot as "tried this cycle" -- otherwise
@@ -2594,30 +2660,24 @@ async def _patched_call_utility_model(
         _strip_a0_only_kwargs(current_model, is_primary=(idx == 0))
 
         if attempt > 0:
-            warn = f"Utility model switching to [{idx}/{n - 1}]: {label}"
+            warn = f"{spec.log_prefix} switching to [{idx}/{n - 1}]: {label}"
             self.context.log.log("warning", content=warn)
             PrintStyle(font_color="orange", padding=True).print(warn)
 
-        call_data = {
-            "model": current_model,
-            "system": system,
-            "message": message,
-            "callback": callback,
-            "background": background,
-            "require_json": require_json,
-        }
+        call_data = spec.call_data_builder(current_model)
         await extension.call_extensions_async(
-            "util_model_call_before", self, call_data=call_data
+            spec.before_hook, self, call_data=call_data
         )
 
-        async def stream_callback(chunk: str, total: str):
-            if call_data["callback"]:
-                await call_data["callback"](chunk)
-
-        async def _succeed(response):
-            # Shared success path: validate JSON, clear cooldown, advance
-            # rotation index, clear extended-retry state, emit after-hook.
-            _validate_json_response(response, call_data)
+        async def _succeed(response, reasoning):
+            # Shared success path: run the cascade-specific validation,
+            # clear cooldown, advance rotation index, clear extended-retry
+            # state, emit after-hook. (v3.0.0: utility validated JSON and
+            # chat validated the tool request -- both live in
+            # spec.success_prepare now. The chat cascade carried
+            # `reasoning` through to its after-hook and return value,
+            # which is why _succeed takes and returns it for both.)
+            await spec.success_prepare(call_data, response, reasoning)
             # Success -- clear cooldown for this model
             _popped_until = model_cooldowns.pop(label, None)
             if _popped_until is not None:
@@ -2641,7 +2701,7 @@ async def _patched_call_utility_model(
             # primary-recovered and fallback-succeeded paths count.
             _reset_primary_strikes()
             if idx != current_idx:
-                ok = f"Utility model fallback succeeded, now using [{idx}]: {label}"
+                ok = f"{spec.log_prefix} fallback succeeded, now using [{idx}]: {label}"
                 self.context.log.log("info", content=ok)
                 PrintStyle(font_color="cyan", padding=True).print(ok)
             # Continuous mode: if we were in a long fallback stretch, announce
@@ -2657,7 +2717,7 @@ async def _patched_call_utility_model(
             if continuous_mode and consecutive_full_cycles > 0:
                 elapsed = int(time.monotonic() - fallback_started_at)
                 recovery_msg = (
-                    f"Utility model recovered after {consecutive_full_cycles} "
+                    f"{spec.log_prefix} recovered after {consecutive_full_cycles} "
                     f"full cycle(s) and {elapsed}s of fallback -- quota "
                     f"refresh detected on [{idx}]: {label}."
                 )
@@ -2671,18 +2731,17 @@ async def _patched_call_utility_model(
             consecutive_no_success_cycles = 0
             stagnation_logged_this_outage = False
             fallback_started_at = time.monotonic()
-            _set_model_idx(self, use_utility_models=True, idx=idx)
+            # v3.0.0: the utility cascade advanced the rotation index on
+            # success; the chat cascade historically did NOT (its callers
+            # re-resolve the chat model per call). Preserved divergence.
+            if spec.persist_idx_on_success:
+                _set_model_idx(self, spec.use_utility_models, idx=idx)
             # Clear extended-retry state on success
             self.set_data(DATA_KEY_EXT_RETRY_ATTEMPTS, 0)
             self.set_data(DATA_KEY_EXT_RETRY_PHASE, 0)
             self.set_data(DATA_KEY_EXT_RETRY_NOTIFIED, False)
-            await extension.call_extensions_async(
-                "util_model_call_after",
-                self,
-                call_data=call_data,
-                response=response,
-            )
-            return response
+            await spec.after_hook_fire(call_data, response, reasoning)
+            return response, reasoning
 
         # Build the inner coroutine once so we can close() it on timeout.
         # Without this, when ``asyncio.wait_for`` cancels the call the
@@ -2697,19 +2756,7 @@ async def _patched_call_utility_model(
         # the OUTER coroutine (the awaitable returned by unified_call) is
         # sufficient: closing it releases its frame and the inner
         # coroutine's frame becomes collectable.
-        _inner_coro = call_data["model"].unified_call(
-            system_message=call_data["system"],
-            user_message=call_data["message"],
-            response_callback=(
-                stream_callback if call_data["callback"] else None
-            ),
-            rate_limiter_callback=(
-                self.rate_limiter_callback
-                if not call_data["background"]
-                else None
-            ),
-            fallbacks=None,
-        )
+        _inner_coro = spec.inner_coro_builder(call_data)
 
         # v2.6: per-candidate warm/cold timeout resolution. Each fallback
         # candidate gets its own warm-check against its own label. The
@@ -2728,7 +2775,7 @@ async def _patched_call_utility_model(
                 self, cand_api_base,
             )
 
-        async def _call_utility_model():
+        async def _call_inner():
             # v2.6: on external cancellation (CancelledError from outer
             # guard / container shutdown), skip the close-coroutine
             # cleanup -- the call was healthy and running, the cancel
@@ -2762,8 +2809,8 @@ async def _patched_call_utility_model(
                 raise
 
         try:
-            response, _reasoning = await _call_utility_model()
-            return await _succeed(response)
+            response, reasoning = await _call_inner()
+            return await _succeed(response, reasoning)
 
         except asyncio.CancelledError:
             # External cancellation (user intervention, container shutdown,
@@ -2774,7 +2821,7 @@ async def _patched_call_utility_model(
             raise
 
         except (asyncio.TimeoutError, TimeoutError) as e:
-            warn = f"Utility model [{idx}] timed out after {int(effective_timeout_s)}s: {label}"
+            warn = f"{spec.log_prefix} [{idx}] timed out after {int(effective_timeout_s)}s: {label}"
             self.context.log.log("warning", content=warn)
             PrintStyle(font_color="orange", padding=True).print(warn)
             # fix A: evict the warm label so the retry uses the cold
@@ -2797,7 +2844,7 @@ async def _patched_call_utility_model(
             timeout_cooldown_booked = False  # v2.8.4: dedupe double-booking
             if _is_code_error(e):
                 err_msg = (
-                    f"Utility model [{idx}] CODE ERROR ({type(e).__name__}): "
+                    f"{spec.log_prefix} [{idx}] CODE ERROR ({type(e).__name__}): "
                     f"{label} - {_format_exception(e)}. "
                     f"This is a code bug, not an API failure -- failing fast."
                 )
@@ -2805,7 +2852,7 @@ async def _patched_call_utility_model(
                 PrintStyle(font_color="red", padding=True).print(err_msg)
                 # Mark as permanent so it's not retried, then raise
                 _handle_error_cooldown(e, label, model_cooldowns, self, cand_api_base)
-                raise CodeError(e, f"utility model [{label}]")
+                raise CodeError(e, f"{spec.code_error_ctx} [{label}]")
 
             # v2.8.3: a litellm.Timeout that escaped unified_call before our
             # wait_for fired lands here (it is NOT a TimeoutError subclass).
@@ -2822,16 +2869,10 @@ async def _patched_call_utility_model(
                 )
                 timeout_cooldown_booked = True
 
-            is_json_err = isinstance(e, ValueError) and "valid JSON" in str(e)
-            is_overflow = _is_context_overflow_error(e)
-            err_type = (
-                "Format Error"
-                if is_json_err
-                else "ContextOverflow"
-                if is_overflow
-                else f"Error ({type(e).__name__})"
-            )
-            err_msg = f"Utility model [{idx}] {err_type}: {label} - {_format_exception(e)}"
+            # v3.0.0: the log-line shape diverges (utility classifies JSON
+            # parse failures as "Format Error"; chat's message reads
+            # "error (<err_type>)") -- both live in spec.error_msg_fn.
+            err_msg = spec.error_msg_fn(e, idx, label)
             self.context.log.log("warning", content=err_msg)
             PrintStyle(font_color="orange", padding=True).print(err_msg)
 
@@ -2850,7 +2891,7 @@ async def _patched_call_utility_model(
                 self.context.log.log(
                     "warning",
                     content=(
-                        f"Utility model [{idx}] Responses 5xx; retrying "
+                        f"{spec.log_prefix} [{idx}] Responses 5xx; retrying "
                         f"{label} once with chat-completions."
                     ),
                 )
@@ -2864,21 +2905,9 @@ async def _patched_call_utility_model(
                     # coroutine", was swallowed by the except below, and the
                     # "retrying once" log never did anything. Build a FRESH
                     # coroutine now that the model is in chat-completions mode.
-                    _inner_coro = call_data["model"].unified_call(
-                        system_message=call_data["system"],
-                        user_message=call_data["message"],
-                        response_callback=(
-                            stream_callback if call_data["callback"] else None
-                        ),
-                        rate_limiter_callback=(
-                            self.rate_limiter_callback
-                            if not call_data["background"]
-                            else None
-                        ),
-                        fallbacks=None,
-                    )
-                    response, _reasoning = await _call_utility_model()
-                    return await _succeed(response)
+                    _inner_coro = spec.inner_coro_builder(call_data)
+                    response, reasoning = await _call_inner()
+                    return await _succeed(response, reasoning)
                 except Exception:
                     # chat-completions also failed -> fall through to normal
                     # cooldown + advance. Keep the original exception `e`.
@@ -2907,7 +2936,7 @@ async def _patched_call_utility_model(
     _maybe_raise_retry_after_hours(self, cycle_count, n, attempt, max_cycles=max_cycles)
 
     exhausted = (
-        f"All utility model candidates exhausted after {cycle_count} cycle(s) "
+        f"All {spec.kind} model candidates exhausted after {cycle_count} cycle(s) "
         f"({attempt} attempt(s))."
     )
     self.context.log.log("error", content=exhausted)
@@ -2920,12 +2949,114 @@ async def _patched_call_utility_model(
     # invariant: "the agent must never die from a transient unavailability
     # of every cloud model in the chain".
     if continuous_mode:
-        return None
+        # v3.0.0: the engine always returns the (response, reasoning)
+        # shape; the utility adapter unwraps `response` (which is None
+        # here), preserving its old `return None` contract.
+        return None, None
     raise RuntimeError(exhausted)
 
 
 # ---------------------------------------------------------------------------
-# Patched call_chat_model
+# Patched call_utility_model (thin adapter -> _run_rotation_cascade, v3.0.0)
+# ---------------------------------------------------------------------------
+
+async def _patched_call_utility_model(
+    self,
+    system: str,
+    message: str,
+    callback: Callable | None = None,
+    background: bool = False,
+    require_json: bool = False,
+):
+    # Thin adapter (v3.0.0): keeps the exact public signature (hard imports
+    # in usr\extensions\python\_functions\a0\agent\Agent\call_utility_model
+    # depend on it), shapes the utility cascade's call_data / unified_call
+    # kwargs, runs the shared _run_rotation_cascade engine, and unwraps
+    # (response, reasoning) -> response.
+    model_obj = self.get_utility_model()
+    if model_obj is None:
+        raise RuntimeError("Agent has no utility model configured")
+
+    def call_data_builder(current_model):
+        return {
+            "model": current_model,
+            "system": system,
+            "message": message,
+            "callback": callback,
+            "background": background,
+            "require_json": require_json,
+        }
+
+    def inner_coro_builder(call_data):
+        # Stream only when a callback is present; the rate limiter is
+        # skipped for background calls.
+        async def stream_callback(chunk: str, total: str):
+            if call_data["callback"]:
+                await call_data["callback"](chunk)
+
+        return call_data["model"].unified_call(
+            system_message=call_data["system"],
+            user_message=call_data["message"],
+            response_callback=(
+                stream_callback if call_data["callback"] else None
+            ),
+            rate_limiter_callback=(
+                self.rate_limiter_callback
+                if not call_data["background"]
+                else None
+            ),
+            fallbacks=None,
+        )
+
+    async def success_prepare(call_data, response, reasoning):
+        _validate_json_response(response, call_data)
+
+    def error_msg_fn(e, idx, label):
+        is_json_err = isinstance(e, ValueError) and "valid JSON" in str(e)
+        is_overflow = _is_context_overflow_error(e)
+        err_type = (
+            "Format Error"
+            if is_json_err
+            else "ContextOverflow"
+            if is_overflow
+            else f"Error ({type(e).__name__})"
+        )
+        return f"Utility model [{idx}] {err_type}: {label} - {_format_exception(e)}"
+
+    async def after_hook_fire(call_data, response, reasoning):
+        # The utility after-hook contract does NOT receive `reasoning`.
+        await extension.call_extensions_async(
+            "util_model_call_after",
+            self,
+            call_data=call_data,
+            response=response,
+        )
+
+    spec = _CascadeSpec(
+        kind="utility",
+        log_prefix="Utility model",
+        cycling_prefix="Utility",
+        stagnation_prefix="Cascade",
+        timeout_cfg_key="fallback_utility_timeout_s",
+        use_utility_models=True,
+        is_utility_cascade=True,
+        persist_idx_on_success=True,
+        skip_remaining_suffix="",
+        before_hook="util_model_call_before",
+        preflight_context="utility model fallback",
+        code_error_ctx="utility model",
+        call_data_builder=call_data_builder,
+        inner_coro_builder=inner_coro_builder,
+        success_prepare=success_prepare,
+        error_msg_fn=error_msg_fn,
+        after_hook_fire=after_hook_fire,
+    )
+    response, _reasoning = await _run_rotation_cascade(self, spec, model_obj)
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Patched call_chat_model (thin adapter -> _run_rotation_cascade, v3.0.0)
 # ---------------------------------------------------------------------------
 
 async def _patched_call_chat_model(
@@ -2953,523 +3084,13 @@ async def _patched_call_chat_model(
             else "Agent has no utility model configured"
         )
 
-    # Used by the v2.5.1 primary-skip helper to label its log lines.
-    # In the chat cascade ``use_utility_models`` is a function parameter
-    # (the agent can call chat fallback with utility candidates), so we
-    # honor that distinction.
-    _is_utility_cascade: bool = bool(use_utility_models)
-
-    # Timeout resolution: plugin config > model kwarg > default (300s)
-    plugin_cfg = _get_plugin_cfg(self)
-    default_timeout = float(plugin_cfg.get("fallback_timeout_s", 300))
-    model_kwargs = getattr(model_obj, "kwargs", {}) or {}
-    timeout_s = float(
-        model_kwargs.get("TIMEOUT", model_kwargs.get("timeout", default_timeout))
-    )
-    # v2.6.1 fix: warm/cold per-call timeout reads. The utility cascade reads
-    # these at fallback.py:1153-1158; the chat cascade originally omitted them,
-    # leaving ``warm_timeout_s``/``warm_window_s`` unbound at the call site
-    # (fallback.py:_resolve_per_call_timeout call inside the chat loop). With no
-    # user ``TIMEOUT`` kwarg on the chat model (the common case) that was a
-    # ``NameError`` raised in the loop body before the try/except, killing the
-    # chat call; with a ``TIMEOUT`` kwarg the warm/cold path was silently dead
-    # (always cold). Mirror the utility cascade reads so the chat cascade gets
-    # the same warm 20s fast-path after a label's first successful call.
-    warm_timeout_s = float(plugin_cfg.get(
-        "cascade_warm_timeout_s", _DEFAULT_CASCADE_WARM_TIMEOUT_S,
-    ))
-    warm_window_s = float(plugin_cfg.get(
-        "cascade_warm_window_s", _DEFAULT_CASCADE_WARM_WINDOW_S,
-    ))
-
-    candidates = _build_candidates(model_obj, use_utility_models=use_utility_models, agent=self)
-    n = len(candidates)
-    if n == 0:
-        raise RuntimeError("No chat model candidates available")
-
-    # Pre-flight: catch code errors before entering the loop
-    _preflight_check(model_obj, candidates, "chat model fallback")
-
-    current_idx = _resolve_model_idx(self, use_utility_models) % n
-
-    cycle_delay: float = _clamp_delay(
-        float(
-            model_kwargs.get(
-                "FALLBACK_CYCLE_DELAY",
-                model_kwargs.get("fallback_cycle_delay",
-                                 float(plugin_cfg.get("fallback_cycle_delay", 5.0))),
-            )
-        ),
-        _MAX_CYCLE_DELAY,
-        "cycle_delay",
-    )
-    attempt_delay: float = _clamp_delay(
-        float(
-            model_kwargs.get(
-                "FALLBACK_ATTEMPT_DELAY",
-                model_kwargs.get("fallback_attempt_delay",
-                                 float(plugin_cfg.get("fallback_attempt_delay", 2.0))),
-            )
-        ),
-        _MAX_ATTEMPT_DELAY,
-        "attempt_delay",
-    )
-    max_cycles: int = int(
-        model_kwargs.get(
-            "MAX_FALLBACK_CYCLES",
-            model_kwargs.get("max_fallback_cycles",
-                             int(plugin_cfg.get("fallback_max_cycles", 4))),
-        )
-    )
-
-    # v2.8.1: no ``or {}`` -- a freshly seeded store is an EMPTY (falsy)
-    # dict; ``or {}`` swapped in an unregistered literal, and the success
-    # path's _save_cooldown_store then wrote that empty dict back over the
-    # store, wiping the cooldown _handle_error_cooldown had just booked.
-    model_cooldowns: dict = _get_cooldown_store(self)
-    if not isinstance(model_cooldowns, dict):
-        model_cooldowns = {}
-
-    cycle_count = 0
-    attempt = 0
-    tried_this_cycle = 0  # how many models we actually CALLed (not skipped)
-    empty_passes = 0  # v2.8.3: consecutive all-skipped passes (spin backoff)
-    cycle_permanent_count = 0
-    early_exit_enabled: bool = bool(plugin_cfg.get("early_exit_on_all_permanent", True))
-    responses_5xx_retry_enabled: bool = bool(
-        plugin_cfg.get("responses_5xx_retry_enabled", True)
-    )
-    # Per-label dedupe of the "in cooldown, skipping (Xs remaining)" log.
-    # Same contract as the utility cascade above -- log once per
-    # cooldown window, not once per ~2s iteration. See the comment in
-    # _patched_call_utility_model for the rationale (Laci, 2026-07-21).
-    _last_skip_log_until: dict = {}
-    # v2.6.8: dedupe for the cross-agent dead-label skip log (mirrors
-    # the utility cascade's _last_dead_log_until above).
-    _last_dead_log_until: dict = {}
-
-    # --- Continuous-fallback state -----------------------------------------
-    # Mirrors _patched_call_utility_model. The chat cascade runs the same
-    # backoff envelope so chat and utility stay in lockstep during outages.
-    # See AGENTS.md for the contract.
-    continuous_mode: bool = bool(plugin_cfg.get("continuous_fallback", False))
-    max_cycle_delay_s: float = _clamp_delay(
-        float(plugin_cfg.get("max_cycle_delay_s", 300.0)),
-        3600.0,
-        "max_cycle_delay_s",
-    )
-    backoff_multiplier: float = max(1.0, float(plugin_cfg.get("backoff_multiplier", 2.0)))
-    backoff_jitter_s: float = max(0.0, float(plugin_cfg.get("backoff_jitter_s", 2.0)))
-    consecutive_full_cycles: int = 0
-    fallback_started_at: float = time.monotonic()
-    # v2.6: Phase 3 — stagnation counter (closure-local). Counts
-    # consecutive full cycles with zero successes. Reset on any success.
-    # Used by _compute_cycle_sleep to apply ``cycle_stagnation_factor``
-    # when stagnation exceeds ``cycle_stagnation_threshold`` so the
-    # cascade backs off further during sustained outages.
-    consecutive_no_success_cycles: int = 0
-    stagnation_logged_this_outage: bool = False
-    cycle_stagnation_factor: float = max(
-        1.0, float(plugin_cfg.get(
-            "cycle_stagnation_factor", _DEFAULT_CYCLE_STAGNATION_FACTOR,
-        ))
-    )
-    cycle_stagnation_threshold: int = max(
-        1, int(plugin_cfg.get(
-            "cycle_stagnation_threshold", _DEFAULT_CYCLE_STAGNATION_THRESHOLD,
-        ))
-    )
-
-    # --- v2.5.1 Primary-skip-after-N-strikes (added 2026-07-23) --------------
-    # When the primary model (candidate index 0) fails repeatedly, the
-    # cascade used to keep retrying it every 5 min (the default transient
-    # cooldown) even though the cost of each retry is 60-90s of timeout. The
-    # log on 2026-07-23 22:50 showed "consecutive=2" in a 14+ min stall, all
-    # attributed to a hung primary.
-    #
-    # Mechanism: track consecutive failures of [0] within a single
-    # cascade invocation. When the count crosses ``primary_skip_strikes``,
-    # extend [0]'s cooldown to ``primary_skip_cooldown_s`` (default 600s =
-    # 10 min) so the cascade routes around the primary. The next time the
-    # primary's cooldown expires, the cascade tries it again -- if the
-    # primary is back, success and the counter resets; if it's still hung,
-    # another escalation.
-    #
-    # The counter resets to 0 on:
-    #   - A successful call from ANY candidate (cascade is healthy)
-    #   - A successful call from the primary itself (quota recovered)
-    primary_skip_enabled: bool = bool(plugin_cfg.get("primary_skip_enabled", True))
-    primary_skip_strikes: int = max(
-        1, int(plugin_cfg.get("primary_skip_strikes", 2))
-    )
-    # Default lowered from 600s (10 min) to 120s (2 min). 600s was
-    # over-locking the primary when it had recovered in 2 min, which
-    # is the common case for short-lived upstream hiccups. 120s still
-    # covers one full pass through 6 candidates at 60s timeout each
-    # (6 min) and then some, but routes around a hung primary quickly.
-    # Tunable via config (primary_skip_cooldown_s).
-    primary_skip_cooldown_s: float = max(
-        30.0, float(plugin_cfg.get("primary_skip_cooldown_s", 120.0))
-    )
-    _consecutive_primary_failures: int = 0
-    # v2.8.6 (Z): time-decay window for the strike counter. Without it a
-    # strike booked hours ago still counted toward escalation -- two
-    # isolated failures spread across a session locked the primary out
-    # for the full primary_skip_cooldown_s. Strikes older than this many
-    # seconds are discarded before the increment, so the window restarts
-    # from the newest failure. 0 disables the decay.
-    # Tunable via config (primary_strike_decay_s).
-    primary_strike_decay_s: float = max(
-        0.0, float(plugin_cfg.get("primary_strike_decay_s", 300.0))
-    )
-    _last_primary_failure_at: float = 0.0
-
-    def _maybe_extend_primary_cooldown(reason: str) -> None:
-        """If the primary (candidate 0) has failed ``primary_skip_strikes``
-        times in a row, push its cooldown out to ``primary_skip_cooldown_s``
-        so the cascade stops paying the 60s timeout tax on every cycle.
-
-        Called after every primary failure. The dedupe in the cooldown
-        table's skip-log means the new cooldown value produces exactly one
-        log line per escalation, not one per cascade iteration.
-
-        v2.6: if a peer agent has recently proven this label healthy
-        (within ``health_horizon_s``), reset our local strike counter
-        and any stale per-agent cooldown first. This prevents the case
-        where one agent's stale primary failures keep escalating while
-        another agent's success on the same label would have cleared
-        the cooldown entirely.
-        """
-        nonlocal _consecutive_primary_failures, _last_primary_failure_at
-        if not primary_skip_enabled:
-            return
-        if idx != 0:
-            return
-        # v2.6: Phase 2 — per-provider capacity inference. For
-        # ``concurrent_paid`` (local ollama) and ``router``
-        # (omniroute/*), a primary 429 does not mean the
-        # model is broken — the slot frees in seconds (ollama) or the
-        # next call re-routes (routers). Never escalate the primary-skip
-        # cooldown for these. Skip before the Phase 5 healthy-label
-        # check so a peer success doesn't trigger a counter reset that
-        # would later be wasted by a 30s escalation.
-        if _capacity_skips_cooldown(label, self, cand_api_base):
-            return
-        # v2.6: Phase 5 short-circuit. _maybe_clear_cooldown_for_healthy_label
-        # already enforces the only-cleared-never-overwritten invariant
-        # (returns True only if the local cooldown is stale AND the
-        # cross-agent healthy index proves the label works). When it
-        # returns True we reset our strike counter and return early --
-        # no escalation needed, the peer agent proved this works.
-        if _maybe_clear_cooldown_for_healthy_label(self, label):
-            _consecutive_primary_failures = 0
-            return
-        # v2.8.6 (Z): decay stale strikes before counting this one. A
-        # failure older than primary_strike_decay_s no longer counts as
-        # "consecutive" -- the window restarts from the newest failure.
-        _now = time.monotonic()
-        if (
-            primary_strike_decay_s > 0.0
-            and _last_primary_failure_at > 0.0
-            and (_now - _last_primary_failure_at) > primary_strike_decay_s
-        ):
-            _consecutive_primary_failures = 0
-        _last_primary_failure_at = _now
-        _consecutive_primary_failures += 1
-        if _consecutive_primary_failures < primary_skip_strikes:
-            return
-        # Escalate: write a fresh long cooldown for the primary label.
-        # Bypasses _handle_error_cooldown (already called) -- we just
-        # extend whatever it set.
-        prev_until = model_cooldowns.get(label) or 0.0
-        target_until = time.monotonic() + primary_skip_cooldown_s
-        if target_until <= prev_until:
-            return  # existing cooldown is already longer, don't shorten
-        model_cooldowns[label] = target_until
-        _save_cooldown_store(self, model_cooldowns)
-        # v2.9.1: route event -- the escalation is invisible in counters
-        # (it only extends an existing cooldown), so log it explicitly.
-        events.record_event(
-            "primary_skip_escalated",
-            agent=self,
-            label=label,
-            cooldown_s=round(target_until - time.monotonic(), 1),
-            strikes=int(_consecutive_primary_failures),
-        )
-        # ``use_utility_models`` is a parameter of the chat cascade (default
-        # False) and is implicit True inside the utility cascade. We
-        # disambiguate via the caller-supplied label so the helper stays
-        # identical for both cascades.
-        kind_label = "Utility" if _is_utility_cascade else "Chat"
-        try:
-            self.context.log.log(
-                "warning",
-                f"{kind_label} primary [{label}] has failed "
-                f"{_consecutive_primary_failures} time(s) in a row -- "
-                f"escalating cooldown to {int(primary_skip_cooldown_s)}s "
-                f"(reason: {reason}). Cascade will route around it.",
-            )
-        except Exception:
-            pass
-
-    def _reset_primary_strikes() -> None:
-        """Reset the primary-skip counter. Called on any successful call --
-        either the primary recovered, or a fallback succeeded and proves
-        the cascade is healthy (next primary attempt is no longer a
-        'consecutive failure')."""
-        nonlocal _consecutive_primary_failures, _last_primary_failure_at
-        if _consecutive_primary_failures > 0:
-            _consecutive_primary_failures = 0
-            _last_primary_failure_at = 0.0
-
-    def _compute_cycle_sleep() -> float:
-        """Same envelope as the utility cascade. See _patched_call_utility_model.
-
-        v2.8.5 (Y): this copy was missing the Phase-3 stagnation
-        amplification the utility cascade has had since v2.6 -- the chat
-        cascade backed off to max_cycle_delay_s during a full outage and
-        then hammered every candidate at that fixed cadence, while the
-        utility cascade amplified the sleep by cycle_stagnation_factor.
-        The ``nonlocal`` matters: without it the one-log-per-outage
-        assignment makes the flag function-local and the read above it
-        raises UnboundLocalError on the first stagnation cycle."""
-        nonlocal stagnation_logged_this_outage
-        import random
-        cap = max_cycle_delay_s
-        # v2.6.7 Fix C: router-primary probe cap (see utility cascade).
-        if primary_is_router:
-            try:
-                cap = min(
-                    cap,
-                    float(_get_plugin_cfg(self).get(
-                        "router_max_cycle_delay_s",
-                        _DEFAULT_ROUTER_MAX_CYCLE_DELAY_S,
-                    )),
-                )
-            except Exception:
-                cap = min(cap, _DEFAULT_ROUTER_MAX_CYCLE_DELAY_S)
-        base = cycle_delay * (backoff_multiplier ** min(consecutive_full_cycles, 10))
-        capped = min(base, cap)
-        if (
-            consecutive_no_success_cycles >= cycle_stagnation_threshold
-            and cycle_stagnation_factor > 1.0
-        ):
-            amplified = capped * cycle_stagnation_factor
-            capped = min(amplified, cap)
-            if not stagnation_logged_this_outage:
-                stagnation_logged_this_outage = True
-                try:
-                    self.context.log.log(
-                        "info",
-                        f"Chat cascade stagnation detected — "
-                        f"{consecutive_no_success_cycles} consecutive cycles "
-                        f"with 0 successes; amplifying cycle sleep by "
-                        f"{cycle_stagnation_factor:.1f}x to {int(capped)}s.",
-                    )
-                except Exception:
-                    pass
-        if backoff_jitter_s > 0:
-            capped += random.uniform(0.0, backoff_jitter_s)
-        return capped
-
-    primary_label = _get_model_label(candidates[0], model_obj)
-    primary_api_base = _get_candidate_api_base(candidates[0], model_obj)
-    primary_is_router = (
-        _classify_capacity(primary_label, self, primary_api_base) == "router"
-    )
-
-    while True:
-        idx = (current_idx + attempt) % n
-        label = _get_model_label(candidates[idx], model_obj)
-        cand_api_base = _get_candidate_api_base(candidates[idx], model_obj)
-
-        # v2.8.5: pass-boundary check -- moved ABOVE the dead/cooldown skip
-        # checks, mirroring the utility cascade fix. It previously sat
-        # below them and only ran when the landing candidate
-        # (idx == current_idx) was live, which broke two ways:
-        #   1. All-skipped roster: every iteration exited via a skip
-        #      `continue` containing NO `await` -- a sync-only tight loop
-        #      that froze the ENTIRE event loop until the shortest
-        #      cooldown/dead TTL expired.
-        #   2. Mixed roster with a cooled STARTING candidate: the boundary
-        #      never fired, so cycle_count stayed 0 and max_cycles /
-        #      stagnation backoff / RetryAfterHours never engaged while
-        #      live fallbacks were re-attempted every attempt_delay.
-        # Every branch below ends in `continue`, so for a live starting
-        # candidate the order of operations is unchanged; skips still
-        # `continue` instantly (the attempt_delay sleep stays after the
-        # skip checks).
-        if attempt > 0 and attempt % n == 0:
-            if tried_this_cycle == 0:
-                # Every model in this pass was skipped (all in cooldown or
-                # dead-marked). Don't count it as a "cycle" -- just wait a
-                # bit and try the same set again.
-                # v2.8.3: bound the flat 2s spin (same as the utility
-                # cascade): escalate with the stagnation factor, capped at
-                # max_cycle_delay_s; legacy mode exhausts instead of
-                # looping every 2s for a 24h dead-label TTL.
-                empty_passes += 1
-                spin_s = min(
-                    2.0 * (cycle_stagnation_factor ** empty_passes),
-                    max_cycle_delay_s,
-                )
-                # v2.8.5 (Y): mirror _compute_cycle_sleep's router probe
-                # cap -- a router-primary cascade re-probes every
-                # router_max_cycle_delay_s (default 30s); the all-skipped
-                # spin must not back off toward max_cycle_delay_s (300s)
-                # and stretch the gateway's re-probe with it.
-                if primary_is_router:
-                    try:
-                        spin_s = min(
-                            spin_s,
-                            float(_get_plugin_cfg(self).get(
-                                "router_max_cycle_delay_s",
-                                _DEFAULT_ROUTER_MAX_CYCLE_DELAY_S,
-                            )),
-                        )
-                    except Exception:
-                        spin_s = min(spin_s, _DEFAULT_ROUTER_MAX_CYCLE_DELAY_S)
-                if backoff_jitter_s > 0:
-                    spin_s += random.uniform(0.0, backoff_jitter_s)
-                if not continuous_mode and empty_passes >= 3:
-                    cycle_count += 1
-                    _emit_fallback_summary(self, "chat", candidates)
-                    _maybe_raise_retry_after_hours(self, cycle_count, n, attempt, max_cycles=max_cycles)
-                    raise RuntimeError(
-                        f"All chat model candidates skipped "
-                        f"(cooldown/dead) for {empty_passes} consecutive "
-                        f"passes; exhausted."
-                    )
-                await asyncio.sleep(spin_s)
-                attempt = 0
-                tried_this_cycle = 0
-                cycle_permanent_count = 0
-                continue
-
-            # Early-exit: if every attempted model in this cycle was a
-            # permanent failure, skip the cycle-and-sleep ritual and go
-            # straight to extended-retry mode. See _patched_call_utility_model
-            # for the same logic + rationale.
-            if (
-                early_exit_enabled
-                and cycle_permanent_count > 0
-                and cycle_permanent_count == tried_this_cycle
-            ):
-                cycle_count += 1
-                _emit_fallback_summary(self, "chat", candidates)
-                # Continuous mode: never raise RetryAfterHours; the cascade
-                # must keep cycling so the agent stays alive across multi-hour
-                # rate-limit windows. In legacy mode, raise if applicable.
-                if not continuous_mode:
-                    _maybe_raise_retry_after_hours(self, cycle_count, n, attempt, max_cycles=max_cycles)
-                consecutive_full_cycles += 1
-                sleep_s = _compute_cycle_sleep() if continuous_mode else cycle_delay
-                cycle_msg = (
-                    f"Chat models cycling (all permanent). "
-                    f"Sleeping {sleep_s:.0f}s "
-                    f"(cycle {cycle_count}, consecutive={consecutive_full_cycles})..."
-                )
-                self.context.log.log("warning", content=cycle_msg)
-                PrintStyle(font_color="orange", padding=True).print(cycle_msg)
-                await _yielding_sleep(sleep_s)
-                _set_model_idx(self, use_utility_models, idx=0)
-                attempt = 0
-                tried_this_cycle = 0
-                cycle_permanent_count = 0
-                continue
-
-            cycle_count += 1
-            # Continuous mode: skip the max_cycles cap. See AGENTS.md.
-            if not continuous_mode and max_cycles > 0 and cycle_count >= max_cycles:
-                _maybe_raise_retry_after_hours(self, cycle_count, n, attempt, max_cycles=max_cycles)
-                break
-            consecutive_full_cycles += 1
-            # v2.6: Phase 3 — stagnation counter increments on every
-            # cycle iteration that didn't produce a success. _succeed
-            # resets it. _compute_cycle_sleep applies the stagnation
-            # amplification factor once it crosses the threshold.
-            consecutive_no_success_cycles += 1
-            sleep_s = _compute_cycle_sleep() if continuous_mode else cycle_delay
-            cycle_msg = (
-                f"Chat models cycling (all attempted). "
-                f"Sleeping {sleep_s:.0f}s "
-                f"(cycle {cycle_count}, consecutive={consecutive_full_cycles})..."
-            )
-            self.context.log.log("warning", content=cycle_msg)
-            PrintStyle(font_color="orange", padding=True).print(cycle_msg)
-            await _yielding_sleep(sleep_s)
-            _set_model_idx(self, use_utility_models, idx=0)
-            attempt = 0
-            tried_this_cycle = 0
-            cycle_permanent_count = 0
-
-        # Skip models in cooldown
-        # v2.6.8: cross-agent permanent-fail blocklist. Mirrors the
-        # utility cascade's dead-check above -- skip a label any agent
-        # marked dead (404 / auth-quota) without paying the call. Expiring
-        # (never forever); see _INMEM_DEAD_LABELS.
-        if _is_label_dead(label):
-            _status, dead_until = _INMEM_DEAD_LABELS[label]
-            if _last_dead_log_until.get(label) != dead_until:
-                _last_dead_log_until[label] = dead_until
-                self.context.log.log(
-                    "info",
-                    f"Chat model [{label}] dead cross-agent "
-                    f"(status {_status}), skipping "
-                    f"{int(dead_until - time.monotonic())}s",
-                )
-            attempt += 1
-            continue
-        cooldown_until = model_cooldowns.get(label)
-        # v2.5.2: cross-agent healthy-label reset. See
-        # _maybe_clear_cooldown_for_healthy_label. Mirrors the utility
-        # cascade's skip path above.
-        if cooldown_until is not None:
-            _maybe_clear_cooldown_for_healthy_label(self, label)
-            cooldown_until = model_cooldowns.get(label)
-        now = time.monotonic()
-        if cooldown_until and cooldown_until > now:
-            remaining = int(cooldown_until - now)
-            # Dedupe: only log when the cooldown value is NEW for this
-            # label. Same contract as the utility cascade.
-            if _last_skip_log_until.get(label) != cooldown_until:
-                _last_skip_log_until[label] = cooldown_until
-                self.context.log.log(
-                    "info",
-                    f"Chat model [{label}] in cooldown, skipping ({remaining}s remaining)",
-                )
-            # Advance idx but do NOT count this slot as "tried this cycle"
-            # so the cascade progresses through candidates even when some
-            # are in cooldown. (Laci, 2026-06-15: previously the loop
-            # treated "all models skipped" as "all models attempted" and
-            # 60s-slept forever, which is what produced the spam log.)
-            attempt += 1
-            continue
-        # Cooldown has expired for this label; clear the dedupe marker
-        # so the NEXT cooldown window logs its first skip again.
-        if _last_skip_log_until.get(label) is not None:
-            _last_skip_log_until.pop(label, None)
-
-        if attempt > 0:
-            await _yielding_sleep(attempt_delay)
-
-        tried_this_cycle += 1
-        empty_passes = 0
-        current_model = _build_model(candidates[idx], model_obj)
-
-        # Strip A0-only / provider-invalid keys from the wrapper's kwargs right
-        # before the first acompletion() so they never reach the request body.
-        # The plugin has already read cycle_delay / max_cycles / timeout above.
-        # v2.8.4: idx==0 IS the live primary model object -- keep its own
-        # provider-specific kwargs (see _PROVIDER_SPECIFIC_KWARGS).
-        _strip_a0_only_kwargs(current_model, is_primary=(idx == 0))
-
-        if attempt > 0:
-            warn = f"Chat model switching to [{idx}/{n - 1}]: {label}"
-            self.context.log.log("warning", content=warn)
-            PrintStyle(font_color="orange", padding=True).print(warn)
-
-        call_data = {
+    # Thin adapter (v3.0.0): keeps the exact public signature (hard imports
+    # in usr\extensions\python\_functions\a0\agent\Agent\call_chat_model
+    # depend on it), shapes the chat cascade's call_data / unified_call
+    # kwargs, and runs the shared _run_rotation_cascade engine, returning
+    # its (response, reasoning) tuple directly.
+    def call_data_builder(current_model):
+        return {
             "model": current_model,
             "messages": messages,
             "response_callback": response_callback,
@@ -3477,84 +3098,9 @@ async def _patched_call_chat_model(
             "background": background,
             "explicit_caching": explicit_caching,
         }
-        await extension.call_extensions_async(
-            "chat_model_call_before", self, call_data=call_data
-        )
 
-        async def _succeed(response, reasoning):
-            # Shared success path: validate tool request, clear cooldown,
-            # advance rotation index, clear extended-retry state, emit after-hook.
-            if not call_data.get("background"):
-                tool_request = extract_tools.json_parse_dirty(response)
-                if tool_request is not None:
-                    await self.validate_tool_request(tool_request)
-            # Success -- clear cooldown for this model
-            _popped_until = model_cooldowns.pop(label, None)
-            if _popped_until is not None:
-                # v2.9.1: real recovery -- a live call succeeded on a label
-                # that was in cooldown (distinct from a probe clearing it).
-                events.record_event(
-                    "cooldown_cleared_by_success", agent=self, label=label
-                )
-            _save_cooldown_store(self, model_cooldowns)
-            # v2.5.2: cross-agent healthy-label reset. See
-            # _mark_label_healthy / _maybe_clear_cooldown_for_healthy_label.
-            _mark_label_healthy(self, label)
-            # v2.6: warm-label timestamp. Subsequent calls to this label
-            # within `cascade_warm_window_s` get the shorter warm timeout.
-            # Mirrors the _INMEM_HEALTHY_LABELS pattern at module top.
-            _WARM_LABELS[label] = time.monotonic()
-            # v2.5.1: a successful call voids any pending primary-skip
-            # escalation -- the cascade has proven itself healthy. Both
-            # primary-recovered and fallback-succeeded paths count.
-            _reset_primary_strikes()
-            if idx != current_idx:
-                ok = f"Chat model fallback succeeded, now using [{idx}]: {label}"
-                self.context.log.log("info", content=ok)
-                PrintStyle(font_color="cyan", padding=True).print(ok)
-            # Continuous mode: announce recovery from a long fallback stretch.
-            nonlocal consecutive_full_cycles, fallback_started_at
-            # Phase 3 stagnation counter + one-log-per-outage gate live in
-            # the enclosing scope. The chat _compute_cycle_sleep doesn't
-            # consume them yet, but reset them properly so a future
-            # stagnation block can't silently break the same way. See memory:
-            # model-fallback stagnation nonlocal.
-            nonlocal consecutive_no_success_cycles, stagnation_logged_this_outage
-            if continuous_mode and consecutive_full_cycles > 0:
-                elapsed = int(time.monotonic() - fallback_started_at)
-                recovery_msg = (
-                    f"Chat model recovered after {consecutive_full_cycles} "
-                    f"full cycle(s) and {elapsed}s of fallback -- quota "
-                    f"refresh detected on [{idx}]: {label}."
-                )
-                self.context.log.log("info", content=recovery_msg)
-                PrintStyle(font_color="cyan", padding=True).print(recovery_msg)
-            consecutive_full_cycles = 0
-            # v2.6: Phase 3 — any success clears the stagnation counter
-            # and re-arms the one-log-per-outage gate. Until the next
-            # zero-success run starts, _compute_cycle_sleep won't
-            # amplify again.
-            consecutive_no_success_cycles = 0
-            stagnation_logged_this_outage = False
-            fallback_started_at = time.monotonic()
-            # Clear extended-retry state on success
-            self.set_data(DATA_KEY_EXT_RETRY_ATTEMPTS, 0)
-            self.set_data(DATA_KEY_EXT_RETRY_PHASE, 0)
-            self.set_data(DATA_KEY_EXT_RETRY_NOTIFIED, False)
-            await extension.call_extensions_async(
-                "chat_model_call_after",
-                self,
-                call_data=call_data,
-                response=response,
-                reasoning=reasoning,
-            )
-            return response, reasoning
-
-        # Capture the inner coroutine so we can close() it on timeout. See
-        # the matching block in ``_call_utility_model`` for the rationale
-        # (litellm's ``OpenAIChatCompletion.acompletion`` leaks an
-        # unawaited coroutine on every ``asyncio.wait_for`` cancellation).
-        _inner_coro = call_data["model"].unified_call(
+    def inner_coro_builder(call_data):
+        return call_data["model"].unified_call(
             messages=call_data["messages"],
             reasoning_callback=call_data["reasoning_callback"],
             response_callback=call_data["response_callback"],
@@ -3567,187 +3113,51 @@ async def _patched_call_chat_model(
             fallbacks=None,
         )
 
-        # v2.6: per-candidate warm/cold timeout resolution (mirrors
-        # _patched_call_utility_model). Each fallback candidate gets its
-        # own warm-check against its own label. The user-kwarg TIMEOUT=
-        # override was already applied at the top of the cascade to
-        # compute `timeout_s`; if the user set a kwarg we skip the
-        # warm-check (preserves the legacy contract that kwarg overrides
-        # everything).
-        user_kwarg_set = "TIMEOUT" in model_kwargs or "timeout" in model_kwargs
-        if user_kwarg_set:
-            effective_timeout_s = timeout_s
-        else:
-            effective_timeout_s = _resolve_per_call_timeout(
-                label, timeout_s, warm_timeout_s, warm_window_s,
-                self, cand_api_base,
-            )
+    async def success_prepare(call_data, response, reasoning):
+        # Chat-only validation: a plain text response is fine, but a
+        # parsed tool request must be validated by the agent.
+        if not call_data.get("background"):
+            tool_request = extract_tools.json_parse_dirty(response)
+            if tool_request is not None:
+                await self.validate_tool_request(tool_request)
 
-        async def _call_chat_model():
-            # v2.6: same CancelledError-vs-TimeoutError split as the
-            # utility cascade. See the comment in _call_utility_model
-            # for the rationale (wait_for raises at the timeout
-            # boundary, so a 50% gate is meaningless; the actual user
-            # intent of "don't preempt healthy calls" is honored by
-            # leaving externally-cancelled calls alone).
-            started_at = time.monotonic()
-            try:
-                return await asyncio.wait_for(_inner_coro, timeout=effective_timeout_s)
-            except asyncio.CancelledError:
-                # External cancellation -- don't preempt the inner coro.
-                raise
-            except asyncio.TimeoutError:
-                # Genuine inner timeout. Inner coro is already cancelled
-                # by wait_for; close it explicitly so it doesn't leak a
-                # frame + a warning.
-                try:
-                    if _inner_coro.cr_frame is not None:
-                        _inner_coro.close()
-                except Exception:
-                    pass
-                raise
+    def error_msg_fn(e, idx, label):
+        is_overflow = _is_context_overflow_error(e)
+        err_type = "ContextOverflow" if is_overflow else type(e).__name__
+        return f"Chat model [{idx}] error ({err_type}): {label} - {_format_exception(e)}"
 
-        try:
-            response, reasoning = await _call_chat_model()
-            return await _succeed(response, reasoning)
+    async def after_hook_fire(call_data, response, reasoning):
+        await extension.call_extensions_async(
+            "chat_model_call_after",
+            self,
+            call_data=call_data,
+            response=response,
+            reasoning=reasoning,
+        )
 
-        except asyncio.CancelledError:
-            # External cancellation (user intervention, container shutdown).
-            # Never book a cooldown on a healthy label or rotate on -- the
-            # turn cascade already re-raises; mirror it here.
-            raise
-
-        except (asyncio.TimeoutError, TimeoutError) as e:
-            warn = f"Chat model [{idx}] timed out after {int(effective_timeout_s)}s: {label}"
-            self.context.log.log("warning", content=warn)
-            PrintStyle(font_color="orange", padding=True).print(warn)
-            # fix A: evict the warm label so the retry uses the cold
-            # timeout instead of the 20s warm ceiling (see the utility
-            # timeout handler + _evict_warm_on_timeout for the rationale).
-            _evict_warm_on_timeout(e, label)
-            _handle_error_cooldown(
-                e, label, model_cooldowns, self, cand_api_base,
-                probe_model=call_data["model"],
-            )
-            # v2.8.4: the utility cascade escalates the primary on repeated
-            # timeouts (v2.5.1); this branch never did, so a chat primary
-            # that hangs every cycle re-paid the full timeout tax each
-            # cycle. Parity now.
-            _maybe_extend_primary_cooldown(reason="timeout")
-            # Timeouts are transient.
-
-        except Exception as e:
-            # Code-level errors: fail fast -- don't cycle through all candidates
-            timeout_cooldown_booked = False  # v2.8.4: dedupe double-booking
-            if _is_code_error(e):
-                err_msg = (
-                    f"Chat model [{idx}] CODE ERROR ({type(e).__name__}): "
-                    f"{label} - {_format_exception(e)}. "
-                    f"This is a code bug, not an API failure -- failing fast."
-                )
-                self.context.log.log("error", content=err_msg)
-                PrintStyle(font_color="red", padding=True).print(err_msg)
-                _handle_error_cooldown(e, label, model_cooldowns, self, cand_api_base)
-                raise CodeError(e, f"chat model [{label}]")
-
-            # v2.8.3: litellm.Timeout parity -- see the utility cascade.
-            # v2.8.4: mark booked -- the unconditional call at the bottom
-            # of this handler used to write the identical cooldown twice.
-            if _is_timeout_shaped(e):
-                _evict_warm_on_timeout(e, label)
-                _handle_error_cooldown(
-                    e, label, model_cooldowns, self, cand_api_base,
-                    probe_model=call_data["model"],
-                )
-                timeout_cooldown_booked = True
-
-            is_overflow = _is_context_overflow_error(e)
-            err_type = "ContextOverflow" if is_overflow else type(e).__name__
-            err_msg = f"Chat model [{idx}] error ({err_type}): {label} - {_format_exception(e)}"
-            self.context.log.log("warning", content=err_msg)
-            PrintStyle(font_color="orange", padding=True).print(err_msg)
-
-            # Option D: a 5xx from the Responses path means the endpoint is
-            # broken (not a malformed request). Retry ONCE with
-            # chat-completions, then mark sticky so all later turns force
-            # chat proactively (mirrors the core's RESPONSES_UNSUPPORTED_CACHE).
-            # Guard: only when this call actually used Responses -- i.e. chat
-            # was not already forced (option B static, or a prior 5xx). This
-            # avoids a wasted identical retry when chat itself 5xxs.
-            if (
-                responses_5xx_retry_enabled
-                and is_responses_server_error(e)
-                and not should_force_chat_completions(current_model, self)
-            ):
-                mark_responses_5xx_seen(current_model)
-                force_chat_completions_mode(current_model)
-                self.context.log.log(
-                    "warning",
-                    content=(
-                        f"Chat model [{idx}] Responses 5xx; retrying "
-                        f"{label} once with chat-completions."
-                    ),
-                )
-                try:
-                    # v2.8.5: the first attempt already consumed `_inner_coro`,
-                    # and that coroutine captured its kwargs -- including the
-                    # transport mode -- at creation time, BEFORE
-                    # force_chat_completions_mode above mutated the model. The
-                    # old retry re-awaited the consumed coroutine, raised
-                    # "cannot reuse already awaited coroutine", was swallowed
-                    # by the except below, and the "retrying once" log never
-                    # did anything. Build a FRESH coroutine now that the model
-                    # is in chat-completions mode.
-                    _inner_coro = call_data["model"].unified_call(
-                        messages=call_data["messages"],
-                        reasoning_callback=call_data["reasoning_callback"],
-                        response_callback=call_data["response_callback"],
-                        rate_limiter_callback=(
-                            self.rate_limiter_callback
-                            if not call_data["background"]
-                            else None
-                        ),
-                        explicit_caching=call_data["explicit_caching"],
-                        fallbacks=None,
-                    )
-                    response, reasoning = await _call_chat_model()
-                    return await _succeed(response, reasoning)
-                except Exception:
-                    # chat-completions also failed -> fall through to normal
-                    # cooldown + advance. Keep the original exception `e`.
-                    pass
-
-            # v2.8.4: skip when the litellm.Timeout branch above already
-            # booked the identical cooldown (was a benign double-write).
-            if not timeout_cooldown_booked:
-                _handle_error_cooldown(
-                    e, label, model_cooldowns, self, cand_api_base,
-                    probe_model=call_data["model"],
-                )
-            # v2.5.1: same primary-skip escalation for the general error
-            # path. The helper is a no-op when idx != 0.
-            _maybe_extend_primary_cooldown(reason=type(e).__name__)
-            # v2.8.6 (X): rotation-permanent, not cooldown-permanent -- a
-            # 429 books a cooldown but is NOT a dead model, so it must not
-            # count toward the all-permanent summary/escalation path.
-            if _is_permanent_for_rotation(e):
-                cycle_permanent_count += 1
-
-        attempt += 1
-
-    _emit_fallback_summary(self, "chat", candidates)
-    _maybe_raise_retry_after_hours(self, cycle_count, n, attempt, max_cycles=max_cycles)
-
-    exhausted = (
-        f"All chat model candidates exhausted after {cycle_count} cycle(s) "
-        f"({attempt} attempt(s))."
+    spec = _CascadeSpec(
+        kind="chat",
+        log_prefix="Chat model",
+        cycling_prefix="Chat",
+        stagnation_prefix="Chat cascade",
+        timeout_cfg_key="fallback_timeout_s",
+        use_utility_models=use_utility_models,
+        is_utility_cascade=bool(use_utility_models),
+        # Preserved divergence: the chat cascade never advanced the
+        # rotation index on success (its callers re-resolve the chat
+        # model per call); utility's _succeed did.
+        persist_idx_on_success=False,
+        skip_remaining_suffix=" remaining",
+        before_hook="chat_model_call_before",
+        preflight_context="chat model fallback",
+        code_error_ctx="chat model",
+        call_data_builder=call_data_builder,
+        inner_coro_builder=inner_coro_builder,
+        success_prepare=success_prepare,
+        error_msg_fn=error_msg_fn,
+        after_hook_fire=after_hook_fire,
     )
-    self.context.log.log("error", content=exhausted)
-    PrintStyle(font_color="red", padding=True).print(exhausted)
-    # Continuous mode: see the same guard in _patched_call_utility_model.
-    if continuous_mode:
-        return None, None
-    raise RuntimeError(exhausted)
+    return await _run_rotation_cascade(self, spec, model_obj)
 
 
 # ---------------------------------------------------------------------------
