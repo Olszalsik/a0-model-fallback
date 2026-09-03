@@ -1,4 +1,4 @@
-name: _model_fallback
+name: model_fallback
 title: Model Fallback System
 description: >
   Multi-cycle model fallback: when the primary model rate-limits, times
