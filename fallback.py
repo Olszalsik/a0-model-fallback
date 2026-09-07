@@ -243,8 +243,25 @@ _DEFAULT_CASCADE_WARM_WINDOW_S = 600.0
 _DEFAULT_CYCLE_STAGNATION_FACTOR = 1.5
 _DEFAULT_CYCLE_STAGNATION_THRESHOLD = 2
 
+# ---------------------------------------------------------------------------
+# v3.2.0: adaptive generation budgets -- learn per label how long a HEALTHY
+# generation takes. The warm/cold/latency-adaptive ladder sizes a budget
+# BEFORE the call; this layer adjusts budgets from OUTCOMES: a timeout on a
+# label that was likely still generating RAISES the label's override (grow),
+# every success decays it back toward what real generations need (decay),
+# and an absolute wall (gen_budget_max_s) keeps a genuinely hung connection
+# detectable. Process-global, label-keyed, in-memory only -- same lifecycle
+# as _WARM_LABELS: cleared by clear_all_cooldowns(), reset by
+# hooks.uninstall() via reset_gen_budgets().
+_GEN_BUDGET_OVERRIDES: dict = {}
 
-def _resolve_per_call_timeout(
+_DEFAULT_GEN_BUDGET_MAX_S = 600.0
+_DEFAULT_GEN_BUDGET_GROWTH_FACTOR = 1.5
+_DEFAULT_GEN_BUDGET_DECAY_FACTOR = 0.9
+_DEFAULT_GEN_BUDGET_SUCCESS_MARGIN = 1.3
+
+
+def _resolve_per_call_timeout_base(
     label: str,
     base_timeout_s: float,
     warm_timeout_s: float,
@@ -376,6 +393,230 @@ def _resolve_per_call_timeout(
         # to crash a cascade mid-rotation.
         pass
     return base_timeout_s
+
+
+# ---------------------------------------------------------------------------
+# v3.2.0: adaptive generation-budget helpers (grow / decay / apply).
+# Knobs resolve through _get_plugin_cfg (YAML-under-config merge); every
+# helper degrades to a safe no-op on any config failure.
+# ---------------------------------------------------------------------------
+
+def _gen_budget_cfg(agent) -> dict:
+    """Resolve the adaptive-budget knobs; {} on any failure (defaults win)."""
+    try:
+        cfg = _get_plugin_cfg(agent)
+        return cfg if isinstance(cfg, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _gen_budget_override_for(label, agent=None) -> float:
+    """Current learned override for ``label`` (0.0 when none / disabled).
+
+    Public read used by the outer utility-timeout guard
+    (helpers/utility_timeout.guarded_call) so long utility generations get
+    the same learned headroom the cascades grant. Respects the kill-switch.
+    """
+    if not label:
+        return 0.0
+    try:
+        cfg = _gen_budget_cfg(agent)
+        if not bool(cfg.get("adaptive_gen_budget_enabled", True)):
+            return 0.0
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        return float(_GEN_BUDGET_OVERRIDES.get(label) or 0.0)
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def _grow_gen_budget(label, needed_s, agent=None, base_timeout_s=0.0):
+    """Learn from a timeout: the label needed at least ``needed_s``.
+
+    Raises the override to ``max(prev, needed) * gen_budget_growth_factor``,
+    capped at ``gen_budget_max_s``. When the cascade's cold base timeout is
+    known (``base_timeout_s`` > 0) and the result would not exceed it, the
+    override is skipped/removed -- the stock base already covers the need
+    (e.g. a warm-ceiling timeout on a 300s-base label is fixed by the warm
+    eviction, not by a budget override). Returns the new value or None when
+    the grow was skipped. One INFO line + one route event per growth.
+    """
+    if not label:
+        return None
+    try:
+        needed = max(0.0, float(needed_s or 0.0))
+    except (TypeError, ValueError):
+        return None
+    if needed <= 0:
+        return None
+    cfg = _gen_budget_cfg(agent)
+    if not bool(cfg.get("adaptive_gen_budget_enabled", True)):
+        return None
+    try:
+        factor = max(1.0, float(cfg.get("gen_budget_growth_factor") or _DEFAULT_GEN_BUDGET_GROWTH_FACTOR))
+    except (TypeError, ValueError):
+        factor = _DEFAULT_GEN_BUDGET_GROWTH_FACTOR
+    try:
+        max_s = max(0.0, float(cfg.get("gen_budget_max_s") or _DEFAULT_GEN_BUDGET_MAX_S))
+    except (TypeError, ValueError):
+        max_s = _DEFAULT_GEN_BUDGET_MAX_S
+    try:
+        prev = float(_GEN_BUDGET_OVERRIDES.get(label) or 0.0)
+    except Exception:  # noqa: BLE001
+        prev = 0.0
+    try:
+        base = max(0.0, float(base_timeout_s or 0.0))
+    except (TypeError, ValueError):
+        base = 0.0
+    new = min(max(prev, needed) * factor, max_s) if max_s > 0 else max(prev, needed)
+    if new <= 0:
+        return None
+    if base > 0 and new <= base:
+        # The stock cold base already covers this need -- an override at or
+        # below it is dead weight (apply would return the base anyway).
+        # Remove any stale override so decay starts clean if the base is
+        # later lowered.
+        _GEN_BUDGET_OVERRIDES.pop(label, None)
+        return None
+    _GEN_BUDGET_OVERRIDES[label] = new
+    try:
+        PrintStyle(font_color="cyan", padding=True).print(
+            f"[_model_fallback] adaptive generation budget for '{label}' "
+            f"raised to {new:.0f}s (was {prev:.0f}s, needed >= {needed:.0f}s). "
+            f"The model was likely still generating -- next calls on this "
+            f"label get more time before the timeout fires."
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        events.record_event(
+            "gen_budget_grown",
+            agent=agent,
+            label=str(label),
+            budget_s=round(new, 1),
+            needed_s=round(needed, 1),
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    return new
+
+
+def _decay_gen_budget(label, elapsed_s, agent=None, base_timeout_s=0.0):
+    """Un-learn on success: decay the override toward what real generations
+    need. Floors at ``elapsed * gen_budget_success_margin`` (a success that
+    took ``elapsed`` seconds proves the label needs at least that much
+    headroom) and DELETES the override once it decays to/below the
+    cascade's cold base timeout -- back to stock behavior. Returns the new
+    value, or None when the override was removed / absent / disabled.
+    """
+    if not label or label not in _GEN_BUDGET_OVERRIDES:
+        return None
+    cfg = _gen_budget_cfg(agent)
+    if not bool(cfg.get("adaptive_gen_budget_enabled", True)):
+        return None
+    try:
+        elapsed = max(0.0, float(elapsed_s or 0.0))
+    except (TypeError, ValueError):
+        return None
+    try:
+        decay = min(1.0, max(0.0, float(cfg.get("gen_budget_decay_factor") or _DEFAULT_GEN_BUDGET_DECAY_FACTOR)))
+    except (TypeError, ValueError):
+        decay = _DEFAULT_GEN_BUDGET_DECAY_FACTOR
+    try:
+        margin = max(1.0, float(cfg.get("gen_budget_success_margin") or _DEFAULT_GEN_BUDGET_SUCCESS_MARGIN))
+    except (TypeError, ValueError):
+        margin = _DEFAULT_GEN_BUDGET_SUCCESS_MARGIN
+    try:
+        max_s = max(0.0, float(cfg.get("gen_budget_max_s") or _DEFAULT_GEN_BUDGET_MAX_S))
+    except (TypeError, ValueError):
+        max_s = _DEFAULT_GEN_BUDGET_MAX_S
+    try:
+        prev = float(_GEN_BUDGET_OVERRIDES.get(label) or 0.0)
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        base = max(0.0, float(base_timeout_s or 0.0))
+    except (TypeError, ValueError):
+        base = 0.0
+    decayed = prev * decay
+    floor = elapsed * margin
+    new = min(max(decayed, floor), max_s) if max_s > 0 else max(decayed, floor)
+    if base > 0 and decayed <= base and floor <= base:
+        # Both the decayed value AND the evidence floor sit at/below the
+        # stock cold base -- the override protects nothing the base
+        # doesn't already cover. Drop it; stock behavior resumes. (The
+        # floor alone must NOT trigger deletion: a recent long success is
+        # exactly the evidence the override exists to protect.)
+        _GEN_BUDGET_OVERRIDES.pop(label, None)
+        return None
+    if new <= 0:
+        _GEN_BUDGET_OVERRIDES.pop(label, None)
+        return None
+    _GEN_BUDGET_OVERRIDES[label] = new
+    return new
+
+
+def _apply_gen_budget(label, budget_s, agent=None) -> float:
+    """Apply the learned override on top of a resolved budget. The override
+    can only RAISE the budget, never shrink it, and is itself capped by
+    ``gen_budget_max_s`` (the absolute wall). Kill-switch off -> identity.
+    """
+    try:
+        budget = max(0.0, float(budget_s or 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+    try:
+        cfg = _gen_budget_cfg(agent)
+        if not bool(cfg.get("adaptive_gen_budget_enabled", True)):
+            return budget
+        max_s = max(0.0, float(cfg.get("gen_budget_max_s") or _DEFAULT_GEN_BUDGET_MAX_S))
+    except Exception:  # noqa: BLE001
+        return budget
+    try:
+        override = float(_GEN_BUDGET_OVERRIDES.get(label) or 0.0)
+    except Exception:  # noqa: BLE001
+        override = 0.0
+    if override <= 0:
+        return budget
+    return min(max(budget, override), max_s) if max_s > 0 else max(budget, override)
+
+
+def reset_gen_budgets() -> None:
+    """v3.2.0: drop all learned generation budgets. Called by
+    hooks.uninstall() (same lifecycle as latency.reset()) and by tests.
+    """
+    _GEN_BUDGET_OVERRIDES.clear()
+
+
+def _resolve_per_call_timeout(
+    label: str,
+    base_timeout_s: float,
+    warm_timeout_s: float,
+    warm_window_s: float,
+    agent=None,
+    api_base: str = "",
+    allow_warm: bool = True,
+) -> float:
+    """v3.2.0 wrapper: apply the learned generation-budget override on top
+    of the base warm/cold/latency-adaptive resolution (see
+    ``_resolve_per_call_timeout_base``). The override RAISES any capacity
+    class's ceiling -- long answers happen on routers and paid models too
+    -- and never shrinks a budget. The user's explicit TIMEOUT= kwarg
+    never reaches this helper (checked at the call sites), so it still
+    wins over everything.
+    """
+    try:
+        budget = _resolve_per_call_timeout_base(
+            label, base_timeout_s, warm_timeout_s, warm_window_s,
+            agent=agent, api_base=api_base, allow_warm=allow_warm,
+        )
+    except Exception:  # noqa: BLE001
+        return max(0.0, float(base_timeout_s or 0.0))
+    try:
+        return _apply_gen_budget(label, budget, agent)
+    except Exception:  # noqa: BLE001
+        return budget
 
 
 def _evict_warm_on_timeout(exc, label: str) -> None:
@@ -531,6 +772,11 @@ def clear_all_cooldowns(agent, *, cross_context: bool = False) -> int:
     # process-wide), so a user-initiated clear resets them process-wide.
     _INMEM_DEAD_LABELS.clear()
     _WARM_LABELS.clear()
+    # v3.2.0: learned generation budgets are the same class of runtime
+    # state -- the documented "fix your key, then clear cooldowns"
+    # recovery must also reset them, or a grown budget would survive a
+    # user-initiated clear.
+    _GEN_BUDGET_OVERRIDES.clear()
     try:
         agent.set_data(DATA_KEY_COOLDOWNS, {})
         agent.set_data(DATA_KEY_COOLDOWN_SEED_AT, time.time())
@@ -2842,6 +3088,17 @@ async def _run_rotation_cascade(self, spec: _CascadeSpec, model_obj):
                     )
                 except Exception:
                     pass
+                # v3.2.0: decay the learned generation budget on success --
+                # the label just proved how long a real generation takes.
+                # The floor keeps the override above what this success
+                # needed; once it decays to/below the cold base (timeout_s)
+                # the override is dropped and stock behavior resumes.
+                try:
+                    _decay_gen_budget(
+                        label, time.monotonic() - started_at, self, timeout_s,
+                    )
+                except Exception:
+                    pass
                 return result
             except asyncio.CancelledError:
                 # External cancellation -- don't preempt the inner coro.
@@ -2889,6 +3146,12 @@ async def _run_rotation_cascade(self, spec: _CascadeSpec, model_obj):
                 latency.clear_label(label)
             except Exception:
                 pass
+            # v3.2.0: learn from the outcome instead of only punishing. The
+            # call burned the whole budget -- the label needed AT LEAST
+            # this long (it was likely still generating). Raise the label's
+            # adaptive generation budget so the NEXT call gets more time
+            # instead of repeating the same timeout + cooldown loop.
+            _grow_gen_budget(label, effective_timeout_s, self, timeout_s)
             _handle_error_cooldown(
                 e, label, model_cooldowns, self, cand_api_base,
                 probe_model=call_data["model"],
@@ -2930,6 +3193,8 @@ async def _run_rotation_cascade(self, spec: _CascadeSpec, model_obj):
                     latency.clear_label(label)
                 except Exception:
                     pass
+                # v3.2.0: grow-on-timeout parity with the wait_for branch.
+                _grow_gen_budget(label, effective_timeout_s, self, timeout_s)
                 _handle_error_cooldown(
                     e, label, model_cooldowns, self, cand_api_base,
                     probe_model=call_data["model"],
@@ -3696,6 +3961,17 @@ async def _patched_call_chat_model_turn(
                     latency.clear_label(label)
                 except Exception:
                     pass
+                # v3.2.0: grow-on-timeout parity with the cascade engine.
+                # The turn path's actual elapsed time is the better signal:
+                # the call streamed/ran for this long before the budget
+                # fired, so the label needed at least this much.
+                try:
+                    _grow_gen_budget(
+                        label, time.monotonic() - _turn_started_at, self,
+                        timeout_s,
+                    )
+                except Exception:
+                    pass
             _handle_error_cooldown(
                 e, label, model_cooldowns, self, cand_api_base,
                 probe_model=current_model,
@@ -3773,6 +4049,15 @@ async def _patched_call_chat_model_turn(
                 time.monotonic() - _turn_started_at,
                 enabled=bool(_lat_cfg.get("latency_adaptive_enabled", True)),
                 max_samples=_lat_cfg.get("latency_max_samples", 20),
+            )
+        except Exception:
+            pass
+        # v3.2.0: decay the learned generation budget on success (same
+        # contract as the cascade engine's success path; the floor keeps
+        # the override above what this real turn needed).
+        try:
+            _decay_gen_budget(
+                label, time.monotonic() - _turn_started_at, self, timeout_s,
             )
         except Exception:
             pass

@@ -79,6 +79,142 @@ Knobs: `latency_adaptive_enabled` (true) · `latency_min_samples` (5) ·
 `latency_p95_margin` (1.5) · `latency_floor_s` (45.0) ·
 `latency_max_samples` (20).
 
+### v3.1.1 — free-model tolerance tuning (2026-09-06)
+
+User report: on the all-free preset (`nvidia_nim/moonshotai/kimi-k3` chat +
+`openrouter/z-ai/glm-5.2:free` fallback) the agent kept getting interrupted
+mid-run with `Transient LLM error (TimeoutError) -- the agent will retry
+automatically (N/5)` and eventually stopped.
+
+**Diagnosis.** Free pools are slow AND rate-limited: a healthy kimi-k3
+thinking turn streams for 60 s+ and OpenRouter `:free` answers with
+`upstream_429` / slow TTFT. Budgets tuned for fast paid cloud calls killed
+those healthy-but-slow calls (turn base 180 s, adaptive floor 45 s, warm
+ceiling 20 s, outer utility guard 60 s), the cascade rotated into the other
+free model, which failed too, and the escaped TimeoutError landed in the
+`_60` net. Five consecutive swallows inside the 300 s window stopped the run.
+
+**Changes.**
+* `config.json` (user-tuned free-model profile): `fallback_timeout_s`
+  180→300, `fallback_utility_timeout_s` 60→120, `cascade_warm_timeout_s`
+  20→45, `latency_floor_s` 45→90, `latency_p95_margin` 1.5→2.0,
+  `utility_timeout_guard.default_timeout_s` 60→120 and `max_wait_s`
+  180→240 (outer guard must exceed the inner cascade's largest legitimate
+  per-candidate wait), plus `transient_swallow_max: 8` and
+  `transient_swallow_reset_window_s: 600`.
+* `_60_handle_transient_llm_error.py`: the swallow bound is now
+  configurable — `transient_swallow_max` (default 5) and
+  `transient_swallow_reset_window_s` (default 300 s), resolved from plugin
+  config at exception time; read/garbage failures keep the historic
+  behavior. Both knobs documented in `default_config.yaml` (live via the
+  `_get_plugin_cfg` YAML-under-config merge).
+* Tests: `test_safety_net_uses_configured_swallow_cap` and
+  `test_safety_net_bad_config_falls_back_to_defaults` in
+  `tests/test_turn_cascade_v28.py`; the existing cap test now resolves the
+  bound via `_swallow_limits` instead of the removed module constant.
+* No cascade/engine behavior change: same precedence order, same cooldown
+  table — only the budgets and the safety-net bound got looser.
+
+### v3.2.0 — adaptive generation budgets: never punish a thinking agent (2026-09-06)
+
+User report (2026-09-06 docker log, AFTER v3.1.1 tuning): chat turns still
+die with `TimeoutError on [0] after 60s cooldown` → `All chat model
+candidates exhausted` → `All model candidates are currently unavailable.
+Retrying in 60s` while the model was mid-answer (long essay / deep
+thinking). Static budgets — no matter how well tuned — trade two failure
+modes against each other: raise them and a hung connection stalls the
+agent for minutes; lower them and healthy slow generations get killed and
+then PUNISHED with a cooldown for the crime of thinking longer than the
+budget. A fixed number cannot win both.
+
+**Design goal.** Separate "hung" from "working" per label and make the
+per-call budget ADAPTIVE: grow when a label proves it needs longer
+(likely still generating), decay back when successes are fast again, keep
+an absolute wall so a genuinely wedged connection is still detected.
+
+**Mechanism (phases, in implementation order).**
+
+1. **Grow-on-timeout (learn).** New process-global
+   `_GEN_BUDGET_OVERRIDES: dict[label -> float]` in `fallback.py`
+   (lifecycle identical to `_WARM_LABELS`: in-memory, cleared by
+   `clear_all_cooldowns`, reset by `hooks.uninstall`). At every cascade
+   TimeoutError branch (engine wait_for timeout + engine timeout-shaped +
+   turn path — the same sites that call `_evict_warm_on_timeout` and book
+   the timeout cooldown): when `adaptive_gen_budget_enabled`, raise the
+   override to
+   `min(max(prev, elapsed) * gen_budget_growth_factor, gen_budget_max_s)`.
+   When the cascade's cold base (`timeout_s`) is known and the result
+   would not exceed it, the grow is SKIPPED (and any stale override
+   removed): the stock base already covers the need — a warm-ceiling
+   timeout on a 300s-base label is fixed by the warm eviction, not by a
+   budget override. The outer utility guard's grow call passes no base
+   (it doesn't know the cascade base; growing is the conservative
+   choice). Skip on `asyncio.CancelledError` (external cancel ≠ slow
+   model) and on deterministic upstream errors (they fast-fail, not time
+   out). One INFO line + `events.record_event("gen_budget_grown", ...)`
+   per growth.
+
+2. **Apply (effective budget).** Wrap `_resolve_per_call_timeout`: after
+   the existing precedence chain (router warm-up / `unlimited_paid` /
+   warm fast-path / latency-adaptive shrink / base) returns `budget`,
+   return `min(max(budget, override), gen_budget_max_s)`. The override
+   RAISES any capacity class's ceiling — long answers happen on routers
+   and paid models too. The user's explicit `TIMEOUT=` kwarg still wins
+   (it never reaches this helper; unchanged).
+
+3. **Decay-on-success (un-learn).** Where successes mark
+   `_WARM_LABELS[label]` (engine `_call_inner` post-`wait_for` and the
+   turn success block — the same sites latency samples are recorded):
+   decay the override `* gen_budget_decay_factor`, floored at
+   `elapsed * gen_budget_success_margin` (never below what a real
+   generation just needed), and DELETE the override once BOTH the decayed
+   value AND the evidence floor sit at/below the cold base timeout — the
+   floor alone must not trigger deletion, because a recent long success
+   is exactly the evidence the override exists to protect.
+
+4. **Outer utility-guard parity.** `helpers/utility_timeout.guarded_call`
+   raises its budget with the same learned override AND lifts its
+   `max_wait_s` cap to `max(max_wait_s, override)` — otherwise a long
+   utility generation dies at the outer cap even when the inner cascade
+   would now allow it. Lazy `from ... import fallback` inside the
+   function (existing pattern, no import cycle).
+
+5. **Config knobs** (`default_config.yaml`, resolved via
+   `_get_plugin_cfg`): `adaptive_gen_budget_enabled` (true, kill-switch —
+   gates grow AND apply AND decay), `gen_budget_max_s` (600 — the
+   absolute wall; a hung call is still detected within it),
+   `gen_budget_growth_factor` (1.5), `gen_budget_decay_factor` (0.9),
+   `gen_budget_success_margin` (1.3).
+
+6. **Optional follow-up (v3.2.1).** Persist overrides next to the
+   cooldown store (`mfb_gen_budgets` agent.data key) with the same
+   fresh-seed policy as the cooldowns, so a quick `run_ui` restart during
+   a long-answer workload does not re-learn from scratch. Skip unless
+   restarts prove costly in practice.
+
+**Why not stream-aware idle timeouts instead?** The transport
+(`LiteLLMTransport.astream`) lives in core `models.py`; wiring chunk-level
+progress into the plugin's `wait_for` would either touch core files
+(forbidden by the plugin contract) or re-implement the transport here.
+The budget-learning approach needs zero core changes and composes with the
+existing warm/cold/latency-adaptive precedence. If core ever exposes a
+progress callback, an idle-timeout can be layered on top as a refinement.
+
+**Tests.** `tests/test_adaptive_gen_budget_v320.py` (mirror
+`test_latency_adaptive_v310.py` style): grow caps at `gen_budget_max_s`;
+CancelledError / deterministic errors do not grow; apply overrides every
+capacity class; decay floors at `elapsed * margin` and deletes below
+base; kill-switch disables all three; `reset()` clears state. Full
+plugin suite must stay green.
+
+**Verification.** `pytest usr/plugins/_model_fallback/tests/ -q` green;
+both AST scanners (`tmp/scan_unbound_locals.py`,
+`tmp/scan_undefined_names.py`) clean; live check: one long-generation
+turn logs the single grow event, subsequent turns complete without the
+60s-cooldown retry loop, and a genuinely hung endpoint still rotates
+within `gen_budget_max_s`.
+
+### v3.0.0 — cascade unification (2026-09-03)
 ### v3.0.0 — cascade unification (2026-09-03)
 
 Roadmap item 2. **`fallback.py` net −590 lines** (4,364 → 3,774). Full
@@ -435,7 +571,9 @@ Two additions fix it:
    cascade. Books the cooldown (best-effort label from `exc.model`), sleeps
    3 s, and clears `data["exception"]` — bounded at 5 consecutive swallows
    (state resets after 5 quiet minutes) so a genuinely broken setup still
-   surfaces. Runs BEFORE `_70` and must never touch `RetryAfterHours`.
+   surfaces. v3.1.1: the bound is configurable via `transient_swallow_max`
+   / `transient_swallow_reset_window_s` — see the v3.1.1 section.
+   Runs BEFORE `_70` and must never touch `RetryAfterHours`.
 
 Both mechanisms share the cooldown store with the chat/utility cascades, so a
 429 learned on any path protects every other path on the next turn.

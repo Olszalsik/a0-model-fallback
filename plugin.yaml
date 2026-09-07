@@ -18,7 +18,7 @@ description: >
   config base — never applied to routers or unlimited_paid labels.
   Self-contained; no official agent-zero file is
   modified.
-version: 3.1.0
+version: 3.2.0
 settings_sections:
   - agent
   - developer

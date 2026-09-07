@@ -389,6 +389,49 @@ latency_p95_margin: 1.5
 latency_floor_s: 45.0
 latency_max_samples: 20
 
+# --- v3.2.0 Adaptive generation budgets (added 2026-09-06) -------------------
+# A fixed per-call timeout cannot tell "hung connection" from "healthy model
+# writing a long answer" -- and when it guesses wrong, the cascade kills a
+# mid-generation call and PUNISHES the label with a cooldown, producing the
+# "TimeoutError on [0] after 60s cooldown" -> all-candidates-exhausted loop.
+# These knobs make the per-call budget ADAPTIVE per label:
+#   - GROW: a timeout raises that label's budget
+#           (max(prev, needed) * gen_budget_growth_factor), so the next call
+#           on the label gets more time instead of repeating the loop.
+#   - APPLY: the override can only RAISE a resolved budget (any capacity
+#           class), never shrink it.
+#   - DECAY: every success decays the override (x gen_budget_decay_factor),
+#           floored at elapsed * gen_budget_success_margin, and the override
+#           is deleted once it decays to/below the cold base timeout.
+#   - WALL: gen_budget_max_s caps everything -- a genuinely hung connection
+#           is still detected within it.
+# Overrides are process-global, label-keyed, in-memory runtime state: cleared
+# by "Clear cooldowns" and reset by plugin uninstall. The outer utility
+# timeout guard (utility_timeout_guard) applies the same override.
+# Set adaptive_gen_budget_enabled: false to restore exact pre-v3.2.0
+# behavior (grow, apply and decay all become no-ops).
+adaptive_gen_budget_enabled: true
+gen_budget_max_s: 600.0
+gen_budget_growth_factor: 1.5
+gen_budget_decay_factor: 0.9
+gen_budget_success_margin: 1.3
+
+# --- v3.1.1 Free-model tolerance knobs (added 2026-09-06) --------------------
+# Free-tier endpoints (NVIDIA NIM free, OpenRouter ":free", shared pools) are
+# slow AND rate-limited: a healthy reasoning turn can stream for minutes, and
+# a quota storm can eat more retries than a paid endpoint ever would. These
+# two knobs bound ONLY the last-resort handle_exception safety net
+# (_60_handle_transient_llm_error) -- the turn cascade's own budgets are
+# fallback_timeout_s / cascade_warm_timeout_s / the latency_* block above.
+#
+# transient_swallow_max: how many consecutive escaped transient errors
+#   (TimeoutError / 429 / 5xx) the safety net may swallow before letting the
+#   exception propagate and stopping the agent. Historic default 5.
+# transient_swallow_reset_window_s: quiet period (s) after which the swallow
+#   counter resets. Historic default 300.
+transient_swallow_max: 5
+transient_swallow_reset_window_s: 300.0
+
 # --- v2.6 Cascade stagnation amplification (added 2026-07-28) -----------------
 # When `cycle_stagnation_threshold` consecutive full cycles complete
 # without ANY candidate succeeding (every model still in cooldown),

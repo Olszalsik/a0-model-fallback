@@ -86,6 +86,12 @@ def set_resolved(cfg: Dict[str, Any]) -> None:
 
 
 def get_resolved() -> Dict[str, Any]:
+    # v3.1.1 fix: same UnboundLocalError as helpers/utility_timeout.py --
+    # the assignment below makes ``_resolved`` function-local without
+    # ``global``, so the read on the first line raised
+    # ``UnboundLocalError`` on every call. Currently latent (no caller
+    # yet) but kept correct for future use.
+    global _resolved
     if not _resolved:
         _resolved = dict(DEFAULTS)
     return _resolved

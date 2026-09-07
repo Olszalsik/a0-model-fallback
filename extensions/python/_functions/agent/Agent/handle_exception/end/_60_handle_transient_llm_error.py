@@ -19,9 +19,13 @@ paths not yet covered). It must therefore stay narrow:
     CancelledError, never HandledException.
   - Books the cooldown (shared store) so the next turn routes around the
     failing label even when the cascade couldn't record it.
-  - Bounded: at most 5 consecutive swallows per agent (state resets after
-    5 quiet minutes) -- past that the exception is left for _90 so a
-    genuinely broken setup still surfaces instead of looping forever.
+  - Bounded: at most ``transient_swallow_max`` consecutive swallows per
+    agent (plugin config; default 5), with the counter resetting after
+    ``transient_swallow_reset_window_s`` (default 300s) of quiet --
+    past that the exception is left for _90 so a genuinely broken setup
+    still surfaces instead of looping forever. v3.1.1 made both bounds
+    configurable so slow free-tier presets (NVIDIA NIM free, OpenRouter
+    :free) can tolerate longer transient-error storms.
 
 Ordering: runs BEFORE _70_handle_retry_after_hours (which owns the
 RetryAfterHours contract) -- we explicitly skip RetryAfterHours and leave
@@ -35,8 +39,51 @@ from helpers.print_style import PrintStyle
 
 DATA_KEY_SWALLOW_COUNT = "_mfb_transient_swallow_count"
 DATA_KEY_SWALLOW_AT = "_mfb_transient_swallow_at"
-MAX_CONSECUTIVE_SWALLOWS = 5
-SWALLOW_RESET_WINDOW_S = 300.0
+# v3.1.1: the bound is configurable via plugin config so slow free-tier
+# presets can tolerate longer transient-error storms. The historic
+# hard-coded values (5 / 300s) stay as the defaults -- a missing or
+# unreadable knob preserves the original behavior exactly.
+_DEFAULT_MAX_CONSECUTIVE_SWALLOWS = 5
+_DEFAULT_SWALLOW_RESET_WINDOW_S = 300.0
+
+
+def _swallow_limits(agent) -> tuple[int, float]:
+    """(max_consecutive_swallows, reset_window_s) from plugin config.
+
+    Read at exception time (not import time) so a WebUI config change
+    takes effect on the next failure without a restart. Any read
+    failure falls back to the historic defaults -- this net must never
+    become the bug.
+    """
+    cfg: dict = {}
+    try:
+        from helpers import plugins as plugin_helpers
+
+        raw = plugin_helpers.get_plugin_config("_model_fallback", agent)
+        if isinstance(raw, dict):
+            cfg = raw
+    except Exception:
+        cfg = {}
+    try:
+        max_swallows = int(
+            cfg.get("transient_swallow_max", _DEFAULT_MAX_CONSECUTIVE_SWALLOWS)
+        )
+    except Exception:
+        max_swallows = _DEFAULT_MAX_CONSECUTIVE_SWALLOWS
+    if max_swallows < 1:
+        max_swallows = _DEFAULT_MAX_CONSECUTIVE_SWALLOWS
+    try:
+        reset_window_s = float(
+            cfg.get(
+                "transient_swallow_reset_window_s",
+                _DEFAULT_SWALLOW_RESET_WINDOW_S,
+            )
+        )
+    except Exception:
+        reset_window_s = _DEFAULT_SWALLOW_RESET_WINDOW_S
+    if reset_window_s <= 0:
+        reset_window_s = _DEFAULT_SWALLOW_RESET_WINDOW_S
+    return max_swallows, reset_window_s
 
 
 def _is_transient_llm_error(exc: Exception) -> bool:
@@ -140,16 +187,19 @@ class HandleTransientLLMError(Extension):
             pass
 
         # --- Bounded swallow counter ----------------------------------------
+        # v3.1.1: bounds come from plugin config (free-model presets can
+        # raise both); historic defaults preserved on any read failure.
+        max_swallows, reset_window_s = _swallow_limits(self.agent)
         now = time.monotonic()
         last_at = float(self.agent.get_data(DATA_KEY_SWALLOW_AT) or 0.0)
         count = int(self.agent.get_data(DATA_KEY_SWALLOW_COUNT) or 0)
-        if now - last_at > SWALLOW_RESET_WINDOW_S:
+        if now - last_at > reset_window_s:
             count = 0
         count += 1
         self.agent.set_data(DATA_KEY_SWALLOW_COUNT, count)
         self.agent.set_data(DATA_KEY_SWALLOW_AT, now)
 
-        if count > MAX_CONSECUTIVE_SWALLOWS:
+        if count > max_swallows:
             # Give up quietly -- leave the exception so the critical handler
             # surfaces it (the agent stops rather than spinning silently).
             self.agent.context.log.log(
@@ -164,7 +214,7 @@ class HandleTransientLLMError(Extension):
 
         message = (
             f"Transient LLM error ({type(exc).__name__}) -- the agent will "
-            f"retry automatically ({count}/{MAX_CONSECUTIVE_SWALLOWS}). "
+            f"retry automatically ({count}/{max_swallows}). "
             f"Rate-limited or unreachable provider; rotating on the next turn."
         )
         PrintStyle(font_color="yellow", padding=True).print(message)

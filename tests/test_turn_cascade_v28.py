@@ -20,6 +20,9 @@ Covered here:
   6. The ``_60_handle_transient_llm_error`` safety net swallows a bare
      429 that escaped everything (data["exception"] -> None) and books
      the cooldown.
+  7. (v3.1.1) The safety net's swallow bound is configurable via the
+     ``transient_swallow_max`` / ``transient_swallow_reset_window_s``
+     plugin knobs; unreadable values fall back to the historic 5 / 300s.
 
 Test:
     cd /a0
@@ -367,8 +370,10 @@ def test_safety_net_caps_consecutive_swallows(isolation, monkeypatch):
     monkeypatch.setattr(asyncio, "sleep", fake_sleep)
 
     ext = mod.HandleTransientLLMError(agent=agent)
-    # Pre-set the counter at the cap
-    agent.set_data(mod.DATA_KEY_SWALLOW_COUNT, mod.MAX_CONSECUTIVE_SWALLOWS)
+    # Pre-set the counter at the cap (v3.1.1: the bound is resolved from
+    # plugin config at exception time; the historic default is 5)
+    cap, _window = mod._swallow_limits(agent)
+    agent.set_data(mod.DATA_KEY_SWALLOW_COUNT, cap)
     agent.set_data(mod.DATA_KEY_SWALLOW_AT, time.monotonic())
 
     data = {"exception": FakeRateLimit()}
@@ -376,3 +381,52 @@ def test_safety_net_caps_consecutive_swallows(isolation, monkeypatch):
 
     # Over the cap: exception left for the critical handler
     assert data["exception"] is not None
+
+
+def test_safety_net_uses_configured_swallow_cap(isolation, monkeypatch):
+    """v3.1.1: the swallow bound comes from plugin config, not a
+    hard-coded constant -- slow free-tier presets raise both knobs."""
+    import helpers.plugins as plugin_helpers
+
+    models = isolation
+    agent = FakeAgent(models["openrouter/z-ai/glm-5.2:free"])
+    mod = _load_safety_net()
+
+    async def fake_sleep(_s):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(
+        plugin_helpers,
+        "get_plugin_config",
+        lambda name, agent=None: {"transient_swallow_max": 2},
+        raising=True,
+    )
+
+    ext = mod.HandleTransientLLMError(agent=agent)
+    for _ in range(2):
+        data = {"exception": FakeRateLimit()}
+        asyncio.run(ext.execute(data=data))
+        assert data["exception"] is None  # inside the configured cap
+    # Third consecutive failure is past the configured cap of 2
+    data = {"exception": FakeRateLimit()}
+    asyncio.run(ext.execute(data=data))
+    assert data["exception"] is not None
+
+
+def test_safety_net_bad_config_falls_back_to_defaults(isolation, monkeypatch):
+    """v3.1.1: unreadable knob values keep the historic 5 / 300s bound --
+    the safety net must never become the bug."""
+    import helpers.plugins as plugin_helpers
+
+    mod = _load_safety_net()
+    monkeypatch.setattr(
+        plugin_helpers,
+        "get_plugin_config",
+        lambda name, agent=None: {
+            "transient_swallow_max": "garbage",
+            "transient_swallow_reset_window_s": -5,
+        },
+        raising=True,
+    )
+    assert mod._swallow_limits(None) == (5, 300.0)

@@ -108,6 +108,15 @@ def set_resolved(cfg: Dict[str, Any]) -> None:
 
 
 def get_resolved() -> Dict[str, Any]:
+    # v3.1.1 fix: this function ASSIGNS to ``_resolved`` on the
+    # cache-miss path, so without ``global`` Python compiled the name
+    # as a local for the whole function -- the read on the first line
+    # raised ``UnboundLocalError: cannot access local variable
+    # '_resolved'`` on EVERY call, crashing every utility-model call
+    # routed through guarded_call (e.g. the memory plugin's
+    # memorize hook). set_resolved()/reset() already declared global;
+    # this one was missing it.
+    global _resolved
     if not _resolved:
         _resolved = dict(DEFAULTS)
     return _resolved
@@ -177,6 +186,21 @@ async def guarded_call(
     # min(budget, max_wait), not an unbounded max.
     router_cold = float(cfg.get("_router_cold_s") or 0.0)
     budget = max(max(default_to, 0.0), max(router_cold, 0.0))
+    # v3.2.0: learned generation-budget parity with the cascades. A long
+    # utility generation (memory summarization, JSON validation on big
+    # payloads) must not die at the outer cap when the label has PROVEN it
+    # needs longer. Both the budget and the max_wait cap lift to the
+    # override (still bounded by the fallback module's gen_budget_max_s
+    # wall); override 0 -> exactly the old arithmetic.
+    gen_override = 0.0
+    try:
+        from usr.plugins._model_fallback import fallback as _fb_cfg
+        gen_override = float(_fb_cfg._gen_budget_override_for(model_name, agent))
+    except Exception:  # noqa: BLE001
+        gen_override = 0.0
+    if gen_override > 0:
+        budget = max(budget, gen_override)
+        max_wait = max(max_wait, gen_override)
     timeout_s = min(budget, max_wait)
     # Add a small random spread so concurrent agents don't hit the
     # wire lockstep.
@@ -192,6 +216,16 @@ async def guarded_call(
     except asyncio.TimeoutError:
         elapsed = time.monotonic() - started
         stats.utility_timeout_record_timeout(model_name)
+        # v3.2.0: the outer guard's budget fired -- feed the same
+        # grow-on-timeout learner the cascades use so the label earns a
+        # bigger budget instead of being re-killed at the same ceiling on
+        # every subsequent utility call. Best-effort; never blocks the
+        # RepairableException path below.
+        try:
+            from usr.plugins._model_fallback import fallback as _fb_grow
+            _fb_grow._grow_gen_budget(model_name, elapsed, agent)
+        except Exception:  # noqa: BLE001
+            pass
         if cfg.get("close_inner_on_timeout", True):
             _try_close_inner_coro(inner)
         # v2.8.5: book the timeout cooldown for this utility label so the

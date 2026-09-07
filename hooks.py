@@ -193,6 +193,13 @@ def uninstall():
         latency.reset()
     except Exception:  # noqa: BLE001
         pass
+    # v3.2.0: learned generation budgets are process-global runtime state
+    # too -- a plugin disable must not leave stale ceilings behind.
+    try:
+        from usr.plugins._model_fallback import fallback as _fb_reset
+        _fb_reset.reset_gen_budgets()
+    except Exception:  # noqa: BLE001
+        pass
     return None
 
 
