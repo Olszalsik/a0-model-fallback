@@ -8,7 +8,7 @@ the `cooldown_until` value, so it fires once per cooldown window.
 These tests are pure-Python and don't need the framework -- they
 exercise the dedupe dict directly. To run:
     cd /a0
-    REPO_ROOT_OVERRIDE="$(pwd)" pytest usr/plugins/_model_fallback/tests/test_cooldown_dedupe.py -v
+    REPO_ROOT_OVERRIDE="$(pwd)" pytest usr/plugins/model_fallback/tests/test_cooldown_dedupe.py -v
 """
 
 from __future__ import annotations

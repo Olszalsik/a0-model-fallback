@@ -4,7 +4,7 @@ helpers/events.py: bounded in-memory ring buffer recording routing
 decisions (cooldown bookings/clears, escalations, dead-marks, user
 clears, exhaustion) so the /events endpoint can show the timeline.
 
-Run from repo root:  python -m pytest usr/plugins/_model_fallback/tests/test_events_log.py -q
+Run from repo root:  python -m pytest usr/plugins/model_fallback/tests/test_events_log.py -q
 """
 
 from __future__ import annotations
@@ -22,9 +22,9 @@ REPO_ROOT = Path(
 )
 sys.path.insert(0, str(REPO_ROOT))
 
-from usr.plugins._model_fallback import fallback as fb  # noqa: E402
-from usr.plugins._model_fallback.helpers import events  # noqa: E402
-from usr.plugins._model_fallback.helpers import recovery_probe as rp  # noqa: E402
+from usr.plugins.model_fallback import fallback as fb  # noqa: E402
+from usr.plugins.model_fallback.helpers import events  # noqa: E402
+from usr.plugins.model_fallback.helpers import recovery_probe as rp  # noqa: E402
 
 
 class FakeAgent:

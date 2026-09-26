@@ -26,7 +26,7 @@ Covered here:
 
 Test:
     cd /a0
-    REPO_ROOT_OVERRIDE="$(pwd)" pytest usr/plugins/_model_fallback/tests/test_turn_cascade_v28.py -v
+    REPO_ROOT_OVERRIDE="$(pwd)" pytest usr/plugins/model_fallback/tests/test_turn_cascade_v28.py -v
 """
 
 from __future__ import annotations
@@ -44,8 +44,8 @@ if str(REPO_ROOT) not in sys.path:
 
 import pytest
 
-from usr.plugins._model_fallback import fallback
-from usr.plugins._model_fallback.fallback import (
+from usr.plugins.model_fallback import fallback
+from usr.plugins.model_fallback.fallback import (
     _patched_call_chat_model_turn,
     install_chat_turn_patch,
 )

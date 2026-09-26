@@ -58,7 +58,7 @@ def _load_yaml(path: Path) -> dict:
 
 def test_fallback_utility_timeout_s_above_floor():
     """config.json: fallback_utility_timeout_s (per-candidate utility) must be >= 60s."""
-    cfg_path = REPO_ROOT / "usr" / "plugins" / "_model_fallback" / "config.json"
+    cfg_path = REPO_ROOT / "usr" / "plugins" / "model_fallback" / "config.json"
     cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
     val = cfg.get("fallback_utility_timeout_s")
     assert isinstance(val, (int, float)), (
@@ -73,7 +73,7 @@ def test_fallback_utility_timeout_s_above_floor():
 
 def test_fallback_timeout_s_above_floor():
     """config.json: fallback_timeout_s (per-candidate chat) must be >= 60s."""
-    cfg_path = REPO_ROOT / "usr" / "plugins" / "_model_fallback" / "config.json"
+    cfg_path = REPO_ROOT / "usr" / "plugins" / "model_fallback" / "config.json"
     cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
     val = cfg.get("fallback_timeout_s")
     assert isinstance(val, (int, float)), (
@@ -87,7 +87,7 @@ def test_fallback_timeout_s_above_floor():
 
 def test_utility_timeout_guard_default_above_floor():
     """default_config.yaml: utility_timeout_guard.default_timeout_s >= 60s."""
-    cfg_path = REPO_ROOT / "usr" / "plugins" / "_model_fallback" / "default_config.yaml"
+    cfg_path = REPO_ROOT / "usr" / "plugins" / "model_fallback" / "default_config.yaml"
     block = _load_yaml(cfg_path).get("utility_timeout_guard", {})
     val = block.get("default_timeout_s")
     assert isinstance(val, (int, float)), (
@@ -109,7 +109,7 @@ def test_utility_timeout_guard_max_wait_covers_default():
     together; this test guards against one being raised without the
     other.
     """
-    cfg_path = REPO_ROOT / "usr" / "plugins" / "_model_fallback" / "default_config.yaml"
+    cfg_path = REPO_ROOT / "usr" / "plugins" / "model_fallback" / "default_config.yaml"
     block = _load_yaml(cfg_path).get("utility_timeout_guard", {})
     default_to = block.get("default_timeout_s")
     max_wait = block.get("max_wait_s")

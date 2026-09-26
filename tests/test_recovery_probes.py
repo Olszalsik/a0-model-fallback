@@ -5,7 +5,7 @@ candidate's model wrapper is registered and a background sweep pings
 labels whose REMAINING cooldown exceeds the threshold. A successful
 probe clears the cooldown early (in place) and marks the label healthy.
 
-Run from repo root:  python -m pytest usr/plugins/_model_fallback/tests/test_recovery_probes.py -q
+Run from repo root:  python -m pytest usr/plugins/model_fallback/tests/test_recovery_probes.py -q
 """
 
 from __future__ import annotations
@@ -24,8 +24,8 @@ REPO_ROOT = Path(
 )
 sys.path.insert(0, str(REPO_ROOT))
 
-from usr.plugins._model_fallback import fallback as fb  # noqa: E402
-from usr.plugins._model_fallback.helpers import recovery_probe as rp  # noqa: E402
+from usr.plugins.model_fallback import fallback as fb  # noqa: E402
+from usr.plugins.model_fallback.helpers import recovery_probe as rp  # noqa: E402
 
 
 class FakeAgent:

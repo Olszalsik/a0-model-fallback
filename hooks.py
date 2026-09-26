@@ -3,8 +3,8 @@
 # v2.8.3: real data-key names (the old literal strings
 # "ext_retry_phase"/"ext_retry_at" didn't match what the cascade
 # reads/writes, so reset_fallback_settings never cleared them).
-# v2.8.5: the dead "_mfb_ext_retry_at" constant (nothing in fallback.py
-# writes it; the live key is _mfb_ext_retry_attempts) was removed and
+# v2.8.5: the dead "mfb_ext_retry_at" constant (nothing in fallback.py
+# writes it; the live key is mfb_ext_retry_attempts) was removed and
 # reset_fallback_settings now clears the real keys via the fallback module
 # constants.
 
@@ -23,7 +23,7 @@ async def install():
     """
     try:
         # Lazy import so a broken shim never blocks plugin load.
-        from usr.plugins._model_fallback.helpers import langchain_compat
+        from usr.plugins.model_fallback.helpers import langchain_compat
 
         if langchain_compat.already_installed_in_process():
             return
@@ -54,6 +54,37 @@ async def install():
     except Exception:  # noqa: BLE001
         # Never block plugin install on shim failure. The agent_init
         # extension will retry on the first agent creation.
+        pass
+
+    # v3.3.0: defensive re-install of the two merged guards.
+    #
+    # These normally install from
+    # extensions/python/startup_migration/_00_install_early_guards.py at
+    # boot. This block is a safety net for the paths that never reach
+    # startup_migration (embedded/test harnesses, an extension reload).
+    #
+    # It is NOT the primary install site: ``install()`` itself only runs
+    # when a plugin is installed or updated through the installer, never
+    # on an ordinary restart, which is exactly why the standalone
+    # ``_asyncio_guard`` plugin was dead code.
+    try:
+        from usr.plugins.model_fallback.helpers import asyncio_guard
+        from usr.plugins.model_fallback.helpers import import_guard
+        from usr.plugins.model_fallback.helpers import toggles as _toggles
+
+        cfg = {}
+        try:
+            from usr.plugins.model_fallback import fallback as _fb
+
+            loaded = _fb._get_plugin_cfg(None)
+            cfg = loaded if isinstance(loaded, dict) else {}
+        except Exception:  # noqa: BLE001
+            cfg = {}
+        if _toggles.resolve_toggle(cfg, "extension_import_guard", default=True):
+            import_guard.install()
+        if _toggles.resolve_toggle(cfg, "asyncio_read_ready_guard", default=True):
+            asyncio_guard.install()
+    except Exception:  # noqa: BLE001
         pass
 
 
@@ -153,7 +184,7 @@ def uninstall():
     # Falls back to the old _10-only restore if _00 predates v2.8.6.
     restored_chain = False
     try:
-        from usr.plugins._model_fallback.extensions.python.agent_init import (
+        from usr.plugins.model_fallback.extensions.python.agent_init import (
             _00_install_fallback_patches,
         )
         restored_chain = bool(_00_install_fallback_patches.uninstall())
@@ -161,7 +192,7 @@ def uninstall():
         pass
     if not restored_chain:
         try:
-            from usr.plugins._model_fallback.extensions.python.agent_init import (
+            from usr.plugins.model_fallback.extensions.python.agent_init import (
                 _10_install_utility_timeout_patch,
             )
             _10_install_utility_timeout_patch.uninstall()
@@ -171,33 +202,47 @@ def uninstall():
     # asyncio task + a weakref registry -- cancel and drop on disable so a
     # re-enable starts fresh and no probe fires while the plugin is off.
     try:
-        from usr.plugins._model_fallback.helpers import recovery_probe
+        from usr.plugins.model_fallback.helpers import recovery_probe
         recovery_probe.shutdown_probes()
     except Exception:  # noqa: BLE001
         pass
     try:
-        from usr.plugins._model_fallback.helpers import langchain_compat
+        from usr.plugins.model_fallback.helpers import langchain_compat
         langchain_compat.uninstall_shim()
         langchain_compat.clear_installed_marker()
     except Exception:  # noqa: BLE001
         pass
     try:
-        from usr.plugins._model_fallback.helpers import stats
+        from usr.plugins.model_fallback.helpers import stats
         stats.reset()
     except Exception:  # noqa: BLE001
         pass
     # v3.1.0: per-label latency samples are process-global runtime state
     # -- drop them on disable so a re-enable starts fresh.
     try:
-        from usr.plugins._model_fallback.helpers import latency
+        from usr.plugins.model_fallback.helpers import latency
         latency.reset()
     except Exception:  # noqa: BLE001
         pass
     # v3.2.0: learned generation budgets are process-global runtime state
     # too -- a plugin disable must not leave stale ceilings behind.
     try:
-        from usr.plugins._model_fallback import fallback as _fb_reset
+        from usr.plugins.model_fallback import fallback as _fb_reset
         _fb_reset.reset_gen_budgets()
+        # v3.3.0: belt-and-braces -- reset_gen_budgets() already clears
+        # the memoised config, but a disable must not leave a warm cache
+        # behind regardless of what else ran.
+        _fb_reset.invalidate_plugin_cfg_cache()
+    except Exception:  # noqa: BLE001
+        pass
+    # v3.3.0: restore the upstream extension loader so a disable actually
+    # reverts the per-file import guard. The asyncio guard deliberately
+    # stays installed (see helpers/asyncio_guard.uninstall): removing a
+    # safety monkeypatch from a live process is riskier than leaving it.
+    try:
+        from usr.plugins.model_fallback.helpers import import_guard
+
+        import_guard.uninstall()
     except Exception:  # noqa: BLE001
         pass
     return None
@@ -214,9 +259,12 @@ def get_fallback_settings(agent) -> dict:
     contradicted both config.json and the YAML defaults.
     """
     try:
-        from usr.plugins._model_fallback import fallback as _fb
+        from usr.plugins.model_fallback import fallback as _fb
 
-        cfg = _fb._get_plugin_cfg(agent)
+        # v3.3.0: use_cache=False -- this renders settings back to the user
+        # in the WebUI panel, so it must never show a value that is up to
+        # one cache TTL behind a config they just saved.
+        cfg = _fb._get_plugin_cfg(agent, use_cache=False)
     except Exception:  # noqa: BLE001
         cfg = {}
     return {
@@ -234,15 +282,15 @@ def reset_fallback_settings(agent):
 
     v2.8.5: the cascade knobs live in plugin config (edited in the WebUI),
     not agent data -- the old version wrote dead data keys AND cleared a
-    nonexistent "_mfb_ext_retry_at" while leaving the live
-    "_mfb_ext_retry_attempts" stale, so "reset" never restarted the
+    nonexistent "mfb_ext_retry_at" while leaving the live
+    "mfb_ext_retry_attempts" stale, so "reset" never restarted the
     extended-retry burst budget (the next exhaustion immediately promoted
     phase A -> B into the 3600s wait). Now: clear cooldowns + the real
     extended-retry phase state. Config knobs remain user-managed.
     """
     clear_cooldowns(agent)
     try:
-        from usr.plugins._model_fallback import fallback as _fb
+        from usr.plugins.model_fallback import fallback as _fb
 
         agent.set_data(_fb.DATA_KEY_EXT_RETRY_PHASE, 0)
         agent.set_data(_fb.DATA_KEY_EXT_RETRY_ATTEMPTS, 0)
@@ -255,7 +303,7 @@ def reset_fallback_settings(agent):
         pass
     # v2.9.1: the event timeline is runtime state -- reset goes with it.
     try:
-        from usr.plugins._model_fallback.helpers import events
+        from usr.plugins.model_fallback.helpers import events
         events.reset_events()
     except Exception:  # noqa: BLE001
         pass
@@ -276,7 +324,7 @@ def clear_cooldowns(agent, cross_context: bool = False):
     credential were unreachable from a per-context clear.
     """
     try:
-        from usr.plugins._model_fallback import fallback as _fb
+        from usr.plugins.model_fallback import fallback as _fb
         cleared = _fb.clear_all_cooldowns(agent, cross_context=bool(cross_context))
     except Exception:  # noqa: BLE001
         cleared = 0
@@ -284,8 +332,16 @@ def clear_cooldowns(agent, cross_context: bool = False):
     # literal "_model_cooldowns" was the pre-v2.8.5 (underscore-prefixed)
     # name -- persist_chat strips underscore keys, so nothing ever
     # persisted under it anyway.
+    #
+    # v3.3.0 bug fix: this block referenced ``_fb``, which is only bound
+    # INSIDE the first ``try``. If that import failed, the second block
+    # raised NameError and its own ``except Exception`` swallowed it --
+    # so the persisted key was silently left behind. Re-import locally so
+    # the two blocks are independent.
     try:
-        agent.set_data(_fb.DATA_KEY_COOLDOWNS, {})
+        from usr.plugins.model_fallback import fallback as _fb_keys
+
+        agent.set_data(_fb_keys.DATA_KEY_COOLDOWNS, {})
     except Exception:  # noqa: BLE001
         pass
     return cleared
@@ -298,7 +354,7 @@ def get_cooldowns(agent) -> dict:
     persisted snapshot) instead of the legacy data key nothing writes.
     """
     try:
-        from usr.plugins._model_fallback import fallback as _fb
+        from usr.plugins.model_fallback import fallback as _fb
         live = _fb.snapshot_cooldowns(agent)
         if live:
             return live
@@ -307,7 +363,7 @@ def get_cooldowns(agent) -> dict:
     # v2.8.5: fall back to the persisted key under its CURRENT name (the
     # legacy "_model_cooldowns" literal predated the rename).
     try:
-        from usr.plugins._model_fallback import fallback as _fb2
+        from usr.plugins.model_fallback import fallback as _fb2
         return agent.get_data(_fb2.DATA_KEY_COOLDOWNS) or {}
     except Exception:  # noqa: BLE001
         return {}

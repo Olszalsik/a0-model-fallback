@@ -19,7 +19,7 @@ chat cascade's call site).
 
 To run:
     cd /a0
-    REPO_ROOT_OVERRIDE="$(pwd)" pytest usr/plugins/_model_fallback/tests/test_chat_warm_wiring_v26.py -v
+    REPO_ROOT_OVERRIDE="$(pwd)" pytest usr/plugins/model_fallback/tests/test_chat_warm_wiring_v26.py -v
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ REPO_ROOT = Path(os.environ.get("REPO_ROOT_OVERRIDE") or "/a0")
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from usr.plugins._model_fallback.fallback import (  # noqa: E402
+from usr.plugins.model_fallback.fallback import (  # noqa: E402
     _patched_call_chat_model,
     _patched_call_utility_model,
     _run_rotation_cascade,

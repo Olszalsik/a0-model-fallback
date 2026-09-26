@@ -23,7 +23,7 @@ def _plugin_version() -> str:
     try:
         from helpers import plugins as _plugins
         return str(
-            getattr(_plugins.get_plugin_meta("_model_fallback"), "version", "") or ""
+            getattr(_plugins.get_plugin_meta("model_fallback"), "version", "") or ""
         )
     except Exception:  # noqa: BLE001
         return ""
@@ -42,7 +42,7 @@ def uninstall() -> bool:
     Returns True when at least one Agent method was restored.
     """
     try:
-        from usr.plugins._model_fallback.extensions.python.agent_init import (
+        from usr.plugins.model_fallback.extensions.python.agent_init import (
             _10_install_utility_timeout_patch,
         )
         _10_install_utility_timeout_patch.uninstall()
@@ -62,7 +62,7 @@ def uninstall() -> bool:
             except Exception:  # noqa: BLE001
                 pass
     try:
-        import usr.plugins._model_fallback.fallback as fb
+        import usr.plugins.model_fallback.fallback as fb
         turn_orig = getattr(fb, "_ORIGINAL_CALL_CHAT_MODEL_TURN", None)
         if (
             turn_orig is not None
@@ -88,7 +88,7 @@ class InstallFallbackPatches(Extension):
         # file on a slow mount) would still kill Agent.__init__ for every
         # new chat. No fallback coverage is better than no agent at all.
         try:
-            import usr.plugins._model_fallback.fallback as fb
+            import usr.plugins.model_fallback.fallback as fb
         except Exception as import_exc:  # noqa: BLE001
             try:
                 self.agent.context.log.log(

@@ -4,7 +4,7 @@ The WebUI binds to flat top-level booleans on ``context.settings``
 (e.g. ``utility_timeout_guard_enabled``) instead of nested
 section keys, because Alpine ``x-model`` and a flat settings dict
 are simpler to bind. The runtime helpers in
-``usr/plugins/_model_fallback/helpers/toggles.py`` read the
+``usr/plugins/model_fallback/helpers/toggles.py`` read the
 top-level key first and fall back to the nested section for
 back-compat with hand-edited configs.
 
@@ -83,7 +83,7 @@ if "agent" not in sys.modules:
     except Exception:  # noqa: BLE001
         sys.modules["agent"] = _StubAgentModule("agent")
 
-from usr.plugins._model_fallback.helpers import toggles  # noqa: E402
+from usr.plugins.model_fallback.helpers import toggles  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -241,7 +241,7 @@ class TestExtensionResolveConfigEarlyDisable:
     """
 
     def test_utility_timeout_disabled(self):
-        from usr.plugins._model_fallback.extensions.python.agent_init import (
+        from usr.plugins.model_fallback.extensions.python.agent_init import (
             _10_install_utility_timeout_patch as mod,
         )
         with patch("helpers.plugins.get_plugin_config") as gpc:
@@ -255,7 +255,7 @@ class TestExtensionResolveConfigEarlyDisable:
             assert cfg == {"enabled": False}
 
     def test_utility_timeout_enabled_falls_through_to_full_config(self):
-        from usr.plugins._model_fallback.extensions.python.agent_init import (
+        from usr.plugins.model_fallback.extensions.python.agent_init import (
             _10_install_utility_timeout_patch as mod,
         )
         with patch("helpers.plugins.get_plugin_config") as gpc:
@@ -270,7 +270,7 @@ class TestExtensionResolveConfigEarlyDisable:
             assert cfg.get("default_timeout_s") == 25
 
     def test_langchain_compat_disabled(self):
-        from usr.plugins._model_fallback.extensions.python.agent_init import (
+        from usr.plugins.model_fallback.extensions.python.agent_init import (
             _00_install_langchain_shim as mod,
         )
         with patch("helpers.plugins.get_plugin_config") as gpc:
@@ -282,7 +282,7 @@ class TestExtensionResolveConfigEarlyDisable:
             assert cfg == {"enabled": False}
 
     def test_context_size_guard_disabled(self):
-        from usr.plugins._model_fallback.extensions.python.message_loop_prompts_after import (
+        from usr.plugins.model_fallback.extensions.python.message_loop_prompts_after import (
             _10_context_size_guard as mod,
         )
         with patch("helpers.plugins.get_plugin_config") as gpc:
@@ -316,7 +316,7 @@ class TestHandEditedConfigBackCompat:
     """
 
     def test_utility_timeout_nested_only(self):
-        from usr.plugins._model_fallback.extensions.python.agent_init import (
+        from usr.plugins.model_fallback.extensions.python.agent_init import (
             _10_install_utility_timeout_patch as mod,
         )
         with patch("helpers.plugins.get_plugin_config") as gpc:
@@ -328,7 +328,7 @@ class TestHandEditedConfigBackCompat:
             assert cfg.get("max_wait_s") == 60
 
     def test_langchain_compat_nested_only(self):
-        from usr.plugins._model_fallback.extensions.python.agent_init import (
+        from usr.plugins.model_fallback.extensions.python.agent_init import (
             _00_install_langchain_shim as mod,
         )
         with patch("helpers.plugins.get_plugin_config") as gpc:

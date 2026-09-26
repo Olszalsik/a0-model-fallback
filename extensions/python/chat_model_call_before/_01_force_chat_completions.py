@@ -20,7 +20,7 @@ Sibling of util_model_call_before/_01_force_chat_completions.py.
 """
 from helpers.extension import Extension
 
-from usr.plugins._model_fallback.models_ext import (
+from usr.plugins.model_fallback.models_ext import (
     should_force_chat_completions,
     force_chat_completions_mode,
 )

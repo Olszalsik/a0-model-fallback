@@ -22,7 +22,7 @@ Three wiring sites in fallback.py are also exercised:
 
 To run:
     cd /a0
-    REPO_ROOT_OVERRIDE="$(pwd)" pytest usr/plugins/_model_fallback/tests/test_capacity_v26.py -v
+    REPO_ROOT_OVERRIDE="$(pwd)" pytest usr/plugins/model_fallback/tests/test_capacity_v26.py -v
 """
 
 from __future__ import annotations
@@ -38,8 +38,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 
-from usr.plugins._model_fallback import fallback as _fb_mod
-from usr.plugins._model_fallback.fallback import (
+from usr.plugins.model_fallback import fallback as _fb_mod
+from usr.plugins.model_fallback.fallback import (
     _classify_capacity,
     _handle_error_cooldown,
     _DEFAULT_RATE_LIMIT_NO_RETRY_AFTER_COOLDOWN_S,
@@ -47,7 +47,7 @@ from usr.plugins._model_fallback.fallback import (
 
 
 # Test-time patch for ``_get_plugin_cfg``. The real implementation walks
-# the project filesystem looking for ``_model_fallback/config.json``
+# the project filesystem looking for ``model_fallback/config.json``
 # (~32s wall-clock in tests). The contract under test is the rate-limit
 # branch's cooldown arithmetic, not plugin-config discovery; a minimal
 # patch lets the rate-limit branch run its real ``dur = ...`` lines in

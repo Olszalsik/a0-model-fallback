@@ -1,6 +1,6 @@
 """Install the langchain v0 -> v1 import compatibility shim (v2.4).
 
-This extension lives in the existing ``_model_fallback`` plugin
+This extension lives in the existing ``model_fallback`` plugin
 (merged from the standalone ``_langchain_compat`` plugin in v2.4).
 The user preferred to keep all LLM-error-handling fixes in one
 plugin so a single toggle disables everything.
@@ -33,14 +33,14 @@ _log = logging.getLogger("model_fallback.langchain_compat.install")
 def _resolve_config(agent) -> dict:
     try:
         from helpers import plugins as plugin_helpers  # type: ignore
-        cfg = plugin_helpers.get_plugin_config("_model_fallback", agent) or {}
+        cfg = plugin_helpers.get_plugin_config("model_fallback", agent) or {}
     except Exception:  # noqa: BLE001
         cfg = {}
     # v2.5 WebUI: top-level ``langchain_compat_enabled`` wins
     # over the nested section's ``enabled``. The piece defaults
     # to ON (the shim is a no-op if v0 modules are already
     # present), so explicit False disables.
-    from usr.plugins._model_fallback.helpers import toggles
+    from usr.plugins.model_fallback.helpers import toggles
     if not toggles.resolve_toggle(cfg, "langchain_compat", default=True):
         return {"enabled": False}
     return {"enabled": True}
@@ -53,7 +53,7 @@ class InstallLangchainCompatShim(Extension):
             if not cfg.get("enabled", True):
                 _log.debug("langchain compat shim disabled by config; skipping")
                 return
-            from usr.plugins._model_fallback.helpers import langchain_compat
+            from usr.plugins.model_fallback.helpers import langchain_compat
             if langchain_compat.already_installed_in_process():
                 return
             results = langchain_compat.install_shim()

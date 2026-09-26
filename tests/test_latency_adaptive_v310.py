@@ -9,7 +9,7 @@ genuine timeout CLEARS the label's samples (one bad sizing self-corrects
 to the full base).
 
 Run from repo root:
-    python -m pytest usr/plugins/_model_fallback/tests/test_latency_adaptive_v310.py -q
+    python -m pytest usr/plugins/model_fallback/tests/test_latency_adaptive_v310.py -q
 """
 
 from __future__ import annotations
@@ -28,10 +28,10 @@ REPO_ROOT = Path(
 )
 sys.path.insert(0, str(REPO_ROOT))
 
-from usr.plugins._model_fallback import fallback as fb  # noqa: E402
-from usr.plugins._model_fallback.helpers import events  # noqa: E402
-from usr.plugins._model_fallback.helpers import latency  # noqa: E402
-from usr.plugins._model_fallback.helpers import recovery_probe as rp  # noqa: E402
+from usr.plugins.model_fallback import fallback as fb  # noqa: E402
+from usr.plugins.model_fallback.helpers import events  # noqa: E402
+from usr.plugins.model_fallback.helpers import latency  # noqa: E402
+from usr.plugins.model_fallback.helpers import recovery_probe as rp  # noqa: E402
 
 
 @pytest.fixture(autouse=True)

@@ -60,6 +60,11 @@ _PIECE_TOGGLES = {
     "housekeeping": "housekeeping_enabled",  # ignored at runtime; back-compat only
     "context_size_guard": "context_size_guard_enabled",
     "langchain_compat": "langchain_compat_enabled",
+    # v3.3.0 -- guards merged in from the standalone ``_asyncio_guard``
+    # and ``_extension_import_guard`` plugins. Both default ON; the
+    # WebUI store (webui/fallback-store.js) mirrors these keys.
+    "asyncio_read_ready_guard": "asyncio_read_ready_guard_enabled",
+    "extension_import_guard": "extension_import_guard_enabled",
 }
 
 
@@ -106,6 +111,11 @@ _BUILTIN_DEFAULTS: Dict[str, bool] = {
     "housekeeping": True,            # ignored at runtime; back-compat default (no loop exists)
     "context_size_guard": False,     # OFF; opt-in because aggressive trimming can confuse the LLM
     "langchain_compat": True,        # ON; shim is a no-op on langchain v0.x
+    # v3.3.0: both are pure safety nets with a no-op when unneeded --
+    # the asyncio patch detects an already-fixed interpreter and skips,
+    # and the import guard is transparent for well-formed extensions.
+    "asyncio_read_ready_guard": True,  # ON; no-op on Python >= 3.12.9 / 3.13.2
+    "extension_import_guard": True,    # ON; only observable when a file fails to import
 }
 
 

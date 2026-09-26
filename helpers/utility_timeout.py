@@ -33,7 +33,7 @@ On ``asyncio.TimeoutError`` we:
 
 Why not patch ``call_utility_model`` directly?
 ---------------------------------------------
-``_model_fallback`` already does that (its cascade lives in
+``model_fallback`` already does that (its cascade lives in
 ``fallback.py``). Adding a second monkey-patch on top would require
 either nested wrappers (slow, fragile) or replacing the cascade
 entirely. Hooking the ``start`` extension point lets the timeout
@@ -58,7 +58,7 @@ import time
 from typing import Any, Dict, Optional
 
 from helpers.errors import RepairableException
-from usr.plugins._model_fallback.helpers import stats
+from usr.plugins.model_fallback.helpers import stats
 
 _log = logging.getLogger("model_fallback.utility_timeout")
 
@@ -194,7 +194,7 @@ async def guarded_call(
     # wall); override 0 -> exactly the old arithmetic.
     gen_override = 0.0
     try:
-        from usr.plugins._model_fallback import fallback as _fb_cfg
+        from usr.plugins.model_fallback import fallback as _fb_cfg
         gen_override = float(_fb_cfg._gen_budget_override_for(model_name, agent))
     except Exception:  # noqa: BLE001
         gen_override = 0.0
@@ -222,7 +222,7 @@ async def guarded_call(
         # every subsequent utility call. Best-effort; never blocks the
         # RepairableException path below.
         try:
-            from usr.plugins._model_fallback import fallback as _fb_grow
+            from usr.plugins.model_fallback import fallback as _fb_grow
             _fb_grow._grow_gen_budget(model_name, elapsed, agent)
         except Exception:  # noqa: BLE001
             pass
@@ -240,7 +240,7 @@ async def guarded_call(
         # normal case; this is the safety net for the race the other way.
         try:
             if agent is not None and model_name:
-                from usr.plugins._model_fallback import fallback as _fb
+                from usr.plugins.model_fallback import fallback as _fb
 
                 timeout_exc = TimeoutError(
                     f"utility timeout guard: {model_name} exceeded "
@@ -252,7 +252,7 @@ async def guarded_call(
                 # the full base timeout (the budget that just fired was too
                 # tight).
                 try:
-                    from usr.plugins._model_fallback.helpers import latency as _lat
+                    from usr.plugins.model_fallback.helpers import latency as _lat
 
                     _lat.clear_label(model_name)
                 except Exception:  # noqa: BLE001

@@ -18,7 +18,7 @@ Covers the five items the v2.8.5 audit flagged but did not fix:
   T5  (wiring#11) clear_all_cooldowns(cross_context=True) clears every
           context's in-memory store, not just the caller's.
 
-Run from repo root:  python -m pytest usr/plugins/_model_fallback/tests/test_v286_flagged_fixes.py -q
+Run from repo root:  python -m pytest usr/plugins/model_fallback/tests/test_v286_flagged_fixes.py -q
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ REPO_ROOT = Path(
 )
 sys.path.insert(0, str(REPO_ROOT))
 
-from usr.plugins._model_fallback import fallback as fb  # noqa: E402
+from usr.plugins.model_fallback import fallback as fb  # noqa: E402
 
 
 class FakeAgent:

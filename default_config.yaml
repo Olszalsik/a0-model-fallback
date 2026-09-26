@@ -82,6 +82,23 @@ context_size_guard_enabled: false       # v2.3 — opt-in history trim on Contex
 langchain_compat_enabled: true          # v2.4 — v0 -> v1 import shim (default ON)
 primary_skip_enabled: true              # v2.5.1 — escalate primary cooldown after N strikes
 
+# --- v3.3.0 Guards merged from standalone plugins -----------------------
+# Both were separate plugins before v3.3.0. They now install from
+# extensions/python/startup_migration/_00_install_early_guards.py, which
+# is the earliest hook that reliably fires at boot (the old asyncio guard
+# applied its patch at import time of a hooks.py that nothing loads at
+# startup, so it never ran).
+asyncio_read_ready_guard_enabled: true
+# Patches asyncio.selector_events._SelectorSocketTransport._read_ready so a
+# transport torn down with its fd still in the selector no-ops instead of
+# calling None() (CPython gh-115514, fixed upstream in 3.12.9 / 3.13.2).
+# The patch self-detects an already-fixed interpreter and skips itself, so
+# on a patched Python this key has no observable effect.
+extension_import_guard_enabled: true
+# Wraps helpers.modules.load_classes_from_folder so a single extension file
+# that fails to import is logged and skipped instead of aborting the whole
+# extension point (and with it every model call).
+
 # --- v2.2 Resilience Layer ---------------------------------------------
 # Three independent pieces; each is a no-op when ``enabled: false``.
 # See AGENTS.md for the full design and migration notes (what to do

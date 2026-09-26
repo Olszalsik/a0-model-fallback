@@ -46,7 +46,7 @@ _log = logging.getLogger("model_fallback.utility_timeout.patch")
 def _resolve_config(agent) -> Dict[str, Any]:
     try:
         from helpers import plugins as plugin_helpers  # type: ignore
-        cfg = plugin_helpers.get_plugin_config("_model_fallback", agent) or {}
+        cfg = plugin_helpers.get_plugin_config("model_fallback", agent) or {}
         # v2.8.3: get_plugin_config returns config.json WITHOUT merging
         # default_config.yaml, so the YAML's ``utility_timeout_guard:``
         # section (60s/180s, raised 2026-07-23) never reached the
@@ -55,7 +55,7 @@ def _resolve_config(agent) -> Dict[str, Any]:
         # and user config.json values still win.
         try:
             defaults = plugin_helpers.get_default_plugin_config(
-                "_model_fallback"
+                "model_fallback"
             ) or {}
             if isinstance(defaults, dict):
                 merged = dict(defaults)
@@ -69,7 +69,7 @@ def _resolve_config(agent) -> Dict[str, Any]:
     # v2.5 WebUI: top-level ``utility_timeout_guard_enabled`` wins
     # over the nested section's ``enabled`` so a user toggling OFF
     # in the WebUI takes effect immediately on the next agent_init.
-    from usr.plugins._model_fallback.helpers import toggles
+    from usr.plugins.model_fallback.helpers import toggles
     if not toggles.resolve_toggle(cfg, "utility_timeout_guard", default=True):
         return {"enabled": False}
     overrides = cfg.get("utility_timeout_guard") if isinstance(cfg, dict) else None
@@ -90,7 +90,7 @@ def _resolve_config(agent) -> Dict[str, Any]:
         router_cold_s = 0.0
     if router_cold_s > 0:
         overrides["_router_cold_s"] = router_cold_s
-    from usr.plugins._model_fallback.helpers import utility_timeout
+    from usr.plugins.model_fallback.helpers import utility_timeout
     return utility_timeout.resolve_config(overrides)
 
 
@@ -112,7 +112,7 @@ def _plugin_version() -> str:
     try:
         from helpers import plugins as _plugins
         return str(
-            getattr(_plugins.get_plugin_meta("_model_fallback"), "version", "") or ""
+            getattr(_plugins.get_plugin_meta("model_fallback"), "version", "") or ""
         )
     except Exception:  # noqa: BLE001
         return ""
@@ -125,7 +125,7 @@ def _install(agent: Agent | None) -> bool:
     was already wrapped or the config is disabled.
     """
     cfg = _resolve_config(agent)
-    from usr.plugins._model_fallback.helpers import utility_timeout
+    from usr.plugins.model_fallback.helpers import utility_timeout
     if not cfg.get("enabled", True):
         # v2.8.5: refresh the resolved config BEFORE returning so a
         # wrapper that is already live (installed by an earlier agent_init

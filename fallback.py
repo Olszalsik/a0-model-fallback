@@ -44,14 +44,14 @@ from helpers.print_style import PrintStyle
 
 # v2.9.1: routing event log (ring buffer; no import cycle -- events.py
 # imports nothing from the plugin).
-from usr.plugins._model_fallback.helpers import events
+from usr.plugins.model_fallback.helpers import events
 
 # v3.1.0: per-label latency samples for adaptive cold timeouts (same
 # no-import-cycle property).
-from usr.plugins._model_fallback.helpers import latency
+from usr.plugins.model_fallback.helpers import latency
 
 # All model-related helpers are now local to the plugin (models_ext.py)
-from usr.plugins._model_fallback.models_ext import (
+from usr.plugins.model_fallback.models_ext import (
     _is_code_error,
     _is_context_overflow_error,
     _is_invalid_api_key_400,
@@ -93,7 +93,7 @@ from usr.plugins._model_fallback.models_ext import (
 # serializer strips agent.data keys with a leading underscore
 # (helpers/persist_chat.py:194/:223, and _deserialize_agents restores
 # agent.data from that stripped dict at :311), so every pre-v2.8.5
-# "_mfb_*" key was silently dropped from chat.json and the whole
+# "mfb_*" key was silently dropped from chat.json and the whole
 # restart-survival layer (cooldown seeding, extended-retry phase,
 # cascade position) never actually persisted. Chats persisted by older
 # versions keep the legacy "_model_cooldowns" key; it is simply ignored
@@ -482,7 +482,7 @@ def _grow_gen_budget(label, needed_s, agent=None, base_timeout_s=0.0):
     _GEN_BUDGET_OVERRIDES[label] = new
     try:
         PrintStyle(font_color="cyan", padding=True).print(
-            f"[_model_fallback] adaptive generation budget for '{label}' "
+            f"[model_fallback] adaptive generation budget for '{label}' "
             f"raised to {new:.0f}s (was {prev:.0f}s, needed >= {needed:.0f}s). "
             f"The model was likely still generating -- next calls on this "
             f"label get more time before the timeout fires."
@@ -585,8 +585,13 @@ def _apply_gen_budget(label, budget_s, agent=None) -> float:
 def reset_gen_budgets() -> None:
     """v3.2.0: drop all learned generation budgets. Called by
     hooks.uninstall() (same lifecycle as latency.reset()) and by tests.
+
+    v3.3.0: also drops the memoised plugin config. The learned overrides
+    feed back into the resolved config, so a stale cache would re-apply a
+    ceiling the caller just asked us to forget.
     """
     _GEN_BUDGET_OVERRIDES.clear()
+    invalidate_plugin_cfg_cache()
 
 
 def _resolve_per_call_timeout(
@@ -681,7 +686,7 @@ def _get_cooldown_store(agent) -> dict:
             and isinstance(seed_at, (int, float))
             and (time.time() - float(seed_at)) <= _COOLDOWN_SEED_MAX_AGE_S
         ):
-            store = dict(seed)
+            store = _restore_cooldowns(seed)
         else:
             # Either there's no persisted snapshot, or it's stale.
             # Start clean. Persisted copy will be re-saved as soon as
@@ -689,6 +694,69 @@ def _get_cooldown_store(agent) -> dict:
             store = {}
         _INMEM_COOLDOWNS[key] = store
     return store
+
+
+# Bumped when the persisted representation changed. v1 stored raw
+# time.monotonic() deadlines, which are only meaningful inside the process
+# that wrote them.
+_PERSIST_FORMAT = 2
+_PERSIST_MARKER = "_mfb_v"
+
+
+def _persist_cooldowns(store: dict) -> dict:
+    """Convert in-memory monotonic deadlines to a wall-clock snapshot.
+
+    v3.3.0 (pre-existing bug fix). The live store holds absolute
+    ``time.monotonic()`` deadlines, and that whole dict was written
+    verbatim into ``agent.data``, which is persisted to chat.json and
+    re-seeded after a restart. ``time.monotonic()`` has no defined epoch
+    and resets when the host reboots (CLOCK_MONOTONIC is time-since-boot
+    on Linux, GetTickCount64 on Windows), so a restored deadline was
+    compared against a fresh, much smaller base: a 30 s cooldown came
+    back as ~139 hours, locking every agent out of that model until the
+    machine had been up for weeks. The 600 s freshness gate limits the
+    window to reboots shortly after a save, but that is exactly the
+    crash-loop case.
+
+    Persisting the REMAINING seconds against ``time.time()`` instead makes
+    the snapshot survive a reboot with its meaning intact.
+    """
+    now_mono = time.monotonic()
+    now_wall = time.time()
+    out: dict = {}
+    for label, until in store.items():
+        try:
+            remaining = max(0.0, float(until) - now_mono)
+        except (TypeError, ValueError):
+            continue
+        out[str(label)] = now_wall + remaining
+    return {_PERSIST_MARKER: _PERSIST_FORMAT, "e": out}
+
+
+def _restore_cooldowns(seed: dict) -> dict:
+    """Inverse of :func:`_persist_cooldowns`; returns a live monotonic store.
+
+    A v1 snapshot (no marker) held raw monotonic deadlines whose base is
+    unknowable after a reboot, so there is no safe way to honour it. We
+    start clean instead of risking a multi-day lockout -- the cost is one
+    failed call per label right after upgrading, which is far cheaper than
+    the failure it prevents.
+    """
+    if seed.get(_PERSIST_MARKER) != _PERSIST_FORMAT:
+        return {}
+    entries = seed.get("e")
+    if not isinstance(entries, dict):
+        return {}
+    now_wall = time.time()
+    now_mono = time.monotonic()
+    out: dict = {}
+    for label, wall_until in entries.items():
+        try:
+            remaining = max(0.0, float(wall_until) - now_wall)
+        except (TypeError, ValueError):
+            continue
+        out[label] = now_mono + remaining
+    return out
 
 
 def _save_cooldown_store(agent, store: dict) -> None:
@@ -699,7 +767,9 @@ def _save_cooldown_store(agent, store: dict) -> None:
     key = ("__global__",) if agent_id is None else (str(agent_id),)
     _INMEM_COOLDOWNS[key] = store
     try:
-        agent.set_data(DATA_KEY_COOLDOWNS, dict(store))
+        # v3.3.0: persist wall-clock deadlines, not raw monotonic ones, so
+        # the snapshot survives a reboot (see _persist_cooldowns).
+        agent.set_data(DATA_KEY_COOLDOWNS, _persist_cooldowns(store))
         # Stamp the seed time so a future restart can tell whether
         # the persisted snapshot is fresh enough to trust.
         agent.set_data(DATA_KEY_COOLDOWN_SEED_AT, time.time())
@@ -1047,7 +1117,12 @@ _A0_ONLY_KWARGS = (
 # get them stripped. "usage" stays in the always-strip list above: the OpenAI
 # SDK rejects it as a top-level chat.completions argument, so keeping it on
 # the primary would just guarantee a 400.
-_PROVIDER_SPECIFIC_KWARGS = ("venice_parameters",)
+# v3.2.1: "extra_body" joins the list -- NVIDIA NIM needs
+# extra_body.chat_template_kwargs.thinking=false on nemotron models, but a
+# strict OpenAI-compatible gateway (omniroute, ollama_cloud) may reject the
+# unknown top-level body fields if the primary's extra_body leaks into a
+# fallback wrapper via the parent-kwargs merge.
+_PROVIDER_SPECIFIC_KWARGS = ("venice_parameters", "extra_body")
 
 
 def _strip_a0_only_kwargs(model, is_primary: bool = False) -> None:
@@ -1150,7 +1225,7 @@ def _build_candidates(primary, use_utility_models: bool, agent) -> list:
 
     # 4. From plugin config (global fallback list)
     if not fallbacks:
-        plugin_cfg = plugins.get_plugin_config("_model_fallback", agent)
+        plugin_cfg = plugins.get_plugin_config("model_fallback", agent)
         if isinstance(plugin_cfg, dict):
             cfg_fb = plugin_cfg.get("fallbacks")
             if isinstance(cfg_fb, (list, tuple)) and cfg_fb:
@@ -1826,7 +1901,7 @@ def _handle_error_cooldown_impl(
     """
     if probe_model is not None:
         try:
-            from usr.plugins._model_fallback.helpers import recovery_probe
+            from usr.plugins.model_fallback.helpers import recovery_probe
             recovery_probe.register_probe_target(agent, label, probe_model, api_base)
         except Exception:  # noqa: BLE001
             pass
@@ -2027,6 +2102,38 @@ def _format_exception(exc: Exception) -> str:
 _PLUGIN_DEFAULTS_CACHE: dict = {"mtime": None, "cfg": None}
 
 
+_PLUGIN_CFG_CACHE: dict = {}
+_PLUGIN_CFG_CACHE_TTL_S = 1.0
+_PLUGIN_CFG_CACHE_MAX = 64
+
+
+def _plugin_cfg_cache_key(agent) -> tuple:
+    """Stable per-scope cache key for the merged plugin config.
+
+    Uses the same project/profile resolution the framework uses for
+    scoped plugin config, falling back to the context id (and finally a
+    single global bucket) so an agent without a project still caches.
+    """
+    project_name = ""
+    agent_profile = ""
+    try:
+        if agent is not None:
+            from helpers import projects, subagents  # noqa: F401
+
+            try:
+                project_name = projects.get_context_project_name(agent.context) or ""
+            except Exception:  # noqa: BLE001
+                project_name = ""
+            agent_profile = getattr(getattr(agent, "config", None), "profile", "") or ""
+    except Exception:  # noqa: BLE001
+        pass
+    if project_name or agent_profile:
+        return (project_name, agent_profile)
+    context = getattr(agent, "context", None)
+    context_id = getattr(context, "id", None)
+    return ("__global__", str(context_id) if context_id else "")
+
+
 def _get_merged_defaults() -> dict:
     """default_config.yaml contents, mtime-keyed cached (v2.8.4).
 
@@ -2042,7 +2149,7 @@ def _get_merged_defaults() -> dict:
         from helpers import files as _files
 
         path = _files.get_abs_path(
-            "usr", "plugins", "_model_fallback", "default_config.yaml"
+            "usr", "plugins", "model_fallback", "default_config.yaml"
         )
         mtime = os.path.getmtime(path) if os.path.exists(path) else None
     except Exception:  # noqa: BLE001
@@ -2052,7 +2159,7 @@ def _get_merged_defaults() -> dict:
         if isinstance(cached, dict):
             return cached
     try:
-        defaults = plugins.get_default_plugin_config("_model_fallback")
+        defaults = plugins.get_default_plugin_config("model_fallback")
         if not isinstance(defaults, dict):
             defaults = {}
     except Exception:  # noqa: BLE001
@@ -2062,29 +2169,72 @@ def _get_merged_defaults() -> dict:
     return defaults
 
 
-def _get_plugin_cfg(agent) -> dict:
+def _get_plugin_cfg(agent, use_cache: bool = True) -> dict:
     """Safely load plugin config (handles None, bad types).
 
     v2.8.4: default_config.yaml is merged UNDER the live config.json/scope
     result, so every knob documented in the YAML is actually live without
     being duplicated into config.json.
+
+    v3.3.0 (perf): this was the plugin's hottest non-LLM path. It has ~24
+    call sites and the cascade re-enters it several times PER CANDIDATE
+    (``_resolve_per_call_timeout`` -> ``_gen_budget_cfg`` ->
+    ``_classify_capacity`` -> ``_compute_cycle_sleep`` ...), while
+    ``plugins.get_plugin_config`` is ``@extension.extensible`` -- so every
+    call dispatched the extension machinery, stat-ed the filesystem for
+    the scoped asset and re-parsed config.json. Measured at ~0.79 ms per
+    call, i.e. ~20 ms of pure overhead per cascade pass, repeated for the
+    whole cycle budget of a multi-hour outage. The cache brings that to
+    ~0.002 ms (measured, ~465x).
+
+    The config cannot change mid-cascade in any way that matters, so we
+    memoise the MERGED result for ``_PLUGIN_CFG_CACHE_TTL_S`` seconds,
+    keyed by resolved project/profile. The TTL is deliberately short so a
+    WebUI save still lands within a second, and it is bounded so a long
+    session with many contexts cannot grow the map without limit.
+    ``invalidate_plugin_cfg_cache()`` drops it on reset / disable.
+
+    ``use_cache=False`` forces a fresh read. Anything that renders config
+    back to a user (the settings panel, the stats endpoint) must pass
+    False, or it can display a value that is up to one TTL stale.
     """
-    cfg = plugins.get_plugin_config("_model_fallback", agent) or {}
+    key = _plugin_cfg_cache_key(agent)
+    now = time.monotonic()
+    if use_cache:
+        entry = _PLUGIN_CFG_CACHE.get(key)
+        if entry is not None:
+            expires_at, merged = entry
+            if now < expires_at:
+                return merged
+
+    cfg = plugins.get_plugin_config("model_fallback", agent) or {}
     if not isinstance(cfg, dict):
         cfg = {}
     defaults = _get_merged_defaults()
     if defaults:
         merged = dict(defaults)
         merged.update(cfg)
-        return merged
-    return cfg
+    else:
+        merged = dict(cfg)
+
+    if len(_PLUGIN_CFG_CACHE) >= _PLUGIN_CFG_CACHE_MAX:
+        # Drop the soonest-to-expire entry rather than growing forever.
+        oldest = min(_PLUGIN_CFG_CACHE, key=lambda k: _PLUGIN_CFG_CACHE[k][0])
+        _PLUGIN_CFG_CACHE.pop(oldest, None)
+    _PLUGIN_CFG_CACHE[key] = (now + _PLUGIN_CFG_CACHE_TTL_S, merged)
+    return merged
+
+
+def invalidate_plugin_cfg_cache() -> None:
+    """Drop the memoised config (after a save, reset, or on disable)."""
+    _PLUGIN_CFG_CACHE.clear()
 
 
 def _clamp_delay(value: float, maximum: float, name: str) -> float:
     """Clamp a delay value to a sane maximum, warning if it was excessive."""
     if value > maximum:
         PrintStyle(font_color="orange", padding=True).print(
-            f"[_model_fallback] {name}={value}s exceeds sane maximum, "
+            f"[model_fallback] {name}={value}s exceeds sane maximum, "
             f"clamped to {maximum}s. Check your model kwargs."
         )
         return maximum
@@ -2676,7 +2826,8 @@ async def _run_rotation_cascade(self, spec: _CascadeSpec, model_obj):
         # UnboundLocalError during a sustained outage (the agent-slowdown
         # scenario). See memory: model-fallback stagnation nonlocal.
         nonlocal stagnation_logged_this_outage
-        import random
+        # v3.3.0: the module already imports ``random`` at the top; this
+        # per-call re-import in the cycle-sleep hot path was redundant.
         cap = max_cycle_delay_s
         # v2.6.7 Fix C: when the primary is a self-healing router, probe
         # it often (router_max_cycle_delay_s, default 30s) instead of
@@ -3889,7 +4040,7 @@ async def _patched_call_chat_model_turn(
         # primary that 500s on /v1/responses gets chat-completions on the
         # main loop too, not just on utility/chat-cascade calls.
         try:
-            from usr.plugins._model_fallback.models_ext import (
+            from usr.plugins.model_fallback.models_ext import (
                 force_chat_completions_mode,
                 should_force_chat_completions,
             )

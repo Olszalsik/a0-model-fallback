@@ -14,7 +14,7 @@ if str(REPO_ROOT) not in sys.path:
 
 # Import the helper directly so tests don't depend on the agent
 # loader or the runtime ``agent`` module.
-from usr.plugins._model_fallback.extensions.python.message_loop_prompts_after import (  # noqa: E402
+from usr.plugins.model_fallback.extensions.python.message_loop_prompts_after import (  # noqa: E402
     _10_context_size_guard as csg,
 )
 
@@ -146,7 +146,7 @@ def test_context_size_guard_no_op_when_disabled():
     helper returns the right shape when disabled. We don't invoke
     the extension here because that requires a real ``agent`` import.
     """
-    from usr.plugins._model_fallback.extensions.python.message_loop_prompts_after._10_context_size_guard import (  # noqa: E501
+    from usr.plugins.model_fallback.extensions.python.message_loop_prompts_after._10_context_size_guard import (  # noqa: E501
         ContextSizeGuard,
     )
     cfg = csg.resolve_config({"enabled": False})

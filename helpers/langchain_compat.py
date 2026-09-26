@@ -1,4 +1,4 @@
-"""LangChain v1 -> langchain_core compatibility shim (v2.4 of _model_fallback).
+"""LangChain v1 -> langchain_core compatibility shim (v2.4 of model_fallback).
 
 WHY THIS EXISTS
 ---------------
@@ -20,7 +20,7 @@ error, and the user sees a cascade of "all utility models
 tried to format the same broken context" failures.
 
 This is a v0/v1 langchain interface error, not a network or quota
-error -- the `_model_fallback` cascade can't recover from a
+error -- the `model_fallback` cascade can't recover from a
 ModuleNotFoundError because the import failure happens BEFORE
 any model call. We treat it as part of the same LLM-error-handling
 surface as the cascade itself, so the fix lives in this plugin.

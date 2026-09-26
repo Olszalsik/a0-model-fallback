@@ -28,7 +28,7 @@ if str(REPO_ROOT) not in sys.path:
 
 def test_fallback_a0_only_kwargs_contains_venice_parameters():
     """The cascade's strip list must include venice_parameters."""
-    from usr.plugins._model_fallback.fallback import _A0_ONLY_KWARGS
+    from usr.plugins.model_fallback.fallback import _A0_ONLY_KWARGS
     assert "venice_parameters" in _A0_ONLY_KWARGS, (
         "venice_parameters is not in _A0_ONLY_KWARGS; a0_venice's "
         "kwargs will leak into Groq / other providers, causing 400"
@@ -41,7 +41,7 @@ def test_fallback_a0_only_kwargs_contains_venice_parameters():
 
 def test_models_ext_strip_loop_contains_venice_parameters():
     """build_fallback_wrapper's inline strip list must mirror fallback.py."""
-    from usr.plugins._model_fallback import models_ext
+    from usr.plugins.model_fallback import models_ext
     # Read the strip loop from models_ext.py source. We can't import
     # the constant because it's inline in a function, so we read the
     # source and assert the key string is present.
@@ -67,8 +67,8 @@ def test_strip_lists_are_in_sync():
     If one is updated and the other isn't, the bug re-appears in the
     other path. This test guards against the lists drifting.
     """
-    from usr.plugins._model_fallback import models_ext
-    from usr.plugins._model_fallback.fallback import _A0_ONLY_KWARGS
+    from usr.plugins.model_fallback import models_ext
+    from usr.plugins.model_fallback.fallback import _A0_ONLY_KWARGS
 
     # Provider-specific keys that must appear in BOTH lists
     required = ("venice_parameters", "a0_api_mode")

@@ -1,4 +1,4 @@
-"""Tests for the v2.2 resilience layer of the `_model_fallback` plugin.
+"""Tests for the v2.2 resilience layer of the `model_fallback` plugin.
 
 Covers the remaining piece (v2.5: the housekeeping loop and v2.6.6: the
 webui_extensions_cache were both removed/migrated):
@@ -11,7 +11,7 @@ live in ``usr/plugins/ui_loader_optimizer/tests/test_extension_cache.py``.
 The tests do NOT touch the real framework; everything is mocked
 or run in isolation. To run:
     cd /a0
-    REPO_ROOT_OVERRIDE="$(pwd)" pytest usr/plugins/_model_fallback/tests/test_resilience_v22.py -v
+    REPO_ROOT_OVERRIDE="$(pwd)" pytest usr/plugins/model_fallback/tests/test_resilience_v22.py -v
 """
 
 from __future__ import annotations
@@ -37,8 +37,8 @@ if str(REPO_ROOT) not in sys.path:
 # Test the utility timeout guard
 # ---------------------------------------------------------------------------
 
-from usr.plugins._model_fallback.helpers import utility_timeout  # noqa: E402
-from usr.plugins._model_fallback.helpers import stats as _stats  # noqa: E402
+from usr.plugins.model_fallback.helpers import utility_timeout  # noqa: E402
+from usr.plugins.model_fallback.helpers import stats as _stats  # noqa: E402
 
 
 @pytest.fixture(autouse=True)

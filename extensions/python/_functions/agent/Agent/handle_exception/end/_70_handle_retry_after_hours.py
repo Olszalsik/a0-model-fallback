@@ -39,7 +39,7 @@ class HandleRetryAfterHours(Extension):
 
         # Lazy import so the plugin loads even if fallback.py has import errors
         try:
-            from usr.plugins._model_fallback.fallback import RetryAfterHours
+            from usr.plugins.model_fallback.fallback import RetryAfterHours
         except ImportError:
             return
 
@@ -55,7 +55,7 @@ class HandleRetryAfterHours(Extension):
         # persist_chat stops stripping it) and the old literal now reads a
         # key nothing writes.
         try:
-            from usr.plugins._model_fallback import fallback as _fb
+            from usr.plugins.model_fallback import fallback as _fb
 
             notified_key = _fb.DATA_KEY_EXT_RETRY_NOTIFIED
         except ImportError:

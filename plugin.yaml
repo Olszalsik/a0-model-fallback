@@ -16,9 +16,19 @@ description: >
   the other" bug class. v3.1.0 adds conservative latency-adaptive cold
   timeouts: per-label observed p95 x margin, clamped to a floor and the
   config base — never applied to routers or unlimited_paid labels.
+  v3.3.0 merges the standalone _asyncio_guard and _extension_import_guard
+  plugins in as two more independently toggleable resilience layers, and
+  fixes the install site for both: a plugin ``hooks.py`` is only ever
+  imported lazily by ``call_plugin_hook``, so an import-time patch (the
+  asyncio guard) never ran at boot, and an ``agent_init`` install (the
+  import guard) could not protect its own cold-cache enumeration. Both
+  now install from the ``startup_migration`` extension point, the earliest
+  hook that reliably fires. The import guard also stops mirroring
+  upstream ``load_classes_from_folder`` and instead shims
+  ``modules.import_module``, so it cannot drift.
   Self-contained; no official agent-zero file is
   modified.
-version: 3.2.0
+version: 3.3.0
 settings_sections:
   - agent
   - developer

@@ -12,7 +12,7 @@ and chat cascade are structurally identical, so we test the utility
 contract via an inline replica that mirrors the production wiring).
 Test:
     cd /a0
-    REPO_ROOT_OVERRIDE="$(pwd)" pytest usr/plugins/_model_fallback/tests/test_adaptive_sleep_v26.py -v
+    REPO_ROOT_OVERRIDE="$(pwd)" pytest usr/plugins/model_fallback/tests/test_adaptive_sleep_v26.py -v
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 
-from usr.plugins._model_fallback.fallback import (
+from usr.plugins.model_fallback.fallback import (
     _DEFAULT_CYCLE_STAGNATION_FACTOR,
     _DEFAULT_CYCLE_STAGNATION_THRESHOLD,
 )

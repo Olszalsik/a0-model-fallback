@@ -75,7 +75,7 @@ def _cfg() -> dict:
     """
     out = dict(_DEFAULTS)
     try:
-        from usr.plugins._model_fallback import fallback as fb
+        from usr.plugins.model_fallback import fallback as fb
         # Any live target's agent works for config resolution; None is
         # tolerated by _get_plugin_cfg's own try/except.
         agent = None
@@ -180,7 +180,7 @@ async def sweep() -> int:
     if not cfg["recovery_probe_enabled"]:
         return 0
     try:
-        from usr.plugins._model_fallback import fallback as fb
+        from usr.plugins.model_fallback import fallback as fb
     except Exception:  # noqa: BLE001
         return 0
 
@@ -276,7 +276,7 @@ def _clear_cooldown_early(fb, agent, label: str) -> None:
             # v2.9.1: route event -- distinguishes probe recovery from a
             # live-call recovery (cooldown_cleared_by_success).
             try:
-                from usr.plugins._model_fallback.helpers import events
+                from usr.plugins.model_fallback.helpers import events
                 events.record_event(
                     "cooldown_cleared_early", agent=agent, label=label
                 )

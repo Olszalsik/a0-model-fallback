@@ -11,7 +11,7 @@ Covers the five items the v2.8.3 audit flagged but did not fix:
   T5  _strip_a0_only_kwargs(is_primary=True) keeps provider-specific
       kwargs (venice_parameters) on the live primary model object.
 
-Run from repo root:  python -m pytest usr/plugins/_model_fallback/tests/test_v284_flagged_fixes.py -q
+Run from repo root:  python -m pytest usr/plugins/model_fallback/tests/test_v284_flagged_fixes.py -q
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ REPO_ROOT = Path(
 )
 sys.path.insert(0, str(REPO_ROOT))
 
-from usr.plugins._model_fallback import fallback as fb  # noqa: E402
+from usr.plugins.model_fallback import fallback as fb  # noqa: E402
 
 
 class FakeAgent:
@@ -134,7 +134,7 @@ def test_stats_version_not_hardcoded():
 
 
 def test_force_chat_config_reads_yaml_defaults():
-    from usr.plugins._model_fallback import models_ext as mx
+    from usr.plugins.model_fallback import models_ext as mx
 
     providers, patterns, api_bases = mx._force_chat_config(None)
     # default_config.yaml ships non-empty values for all three lists.

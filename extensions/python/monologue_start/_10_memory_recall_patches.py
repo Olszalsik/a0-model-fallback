@@ -29,7 +29,7 @@ from agent import LoopData
 # v2.8.5 (AD): version-stamp the install guards. A bare ``True`` sentinel
 # survives a plugin UPDATE: the wrapper (closure) from the old code stays
 # live on the framework class for the rest of the process even though its
-# logic is stale. Patches now also record _mfb_*_patch_version; a version
+# logic is stale. Patches now also record mfb_*_patch_version; a version
 # mismatch unwraps the old wrapper (via the stored original) and re-applies.
 _PATCH_VERSION = "2.8.5"
 
@@ -80,10 +80,10 @@ def _resolve_memory_cfg(agent) -> dict:
     """
     try:
         from helpers import plugins as plugin_helpers  # type: ignore
-        cfg = plugin_helpers.get_plugin_config("_model_fallback", agent) or {}
+        cfg = plugin_helpers.get_plugin_config("model_fallback", agent) or {}
         try:
             defaults = plugin_helpers.get_default_plugin_config(
-                "_model_fallback"
+                "model_fallback"
             ) or {}
             if isinstance(defaults, dict):
                 merged = dict(defaults)
@@ -231,7 +231,7 @@ class MemoryRecallPatches(Extension):
             root = os.path.dirname(os.path.dirname(os.path.dirname(
                 os.path.dirname(os.path.dirname(os.path.dirname(
                     os.path.dirname(__file__)))))))
-            # __file__ = <root>/usr/plugins/_model_fallback/extensions/python/
+            # __file__ = <root>/usr/plugins/model_fallback/extensions/python/
             # monologue_start/<this>.py -> 7 dirname() steps up = framework root
         except Exception:
             root = "/a0"
@@ -268,12 +268,12 @@ class MemoryRecallPatches(Extension):
             if cls is None:
                 continue
             current = cls.memorize
-            if getattr(cls, "_mfb_memorize_patched", False):
+            if getattr(cls, "mfb_memorize_patched", False):
                 # Ours (this or a previous plugin version): re-patch only
                 # when the plugin version changed (AD).
-                if getattr(cls, "_mfb_memorize_patch_version", "") == _PATCH_VERSION:
+                if getattr(cls, "mfb_memorize_patch_version", "") == _PATCH_VERSION:
                     continue
-                original = getattr(current, "_mfb_orig", None) or current
+                original = getattr(current, "mfb_orig", None) or current
             else:
                 original = current
 
@@ -304,10 +304,10 @@ class MemoryRecallPatches(Extension):
                 return safe_memorize
 
             new_memorize = make_safe(original)
-            new_memorize._mfb_orig = original
+            new_memorize.mfb_orig = original
             cls.memorize = new_memorize
-            cls._mfb_memorize_patched = True
-            cls._mfb_memorize_patch_version = _PATCH_VERSION
+            cls.mfb_memorize_patched = True
+            cls.mfb_memorize_patch_version = _PATCH_VERSION
 
     def _ensure_config(self):
         """Ensure the _memory plugin's config.json exists with safe defaults.

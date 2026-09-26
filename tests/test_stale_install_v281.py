@@ -14,7 +14,7 @@ gracefully (no ImportError out of Agent.__init__).
 
 Test:
     cd /a0
-    REPO_ROOT_OVERRIDE="$(pwd)" pytest usr/plugins/_model_fallback/tests/test_stale_install_v281.py -v
+    REPO_ROOT_OVERRIDE="$(pwd)" pytest usr/plugins/model_fallback/tests/test_stale_install_v281.py -v
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ if str(REPO_ROOT) not in sys.path:
 
 import pytest
 
-from usr.plugins._model_fallback import fallback
+from usr.plugins.model_fallback import fallback
 
 
 class FakeLog:
@@ -129,13 +129,13 @@ def test_installer_survives_stale_fallback_module(monkeypatch):
     class StaleFallback:
         pass  # no attributes at all
 
-    import usr.plugins._model_fallback as pkg
+    import usr.plugins.model_fallback as pkg
     monkeypatch.setattr(pkg, "fallback", StaleFallback(), raising=False)
-    # The installer imports ``usr.plugins._model_fallback.fallback`` --
+    # The installer imports ``usr.plugins.model_fallback.fallback`` --
     # monkeypatching the package attr doesn't affect sys.modules, so also
     # patch sys.modules directly.
     monkeypatch.setitem(
-        sys.modules, "usr.plugins._model_fallback.fallback", StaleFallback()
+        sys.modules, "usr.plugins.model_fallback.fallback", StaleFallback()
     )
 
     class FakeContext:
@@ -157,7 +157,7 @@ def test_installer_survives_stale_fallback_module(monkeypatch):
         _patched_call_chat_model = fallback._patched_call_chat_model
 
     monkeypatch.setitem(
-        sys.modules, "usr.plugins._model_fallback.fallback", HalfStale()
+        sys.modules, "usr.plugins.model_fallback.fallback", HalfStale()
     )
     ext2 = mod.InstallFallbackPatches(agent=FakeAgent())
     ext2.execute()  # must not raise either

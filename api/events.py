@@ -1,6 +1,6 @@
 """Read-only event-timeline endpoint (v2.9.1).
 
-Route: POST /api/plugins/_model_fallback/events
+Route: POST /api/plugins/model_fallback/events
 
 Returns the newest-first ring-buffer of routing events recorded by
 helpers/events.py -- cooldown bookings and clears (probe vs live-call
@@ -31,7 +31,7 @@ from helpers.api import ApiHandler, Request
 
 class Events(ApiHandler):
     async def process(self, input: Dict[str, Any], request: Request) -> Dict[str, Any]:
-        from usr.plugins._model_fallback.helpers import events
+        from usr.plugins.model_fallback.helpers import events
 
         try:
             limit = int(input.get("limit", 100))
@@ -56,7 +56,7 @@ def _version() -> str:
     try:
         from helpers import plugins
 
-        meta = plugins.get_plugin_meta("_model_fallback")
+        meta = plugins.get_plugin_meta("model_fallback")
         return str(getattr(meta, "version", "") or "unknown")
     except Exception:  # noqa: BLE001
         return "unknown"

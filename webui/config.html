@@ -189,6 +189,51 @@
           </div>
         </div>
 
+        <div class="toggle-row">
+          <label class="toggle">
+            <input type="checkbox"
+                   x-model="context.settings.asyncio_read_ready_guard_enabled" />
+            <span class="toggle-slider"></span>
+          </label>
+          <div class="toggle-label">
+            <div class="field-title">Asyncio read-ready guard
+              <span class="version-badge">v3.3.0</span>
+            </div>
+            <div class="field-description">
+              Merged from the old <code>_asyncio_guard</code> plugin.
+              Stops a closed socket whose file descriptor is still in the
+              selector from calling a cleared callback, which raises
+              <code>TypeError</code> every tick and wedges the event loop
+              (CPython <code>gh-115514</code>). Installs at
+              <code>startup_migration</code>, before any model call.
+              Detects an already-fixed CPython and does nothing, so it is
+              safe to leave on.
+            </div>
+          </div>
+        </div>
+
+        <div class="toggle-row">
+          <label class="toggle">
+            <input type="checkbox"
+                   x-model="context.settings.extension_import_guard_enabled" />
+            <span class="toggle-slider"></span>
+          </label>
+          <div class="toggle-label">
+            <div class="field-title">Extension import guard
+              <span class="version-badge">v3.3.0</span>
+            </div>
+            <div class="field-description">
+              Merged from the old <code>_extension_import_guard</code>
+              plugin. One extension file that fails to import is logged
+              and skipped instead of aborting its whole extension point —
+              which previously killed <em>every</em> model call. Skipped
+              files are listed on the
+              <code>/api/plugins/model_fallback/stats</code> endpoint and recover
+              automatically once the file is fixed.
+            </div>
+          </div>
+        </div>
+
         <div class="advanced-disclosure" x-data="{ open: false }">
           <button type="button" class="disclosure-toggle" @click="open = !open">
             <span x-text="open ? '▾' : '▸'"></span>

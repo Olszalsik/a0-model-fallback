@@ -21,7 +21,7 @@ Root causes under test (2026-09-02 audit of the v2.8.2 tree):
 
 Test:
     cd /a0  (or the repo root on a host checkout)
-    pytest usr/plugins/_model_fallback/tests/test_v283_audit_fixes.py -v
+    pytest usr/plugins/model_fallback/tests/test_v283_audit_fixes.py -v
 """
 
 from __future__ import annotations
@@ -38,12 +38,12 @@ if str(REPO_ROOT) not in sys.path:
 
 import pytest
 
-from usr.plugins._model_fallback import fallback
-from usr.plugins._model_fallback.fallback import (
+from usr.plugins.model_fallback import fallback
+from usr.plugins.model_fallback.fallback import (
     _cooldown_seconds_for_status,
     _is_timeout_shaped,
 )
-from usr.plugins._model_fallback.helpers import utility_timeout
+from usr.plugins.model_fallback.helpers import utility_timeout
 
 # NOTE: resolve module-level state via ``fallback.<name>`` at call time,
 # never via import-time from-imports (suite-pollution gotcha -- see
@@ -175,7 +175,7 @@ def test_utility_timeout_yaml_merge_reaches_resolve():
     with an empty config.json the YAML's 60s default must win over the
     (old, stale) 30s code default."""
     ext = pytest.importorskip(
-        "usr.plugins._model_fallback.extensions.python.agent_init"
+        "usr.plugins.model_fallback.extensions.python.agent_init"
         "._10_install_utility_timeout_patch"
     )
     cfg = ext._resolve_config(None)
@@ -191,7 +191,7 @@ def test_context_guard_toggle_wins_over_sectionless_config():
     """The WebUI toggle (top-level context_size_guard_enabled) must turn
     the guard ON even when config.json carries no nested section --
     otherwise the UI says ON while the runtime says OFF."""
-    from usr.plugins._model_fallback.extensions.python.message_loop_prompts_after import (  # noqa: E402
+    from usr.plugins.model_fallback.extensions.python.message_loop_prompts_after import (  # noqa: E402
         _10_context_size_guard as csg,
     )
 
@@ -217,7 +217,7 @@ def test_context_guard_toggle_wins_over_sectionless_config():
 
 
 def test_hooks_cooldown_api_uses_live_store():
-    from usr.plugins._model_fallback import hooks
+    from usr.plugins.model_fallback import hooks
 
     agent = FakeAgent()
     store = fallback._get_cooldown_store(agent)

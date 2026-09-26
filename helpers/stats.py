@@ -10,14 +10,14 @@ and a single set of counters is enough for the WebUI's traffic-light
 tile. Module-level dicts are the simplest correct option and are
 reset by ``reset()`` from ``uninstall``.
 
-Why not the existing ``_model_fallback.fallback`` stats: those are
+Why not the existing ``model_fallback.fallback`` stats: those are
 agent-scoped (one dict per agent, persisted to ``agent.data``). The
 resilience counters are PROCESS-scoped. Two distinct scopes, two
 distinct stores.
 
 Thread safety: this is async code on a single event loop. There is
 no preemption between ``+=`` and the dict read. The bookkeeping
-counters are read by the ``/api/plugins/_model_fallback/stats``
+counters are read by the ``/api/plugins/model_fallback/stats``
 endpoint, which runs on the same loop. No locks needed.
 
 Memory: the dict grows at the rate of model calls. With the defaults
@@ -31,7 +31,7 @@ The ``_HOUSEKEEPING`` counter group and the
 ``housekeeping_snapshot`` / ``housekeeping_mark_*`` accessors were
 removed in this branch. The standalone housekeeping loop is gone;
 the counters would have stayed frozen at zero forever. The
-``/api/plugins/_model_fallback/stats`` endpoint no longer surfaces
+``/api/plugins/model_fallback/stats`` endpoint no longer surfaces
 a ``housekeeping`` block.
 
 v2.6.6 extensions-cache removal

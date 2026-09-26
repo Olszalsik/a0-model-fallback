@@ -35,7 +35,7 @@ def test_build_fallback_wrapper_rejects_list_model_value():
     construct a wrapper that fails downstream with a confusing litellm
     BadRequestError."""
     import pytest
-    from usr.plugins._model_fallback.models_ext import build_fallback_wrapper
+    from usr.plugins.model_fallback.models_ext import build_fallback_wrapper
     with pytest.raises(TypeError, match="must be a string"):
         build_fallback_wrapper(
             {"model": [{"model": "nvidia_nim/x"}]},
@@ -49,7 +49,7 @@ def test_build_fallback_wrapper_rejects_dict_model_value():
     cascade has no way to know which inner key is the model name in
     general, so any non-string shape is rejected."""
     import pytest
-    from usr.plugins._model_fallback.models_ext import build_fallback_wrapper
+    from usr.plugins.model_fallback.models_ext import build_fallback_wrapper
     with pytest.raises(TypeError, match="must be a string"):
         build_fallback_wrapper(
             {"model": {"oops": "nested"}},
@@ -64,7 +64,7 @@ def test_build_fallback_wrapper_accepts_string_model():
     wrapper construction itself may fail (e.g. litellm not available
     in test env, or provider YAML missing); we only care that the
     TypeError validation doesn't fire."""
-    from usr.plugins._model_fallback.models_ext import build_fallback_wrapper
+    from usr.plugins.model_fallback.models_ext import build_fallback_wrapper
     try:
         build_fallback_wrapper(
             {"model": "nvidia_nim/x"},
@@ -91,7 +91,7 @@ def test_get_model_label_handles_list_model():
     the per-attempt log line and the cooldown dict; an unparseable
     label would break cooldown dedupe (different malformed specs
     would each have a unique str() output)."""
-    from usr.plugins._model_fallback.fallback import _get_model_label
+    from usr.plugins.model_fallback.fallback import _get_model_label
     label = _get_model_label(
         {"model": [{"model": "nvidia_nim/x"}]},
         None,
@@ -106,7 +106,7 @@ def test_get_model_label_handles_dict_model():
     """Same as the list case, but for a dict-valued `model` key.
     Defensive: a different malformed shape produces a similarly
     clean label."""
-    from usr.plugins._model_fallback.fallback import _get_model_label
+    from usr.plugins.model_fallback.fallback import _get_model_label
     label = _get_model_label(
         {"model": {"oops": "nested"}},
         None,

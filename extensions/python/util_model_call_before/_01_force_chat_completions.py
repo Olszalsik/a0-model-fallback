@@ -6,7 +6,7 @@ to /v1/responses and hits the same ollama.com 500, so the same injection applies
 """
 from helpers.extension import Extension
 
-from usr.plugins._model_fallback.models_ext import (
+from usr.plugins.model_fallback.models_ext import (
     should_force_chat_completions,
     force_chat_completions_mode,
 )

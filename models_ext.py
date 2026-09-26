@@ -307,7 +307,7 @@ def _force_chat_config(agent) -> tuple:
     try:
         from helpers import plugins as _plugins
 
-        cfg = _plugins.get_plugin_config("_model_fallback", agent) or {}
+        cfg = _plugins.get_plugin_config("model_fallback", agent) or {}
         if not isinstance(cfg, dict):
             cfg = {}
         # v2.8.4: get_plugin_config does NOT merge default_config.yaml with
@@ -317,7 +317,7 @@ def _force_chat_config(agent) -> tuple:
         # lists never reached this code unless the user duplicated them into
         # config.json by hand. Default YAML first, live config.json on top.
         try:
-            defaults = _plugins.get_default_plugin_config("_model_fallback")
+            defaults = _plugins.get_default_plugin_config("model_fallback")
             if isinstance(defaults, dict):
                 merged = dict(defaults)
                 merged.update(cfg)
@@ -642,6 +642,9 @@ def build_fallback_wrapper(spec: Any, parent_config: dict):
     # spec (different model on the same vendor), so we still drop them
     # here and let get_api_key() fill them in below.
     parent_kwargs_to_skip = {"api_key", "api_base"}
+    # extra_body is provider-specific (e.g. NVIDIA NIM's nemotron thinking
+    # toggle); a fallback on a different provider must not inherit it.
+    parent_kwargs_to_skip.add("extra_body")
     for k, v in (parent_config.get("kwargs") or {}).items():
         if k in parent_kwargs_to_skip:
             # Drop the parent's credentials. Either the spec carries its

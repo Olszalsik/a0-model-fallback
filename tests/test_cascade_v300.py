@@ -12,7 +12,7 @@ it is NOT part of the v3.0.0 unification.
 
 Test:
     cd /a0
-    REPO_ROOT_OVERRIDE="$(pwd)" pytest usr/plugins/_model_fallback/tests/test_cascade_v300.py -v
+    REPO_ROOT_OVERRIDE="$(pwd)" pytest usr/plugins/model_fallback/tests/test_cascade_v300.py -v
 """
 
 from __future__ import annotations
@@ -31,9 +31,9 @@ REPO_ROOT = Path(
 )
 sys.path.insert(0, str(REPO_ROOT))
 
-from usr.plugins._model_fallback import fallback as fb  # noqa: E402
-from usr.plugins._model_fallback.helpers import events  # noqa: E402
-from usr.plugins._model_fallback.helpers import recovery_probe as rp  # noqa: E402
+from usr.plugins.model_fallback import fallback as fb  # noqa: E402
+from usr.plugins.model_fallback.helpers import events  # noqa: E402
+from usr.plugins.model_fallback.helpers import recovery_probe as rp  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 """Tests for the v2.4 langchain v0 -> v1 import compatibility shim.
 
-The shim is part of the ``_model_fallback`` plugin's
+The shim is part of the ``model_fallback`` plugin's
 LLM-error-handling surface (a v0/v1 langchain import mismatch is a
 fatal error no cascade can recover from). It registers
 ``langchain_core.prompts`` and ``langchain_core.messages`` under
@@ -32,7 +32,7 @@ if str(REPO_ROOT) not in sys.path:
 # Import the helper directly so tests don't depend on the agent
 # loader or the runtime ``agent`` module. The agent_init extension
 # is just a thin wrapper around the helper.
-from usr.plugins._model_fallback.helpers import langchain_compat  # noqa: E402
+from usr.plugins.model_fallback.helpers import langchain_compat  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -196,14 +196,14 @@ def test_shim_falls_back_to_messages_for_schema():
 
 
 def test_helper_lives_in_model_fallback_not_standalone_plugin():
-    """The shim helper is part of ``_model_fallback`` (per user
+    """The shim helper is part of ``model_fallback`` (per user
     preference: LLM-error-handling in one plugin). A regression
     that re-extracts it to a separate plugin would be visible here.
     """
     # The module's fully-qualified name ends with ``.langchain_compat``
-    # and lives under ``_model_fallback.helpers``, not a standalone
+    # and lives under ``model_fallback.helpers``, not a standalone
     # ``_langchain_compat`` package.
     assert langchain_compat.__name__.endswith(".langchain_compat")
     mod_file = getattr(langchain_compat, "__file__", "") or ""
-    assert "_model_fallback" in mod_file
+    assert "model_fallback" in mod_file
     assert "_langchain_compat" not in mod_file

@@ -26,7 +26,7 @@ code MUST do at the boundary.
 
 To run:
     cd /a0
-    REPO_ROOT_OVERRIDE="$(pwd)" pytest usr/plugins/_model_fallback/tests/test_no_preempt_v26.py -v
+    REPO_ROOT_OVERRIDE="$(pwd)" pytest usr/plugins/model_fallback/tests/test_no_preempt_v26.py -v
 """
 
 from __future__ import annotations
@@ -178,7 +178,7 @@ def test_outer_guard_unchanged_by_phase_4():
     suite. We pop the module so the test suite order doesn't matter.
     """
     from helpers.errors import RepairableException
-    from usr.plugins._model_fallback.helpers import utility_timeout
+    from usr.plugins.model_fallback.helpers import utility_timeout
 
     cfg = utility_timeout.resolve_config({
         "enabled": True,

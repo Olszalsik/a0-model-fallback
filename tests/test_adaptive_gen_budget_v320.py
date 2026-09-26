@@ -20,7 +20,7 @@ path timeout, both success paths, clear_all_cooldowns, hooks.uninstall,
 and the outer utility-timeout guard (apply + grow).
 
 Run from repo root:
-    python -m pytest usr/plugins/_model_fallback/tests/test_adaptive_gen_budget_v320.py -q
+    python -m pytest usr/plugins/model_fallback/tests/test_adaptive_gen_budget_v320.py -q
 """
 
 from __future__ import annotations
@@ -38,11 +38,11 @@ REPO_ROOT = Path(
 )
 sys.path.insert(0, str(REPO_ROOT))
 
-from usr.plugins._model_fallback import fallback as fb  # noqa: E402
-from usr.plugins._model_fallback.helpers import events  # noqa: E402
-from usr.plugins._model_fallback.helpers import latency  # noqa: E402
+from usr.plugins.model_fallback import fallback as fb  # noqa: E402
+from usr.plugins.model_fallback.helpers import events  # noqa: E402
+from usr.plugins.model_fallback.helpers import latency  # noqa: E402
 from helpers.errors import RepairableException  # noqa: E402
-from usr.plugins._model_fallback.helpers import utility_timeout as ut  # noqa: E402
+from usr.plugins.model_fallback.helpers import utility_timeout as ut  # noqa: E402
 
 
 @pytest.fixture(autouse=True)

@@ -17,7 +17,7 @@ The fix resolves classes through ``helpers.extension._get_extension_classes``
 
 Test:
     cd <repo root>
-    REPO_ROOT_OVERRIDE="$(pwd)" python -m pytest usr/plugins/_model_fallback/tests/test_memory_recall_patches_v282.py -v
+    REPO_ROOT_OVERRIDE="$(pwd)" python -m pytest usr/plugins/model_fallback/tests/test_memory_recall_patches_v282.py -v
 """
 
 from __future__ import annotations
@@ -197,8 +197,8 @@ def test_memorize_classes_wrapped(framework, ext_cls):
     MS = framework["classes"]["MemorizeSolutions"]
     inst = ext_cls(agent=FakeAgent())
     asyncio.run(inst.execute())
-    assert getattr(MM, "_mfb_memorize_patched", False) is True
-    assert getattr(MS, "_mfb_memorize_patched", True) is True
+    assert getattr(MM, "mfb_memorize_patched", False) is True
+    assert getattr(MS, "mfb_memorize_patched", True) is True
 
 
 def test_idempotent_reapplication(framework, ext_cls):

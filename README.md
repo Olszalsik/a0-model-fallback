@@ -1,4 +1,4 @@
-# Model Fallback System (`_model_fallback`)
+# Model Fallback System (`model_fallback`)
 
 An [agent-zero](https://github.com/agent0ai/agent-zero) plugin that turns a single
 model call into a resilient, multi-candidate cascade with rate-limit evasion,
@@ -47,6 +47,7 @@ two `Agent.*` monkey-patches.
 
 | Version | Feature |
 |---|---|
+| **v3.3.0** | **Merged two standalone plugins in and fixed their install sites.** The `_asyncio_guard` and `_extension_import_guard` plugins are now `helpers/asyncio_guard.py` and `helpers/import_guard.py`, installed from the `startup_migration` extension point. Both previously had broken install sites: the asyncio guard applied its patch at *import time of its own `hooks.py`*, but a plugin `hooks.py` is only ever imported lazily by `call_plugin_hook` and nothing calls `install()` for enabled plugins at boot — so it was dead code on every restart (and this box runs Python 3.12.10, where `_read_ready` really is unguarded). The import guard installed from `agent_init`, which is itself loaded by the `load_classes_from_folder` it patches, so its own cold-cache enumeration ran unpatched. The import guard also stops mirroring upstream `load_classes_from_folder` and shims `modules.import_module` instead, so it can no longer drift; the swap is re-entrancy safe. Upstream-detection in the asyncio guard moved from a `co_names`-length heuristic (which provably cannot tell a fixed interpreter from an unfixed one) to a behavioural probe. Also fixes a latent `NameError` in `hooks.clear_cooldowns`. |
 | **v2.7.0** | **Router cold-call warm-up budget + cross-agent dead-mark exemption.** (1) A COLD router call (no success within the warm window — typical right after 3 concurrent agents exhausted the gateway's free pool and the gateway must re-route to a fresh upstream) now gets `router_cold_call_timeout_s` (default **150s**) instead of dying a "timed out after 60s" death every cycle; once a call succeeds the label is warm and the fast cold base resumes. Composes with `router_call_timeout_s` (takes the max); `<= 0` disables. (2) **Router dead-mark exemption** — a gateway-surfaced upstream 401/403/404 (e.g. one dead free slug) no longer puts the `omniroute/<combo>` label into the shared cross-agent `_INMEM_DEAD_LABELS` blocklist (404 duration = 24h, starving every agent of a healthy gateway). Router labels are exempt; non-router labels keep the shared dead-mark. Covers both detection paths (label prefix and api_base). 179/179 tests. |
 | **v2.6.9** | **Stagnation `nonlocal` fix.** `UnboundLocalError` in `_compute_cycle_sleep` during a sustained outage (`stagnation_logged_this_outage` assigned in a nested closure without `nonlocal`, so its read raised) crashed history compression exactly when the agent was already slow. Also added the missing `nonlocal` resets to both `_succeed` closures. No behavior change. |
 | **v2.6.7** | **Router detection + router-class wait tuning.** The v2.6.2 router class detected routers by label prefix only, so an OmniRoute primary registered with `litellm_provider: openai` (label `openai/auto/best-coding`, prefix `openai`) was mis-classified as `free_per_minute` — a single timeout set a 300s cooldown (the "300 second wait"). Four gated fixes: A1 configurable `router_label_prefixes`, A2 durable `api_base` matcher (the reliable signal), B pure-timeout → no cooldown for routers, C router cycle-backoff cap 30s, D `router_call_timeout_s` headroom knob. Recovers drop from 400-700s to <60s. |
@@ -115,9 +116,9 @@ This is an agent-zero plugin. Drop the directory into your agent-zero plugin
 folder:
 
 ```
-<agent-zero>/plugins/_model_fallback/        # shared / upstream-style
+<agent-zero>/plugins/model_fallback/        # shared / upstream-style
 # or
-<agent-zero>/usr/plugins/_model_fallback/     # user-local (not overwritten by updates)
+<agent-zero>/usr/plugins/model_fallback/     # user-local (not overwritten by updates)
 ```
 
 Then enable it from the agent-zero WebUI (Settings → Plugins) or by ensuring no
@@ -209,9 +210,9 @@ langchain shim, spec validation, cooldown dedupe, etc. Run from the agent-zero
 repo root:
 
 ```bash
-# The plugin imports via `usr.plugins._model_fallback`, so set the repo root
+# The plugin imports via `usr.plugins.model_fallback`, so set the repo root
 # (tests default to the container path /a0):
-REPO_ROOT_OVERRIDE="$(pwd)" pytest usr/plugins/_model_fallback/tests/ -v
+REPO_ROOT_OVERRIDE="$(pwd)" pytest usr/plugins/model_fallback/tests/ -v
 ```
 
 The v2.6.1 regression test (`tests/test_chat_warm_wiring_v26.py`) is a

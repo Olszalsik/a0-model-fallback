@@ -14,7 +14,7 @@ verify the contract that Phase 5 relies on.
 
 To run:
     cd /a0
-    REPO_ROOT_OVERRIDE="$(pwd)" pytest usr/plugins/_model_fallback/tests/test_primary_skip_v26.py -v
+    REPO_ROOT_OVERRIDE="$(pwd)" pytest usr/plugins/model_fallback/tests/test_primary_skip_v26.py -v
 """
 
 from __future__ import annotations
@@ -29,8 +29,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 
-from usr.plugins._model_fallback import fallback as _fb_mod
-from usr.plugins._model_fallback.fallback import (
+from usr.plugins.model_fallback import fallback as _fb_mod
+from usr.plugins.model_fallback.fallback import (
     _maybe_clear_cooldown_for_healthy_label,
     _INMEM_HEALTHY_LABELS,
 )

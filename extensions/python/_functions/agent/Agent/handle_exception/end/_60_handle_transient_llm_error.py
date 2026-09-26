@@ -59,7 +59,7 @@ def _swallow_limits(agent) -> tuple[int, float]:
     try:
         from helpers import plugins as plugin_helpers
 
-        raw = plugin_helpers.get_plugin_config("_model_fallback", agent)
+        raw = plugin_helpers.get_plugin_config("model_fallback", agent)
         if isinstance(raw, dict):
             cfg = raw
     except Exception:
@@ -127,7 +127,7 @@ def _is_transient_llm_error(exc: Exception) -> bool:
     # Shared detector from the plugin (phrase-based: "rate limit",
     # "too many requests", "upstream_429", ...).
     try:
-        from usr.plugins._model_fallback.models_ext import _is_rate_limited_error
+        from usr.plugins.model_fallback.models_ext import _is_rate_limited_error
 
         if _is_rate_limited_error(exc):
             return True
@@ -156,7 +156,7 @@ class HandleTransientLLMError(Extension):
 
         # Never touch the RetryAfterHours contract -- _70 owns it.
         try:
-            from usr.plugins._model_fallback.fallback import RetryAfterHours
+            from usr.plugins.model_fallback.fallback import RetryAfterHours
 
             if isinstance(exc, RetryAfterHours):
                 return
@@ -168,7 +168,7 @@ class HandleTransientLLMError(Extension):
 
         # --- Book the cooldown so the next turn routes around this label ---
         try:
-            from usr.plugins._model_fallback.fallback import (
+            from usr.plugins.model_fallback.fallback import (
                 _get_cooldown_store,
                 _save_cooldown_store,
                 _handle_error_cooldown,

@@ -8,7 +8,7 @@ The cascade now distinguishes "warm" labels (called successfully within
 These tests are pure-Python and don't need the framework -- they
 exercise _resolve_per_call_timeout directly. To run:
     cd /a0
-    REPO_ROOT_OVERRIDE="$(pwd)" pytest usr/plugins/_model_fallback/tests/test_warm_timeout_v26.py -v
+    REPO_ROOT_OVERRIDE="$(pwd)" pytest usr/plugins/model_fallback/tests/test_warm_timeout_v26.py -v
 """
 
 from __future__ import annotations
@@ -31,8 +31,8 @@ if str(REPO_ROOT) not in sys.path:
 # ``importlib.reload(fallback)`` between tests -- a reload creates a
 # new module object but our test should target whichever module
 # instance the SUT currently has.
-from usr.plugins._model_fallback import fallback as _fb_mod
-from usr.plugins._model_fallback.fallback import (
+from usr.plugins.model_fallback import fallback as _fb_mod
+from usr.plugins.model_fallback.fallback import (
     _resolve_per_call_timeout,
     _evict_warm_on_timeout,
     _DEFAULT_CASCADE_WARM_TIMEOUT_S,

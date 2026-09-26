@@ -229,13 +229,13 @@ class _CounterProxy:
     """Dict-backed snapshot proxy kept for get_counter() callers."""
 
     def snapshot(self) -> Dict[str, Any]:
-        from usr.plugins._model_fallback.helpers import stats as _stats
+        from usr.plugins.model_fallback.helpers import stats as _stats
         return _stats.context_guard_snapshot()
 
     # Attribute-style reads (counter.trims) for backward compatibility.
     def __getattr__(self, name: str) -> Any:
         try:
-            from usr.plugins._model_fallback.helpers import stats as _stats
+            from usr.plugins.model_fallback.helpers import stats as _stats
             return _stats.context_guard_snapshot().get(name, 0)
         except Exception:  # noqa: BLE001
             return 0
@@ -246,14 +246,14 @@ def get_counter() -> _CounterProxy:
 
 
 def reset_counter() -> None:
-    from usr.plugins._model_fallback.helpers import stats as _stats
+    from usr.plugins.model_fallback.helpers import stats as _stats
     _stats.reset_context_guard_counters()
 
 
 def _resolve_runtime_config(agent) -> Dict[str, Any]:
     try:
         from helpers import plugins as plugin_helpers  # type: ignore
-        cfg = plugin_helpers.get_plugin_config("_model_fallback", agent) or {}
+        cfg = plugin_helpers.get_plugin_config("model_fallback", agent) or {}
         # v2.8.5 (wiring#7): get_plugin_config returns config.json WITHOUT
         # merging default_config.yaml (same gap the utility guard hit --
         # see _10_install_utility_timeout_patch._resolve_config v2.8.3).
@@ -262,7 +262,7 @@ def _resolve_runtime_config(agent) -> Dict[str, Any]:
         # notice_text) is effective and user config.json values win.
         try:
             defaults = plugin_helpers.get_default_plugin_config(
-                "_model_fallback"
+                "model_fallback"
             ) or {}
             if isinstance(defaults, dict):
                 merged = dict(defaults)
@@ -276,7 +276,7 @@ def _resolve_runtime_config(agent) -> Dict[str, Any]:
     # v2.5 WebUI: top-level ``context_size_guard_enabled`` wins
     # over the nested section's ``enabled``. The piece defaults
     # to OFF, so an explicit True in either place turns it on.
-    from usr.plugins._model_fallback.helpers import toggles
+    from usr.plugins.model_fallback.helpers import toggles
     toggle_on = toggles.resolve_toggle(cfg, "context_size_guard", default=False)
     if not toggle_on:
         return {"enabled": False}
@@ -318,7 +318,7 @@ class ContextSizeGuard(Extension):
             if trimmed:
                 loop_data.history_output = new_list
                 try:
-                    from usr.plugins._model_fallback.helpers import stats as _stats
+                    from usr.plugins.model_fallback.helpers import stats as _stats
                     _stats.context_guard_record_trim(dropped, len(new_list))
                 except Exception:  # noqa: BLE001
                     pass

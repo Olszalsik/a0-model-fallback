@@ -45,12 +45,12 @@ if str(REPO_ROOT) not in sys.path:
 
 
 def test_normalize_passes_through_string():
-    from usr.plugins._model_fallback.fallback import _normalize_spec
+    from usr.plugins.model_fallback.fallback import _normalize_spec
     assert _normalize_spec("nvidia_nim/x") == "nvidia_nim/x"
 
 
 def test_normalize_passes_through_valid_dict():
-    from usr.plugins._model_fallback.fallback import _normalize_spec
+    from usr.plugins.model_fallback.fallback import _normalize_spec
     spec = {"model": "nvidia_nim/x", "provider": "nvidia_nim"}
     out = _normalize_spec(spec)
     assert out == spec
@@ -63,14 +63,14 @@ def test_normalize_unwraps_single_element_list_of_dict():
 
     This is the exact shape that produced the docker-log BadRequestError.
     """
-    from usr.plugins._model_fallback.fallback import _normalize_spec
+    from usr.plugins.model_fallback.fallback import _normalize_spec
     bad = [{"model": "nvidia_nim/x"}]
     out = _normalize_spec(bad)
     assert out == {"model": "nvidia_nim/x"}
 
 
 def test_normalize_unwraps_single_element_list_of_string():
-    from usr.plugins._model_fallback.fallback import _normalize_spec
+    from usr.plugins.model_fallback.fallback import _normalize_spec
     assert _normalize_spec(["nvidia_nim/x"]) == "nvidia_nim/x"
 
 
@@ -83,7 +83,7 @@ def test_normalize_flattens_double_nested_list():
     list of well-formed specs; the caller (`_build_candidates`)
     extends the candidate list with them.
     """
-    from usr.plugins._model_fallback.fallback import _normalize_spec
+    from usr.plugins.model_fallback.fallback import _normalize_spec
     bad = [[{"model": "a/x"}], [{"model": "b/y"}]]
     out = _normalize_spec(bad)
     assert out == [{"model": "a/x"}, {"model": "b/y"}]
@@ -95,7 +95,7 @@ def test_normalize_dict_with_dict_model_unwraps_name_key():
     The unwrap tries the common inner keys in order: name, id,
     model_name, model.
     """
-    from usr.plugins._model_fallback.fallback import _normalize_spec
+    from usr.plugins.model_fallback.fallback import _normalize_spec
     bad = {"model": {"name": "nvidia_nim/x", "extra": "ignored"}}
     out = _normalize_spec(bad)
     assert out == {"model": "nvidia_nim/x"}
@@ -103,37 +103,37 @@ def test_normalize_dict_with_dict_model_unwraps_name_key():
 
 def test_normalize_dict_with_list_model_takes_first_string():
     """`{"model": ["a/x", "b/y"]}` -> `{"model": "a/x"}`."""
-    from usr.plugins._model_fallback.fallback import _normalize_spec
+    from usr.plugins.model_fallback.fallback import _normalize_spec
     bad = {"model": ["a/x", "b/y"]}
     out = _normalize_spec(bad)
     assert out == {"model": "a/x"}
 
 
 def test_normalize_drops_none_model():
-    from usr.plugins._model_fallback.fallback import _normalize_spec
+    from usr.plugins.model_fallback.fallback import _normalize_spec
     assert _normalize_spec({"model": None}) is None
 
 
 def test_normalize_drops_empty_string():
-    from usr.plugins._model_fallback.fallback import _normalize_spec
+    from usr.plugins.model_fallback.fallback import _normalize_spec
     assert _normalize_spec("") is None
     assert _normalize_spec("   ") is None
 
 
 def test_normalize_drops_empty_list():
-    from usr.plugins._model_fallback.fallback import _normalize_spec
+    from usr.plugins.model_fallback.fallback import _normalize_spec
     assert _normalize_spec([]) is None
 
 
 def test_normalize_drops_bool_and_int():
-    from usr.plugins._model_fallback.fallback import _normalize_spec
+    from usr.plugins.model_fallback.fallback import _normalize_spec
     assert _normalize_spec(True) is None
     assert _normalize_spec(42) is None
 
 
 def test_normalize_dict_with_unparseable_inner_model():
     """`{"model": {"oops": "x"}}` -> None (no recognized inner key)."""
-    from usr.plugins._model_fallback.fallback import _normalize_spec
+    from usr.plugins.model_fallback.fallback import _normalize_spec
     assert _normalize_spec({"model": {"oops": "x"}}) is None
 
 
@@ -161,7 +161,7 @@ def test_build_candidates_from_kwargs_flattens_nested_list():
     candidate -- not the stringified list that triggered the cascade of
     BadRequestErrors.
     """
-    from usr.plugins._model_fallback.fallback import _build_candidates
+    from usr.plugins.model_fallback.fallback import _build_candidates
     primary = _FakePrimary(kwargs={
         "fallbacks": [[{"model": "a/x"}], [{"model": "b/y"}]],
     })
@@ -184,7 +184,7 @@ def test_build_candidates_from_kwargs_flattens_nested_list():
 
 
 def test_build_candidates_from_agent_config_flattens_list_wrapper():
-    from usr.plugins._model_fallback.fallback import _build_candidates
+    from usr.plugins.model_fallback.fallback import _build_candidates
     primary = _FakePrimary(kwargs={})  # no fallbacks in kwargs
     agent = _FakeAgent(config={
         "utility_fallback_models": [{"model": "groq/llama"}, {"model": "venice/gemma"}],
@@ -202,7 +202,7 @@ def test_build_candidates_from_env_comma_string_unchanged():
     try:
         # Re-import to get a fresh module-level `os.environ` view.
         from importlib import reload
-        from usr.plugins._model_fallback import fallback as fb_mod
+        from usr.plugins.model_fallback import fallback as fb_mod
         reload(fb_mod)
         primary = _FakePrimary(kwargs={})
         agent = _FakeAgent()
@@ -218,7 +218,7 @@ def test_build_candidates_drops_unparseable_entries_silently():
     """A mixed list with one good spec and one bad spec must return
     only the good one. Better a 1-candidate cascade than a cascade
     where 1/2 candidates fail with BadRequestError."""
-    from usr.plugins._model_fallback.fallback import _build_candidates
+    from usr.plugins.model_fallback.fallback import _build_candidates
     primary = _FakePrimary(kwargs={
         "fallbacks": [
             {"model": "good/x"},
@@ -247,7 +247,7 @@ def test_build_candidates_extends_double_nested_list():
     `[None, spec, spec]` -- not with a 2-element list of single-element
     lists that would then be stringified into
     `model=[{"model": "..."}]` by the litellm call."""
-    from usr.plugins._model_fallback.fallback import _build_candidates
+    from usr.plugins.model_fallback.fallback import _build_candidates
     primary = _FakePrimary(kwargs={
         "fallbacks": [[{"model": "a/x"}], [{"model": "b/y"}]],
     })
@@ -291,7 +291,7 @@ def test_coerce_to_list_passes_through_non_string():
     """Non-string values (list, dict, None) flow through unchanged.
     Only strings are candidates for JSON-decoding; everything else
     should hit the list/dict branch in `_build_candidates` directly."""
-    from usr.plugins._model_fallback.fallback import _coerce_to_list
+    from usr.plugins.model_fallback.fallback import _coerce_to_list
     assert _coerce_to_list(None) is None
     assert _coerce_to_list([{"model": "x"}]) == [{"model": "x"}]
     assert _coerce_to_list({"model": "x"}) == {"model": "x"}
@@ -304,7 +304,7 @@ def test_coerce_to_list_passes_through_bare_string():
     raise (or produce a string `'a'` if the bare value `'a'` parses as
     a JSON string). The helper must return the value as-is so the
     downstream comma-split still works."""
-    from usr.plugins._model_fallback.fallback import _coerce_to_list
+    from usr.plugins.model_fallback.fallback import _coerce_to_list
     assert _coerce_to_list("a, b, c") == "a, b, c"
     assert _coerce_to_list("a/x") == "a/x"
     assert _coerce_to_list("") == ""
@@ -315,14 +315,14 @@ def test_coerce_to_list_passes_through_malformed_json():
     """A string that starts with `[` but is not valid JSON must be
     returned unchanged (so the downstream comma-split path handles it
     as a fallback). Decode failure must NEVER raise."""
-    from usr.plugins._model_fallback.fallback import _coerce_to_list
+    from usr.plugins.model_fallback.fallback import _coerce_to_list
     assert _coerce_to_list("[not valid json") == "[not valid json"
     assert _coerce_to_list("[{model: x}]") == "[{model: x}]"  # unquoted key
 
 
 def test_coerce_to_list_decodes_list_string():
     """`'[1, 2, 3]'` -> `[1, 2, 3]` (Python list)."""
-    from usr.plugins._model_fallback.fallback import _coerce_to_list
+    from usr.plugins.model_fallback.fallback import _coerce_to_list
     out = _coerce_to_list("[1, 2, 3]")
     assert out == [1, 2, 3]
     assert isinstance(out, list)
@@ -330,7 +330,7 @@ def test_coerce_to_list_decodes_list_string():
 
 def test_coerce_to_list_decodes_dict_string():
     """`'{"k": "v"}'` -> `{"k": "v"}` (Python dict)."""
-    from usr.plugins._model_fallback.fallback import _coerce_to_list
+    from usr.plugins.model_fallback.fallback import _coerce_to_list
     out = _coerce_to_list('{"k": "v"}')
     assert out == {"k": "v"}
     assert isinstance(out, dict)
@@ -339,7 +339,7 @@ def test_coerce_to_list_decodes_dict_string():
 def test_coerce_to_list_strips_whitespace():
     """A string with leading/trailing whitespace is decoded normally
     (we `.strip()` before checking the first char)."""
-    from usr.plugins._model_fallback.fallback import _coerce_to_list
+    from usr.plugins.model_fallback.fallback import _coerce_to_list
     assert _coerce_to_list('  [{"model": "x"}]  ') == [{"model": "x"}]
 
 
@@ -348,7 +348,7 @@ def test_build_candidates_decodes_json_string_preset():
     that holds a JSON list. After coercion, `_build_candidates` should
     see 5 well-formed dict candidates (None + 4 cleaned dicts), NOT
     6 fragment strings."""
-    from usr.plugins._model_fallback.fallback import _build_candidates
+    from usr.plugins.model_fallback.fallback import _build_candidates
     user_preset = (
         '[{"model":"nvidia_nim/stepfun-ai/step-3.7-flash"},'
         '{"model":"a0_venice/google-gemma-4-26b-a4b-it"},'
@@ -381,7 +381,7 @@ def test_build_candidates_decodes_json_string_in_env():
     `A0_UTILITY_FALLBACK_MODELS` env var that holds a JSON list is
     decoded the same way."""
     from importlib import reload
-    from usr.plugins._model_fallback import fallback as fb_mod
+    from usr.plugins.model_fallback import fallback as fb_mod
     reload(fb_mod)
     os.environ["A0_UTILITY_FALLBACK_MODELS"] = (
         '[{"model":"a/x"},{"model":"b/y"}]'
@@ -403,7 +403,7 @@ def test_build_candidates_decodes_json_string_in_env():
 
 def test_build_candidates_decodes_json_string_in_agent_config():
     """The agent-config path also goes through `_coerce_to_list`."""
-    from usr.plugins._model_fallback.fallback import _build_candidates
+    from usr.plugins.model_fallback.fallback import _build_candidates
     primary = _FakePrimary(kwargs={})  # no kwargs
     agent = _FakeAgent(config={
         "utility_fallback_models": '[{"model":"a/x"},{"model":"b/y"}]',
@@ -421,7 +421,7 @@ def test_build_candidates_env_comma_string_still_works():
     still work. The new coercion must not break the path that was
     already working."""
     from importlib import reload
-    from usr.plugins._model_fallback import fallback as fb_mod
+    from usr.plugins.model_fallback import fallback as fb_mod
     reload(fb_mod)
     os.environ["A0_UTILITY_FALLBACK_MODELS"] = "a/x, b/y ,c/z"
     try:

@@ -2,7 +2,7 @@ import { createStore } from "/js/AlpineStore.js";
 
 // The WebUI binds to flat top-level booleans on
 // ``context.settings`` (e.g. ``utility_timeout_guard_enabled``).
-// The runtime helpers in ``usr/plugins/_model_fallback/helpers/toggles.py``
+// The runtime helpers in ``usr/plugins/model_fallback/helpers/toggles.py``
 // read the top-level key first and fall back to the nested
 // ``<piece>.enabled`` for back-compat with hand-edited configs.
 //
@@ -28,12 +28,20 @@ const TOGGLE_DEFAULTS = {
   utility_timeout_guard: true,   // ON by default; the cascade alone is not enough for slow ollama CPU
   context_size_guard: false,     // OFF; opt-in because aggressive trimming can confuse the LLM
   langchain_compat: true,        // ON; the shim is a no-op on langchain v0.x
+  // v3.3.0 -- merged in from the standalone _asyncio_guard and
+  // _extension_import_guard plugins. Both are pure safety nets: the
+  // asyncio patch self-detects an already-fixed CPython and skips
+  // itself, and the import guard is invisible unless a file fails.
+  asyncio_read_ready_guard: true,
+  extension_import_guard: true,
 };
 
 const TOP_LEVEL_KEYS = {
   utility_timeout_guard: "utility_timeout_guard_enabled",
   context_size_guard: "context_size_guard_enabled",
   langchain_compat: "langchain_compat_enabled",
+  asyncio_read_ready_guard: "asyncio_read_ready_guard_enabled",
+  extension_import_guard: "extension_import_guard_enabled",
 };
 
 function resolveToggle(settings, piece) {
@@ -61,7 +69,7 @@ export const store = createStore("modelFallback", {
 
   async openHelp() {
     this.showHelp = true;
-    await window.openModal?.('/plugins/_model_fallback/webui/help.html');
+    await window.openModal?.('/plugins/model_fallback/webui/help.html');
   },
 
   getDefaults() {
@@ -84,6 +92,8 @@ export const store = createStore("modelFallback", {
       utility_timeout_guard_enabled: TOGGLE_DEFAULTS.utility_timeout_guard,
       context_size_guard_enabled: TOGGLE_DEFAULTS.context_size_guard,
       langchain_compat_enabled: TOGGLE_DEFAULTS.langchain_compat,
+      asyncio_read_ready_guard_enabled: TOGGLE_DEFAULTS.asyncio_read_ready_guard,
+      extension_import_guard_enabled: TOGGLE_DEFAULTS.extension_import_guard,
     };
   },
 

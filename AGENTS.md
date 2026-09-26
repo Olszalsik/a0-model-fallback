@@ -1,12 +1,101 @@
-# AGENTS.md — `_model_fallback` plugin
+# AGENTS.md — `model_fallback` plugin
 
-This file documents the **intended behavior** of the `_model_fallback` plugin so
+This file documents the **intended behavior** of the `model_fallback` plugin so
 that future maintainers (human or AI) do not regress the cascade into a
 "showstopper" design. The plugin exists because the host environment mixes
 **quota-limited cloud providers** with **rate-limited gateways**, so a single
 provider going dark for hours is normal operating conditions, not a failure.
 
 **If you are about to change `fallback.py`, read this first.**
+
+---
+
+## v3.3.0 — merged guards (`asyncio_guard`, `import_guard`)
+
+Two standalone plugins were folded in as `helpers/asyncio_guard.py` and
+`helpers/import_guard.py`, installed from
+`extensions/python/startup_migration/_00_install_early_guards.py`. Toggles:
+`asyncio_read_ready_guard_enabled`, `extension_import_guard_enabled` (both
+default ON).
+
+### Why `startup_migration` and not `hooks.py`
+
+This is the load-bearing decision; do not "simplify" it back.
+
+A plugin's `hooks.py` is imported **only** by
+`helpers.plugins.call_plugin_hook`, which is lazy and on-demand. Nothing
+iterates enabled plugins calling `install()` during startup — `install()`
+fires only when a plugin is installed/updated through
+`plugins/_plugin_installer`. `always_enabled: true` affects
+`get_enabled_plugins()` (toggle state) and does **not** import `hooks.py`.
+
+Consequences that motivated the merge:
+
+- The old `_asyncio_guard` applied its patch at *import time of its own
+  `hooks.py`*, so it was dead code on every restart. Its docstring's claim
+  that "load_plugins runs before VectorDB init" was wrong:
+  `helpers/plugins.py::load_plugins` only reads `plugin.yaml` metadata.
+- This host runs Python 3.12.10, where
+  `_SelectorSocketTransport._read_ready` is a bare `self._read_ready_cb()`,
+  so the gh-115514 doom-loop was genuinely live.
+- The old `_extension_import_guard` installed from `agent_init`, which is
+  itself loaded by the very `load_classes_from_folder` it patches — its own
+  cold-cache enumeration ran unpatched.
+
+`startup_migration` is dispatched from `initialize.initialize_migration()`
+in `run()` before the web server is prepared and before any agent exists,
+and resolves plugin folders with `agent=None`. It is the earliest hook that
+reliably fires, and installing there also protects the `agent_init` load.
+
+### `asyncio_guard` — no shape heuristics
+
+Deciding "is this interpreter already patched?" must be **behavioural**:
+`_needs_guard(cls)` calls the real `_read_ready` on a bare instance with
+`_read_ready_cb = None` and reports whether it raised. Two earlier
+heuristics were wrong and are documented in the module:
+
+- `len(code.co_names) > 1` — a *fixed* body compiles to
+  `co_names == ('_read_ready_cb',)`, identical to the unguarded body.
+- a jump-opcode allowlist — CPython 3.12 *inverts* the guard and emits
+  `POP_JUMP_IF_NOT_NONE`, and `dis.hasjabs` / `dis.hasjrel` are empty on
+  3.12, so the allowlist missed a fixed interpreter.
+
+`uninstall()` is intentionally a no-op: removing a process-wide safety
+monkeypatch from a live process is riskier than leaving it.
+
+### `import_guard` — shim, do not mirror
+
+The old implementation re-implemented `load_classes_from_folder` and
+shipped an `inspect.getsource` marker check to warn about drift. This one
+keeps upstream authoritative and swaps only `modules.import_module` for the
+duration of the call, returning an **empty** `ModuleType` on failure
+(`inspect.getmembers(None, isclass)` is *not* empty — it yields
+`__class__ -> NoneType`, which would leak into results for a permissive
+`base_class`).
+
+Contract for anyone editing `helpers/import_guard.py`:
+
+- `_original_import` must be the **import function**, not the loader. The
+  shim calls it with a single file path; assigning the loader there
+  produces `TypeError: load_classes_from_folder() missing 2 required
+  positional arguments` (this was a real bug caught by the tests).
+- Any function that *assigns* `_original_import` or `_depth` needs
+  `global` — the plugin has been bitten by this class of bug before
+  (`helpers/utility_timeout.get_resolved`, the v2.6.9 `nonlocal` crash).
+- The swap is re-entrancy safe: depth counter under `_swap_lock` plus a
+  thread-local error sink. A naive save/restore lets one thread restore
+  another's shim, permanently patching `import_module` process-wide.
+- Only `Exception` is swallowed; `KeyboardInterrupt`, `SystemExit` and
+  `asyncio.CancelledError` (BaseException on 3.8+) must still propagate.
+- `hooks.uninstall()` restores the upstream loader. The asyncio guard
+  deliberately stays installed.
+
+### Other fixes in v3.3.0
+
+`hooks.clear_cooldowns` referenced `_fb` in a second `try` block while it
+was only bound inside the first; on import failure the `NameError` was
+swallowed by its own `except Exception`, so the persisted cooldown key was
+silently left behind. The blocks are now independent.
 
 ---
 
@@ -207,7 +296,7 @@ capacity class; decay floors at `elapsed * margin` and deletes below
 base; kill-switch disables all three; `reset()` clears state. Full
 plugin suite must stay green.
 
-**Verification.** `pytest usr/plugins/_model_fallback/tests/ -q` green;
+**Verification.** `pytest usr/plugins/model_fallback/tests/ -q` green;
 both AST scanners (`tmp/scan_unbound_locals.py`,
 `tmp/scan_undefined_names.py`) clean; live check: one long-generation
 turn logs the single grow event, subsequent turns complete without the
@@ -314,7 +403,7 @@ Event kinds (all recorded by fallback.py / recovery_probe.py):
 | `cooldowns_cleared` | user-initiated clear (button / hooks API) | `clear_all_cooldowns` (carries `count` + `cross_context`) |
 | `cascade_exhausted` | all candidates failed, RetryAfterHours imminent | `_emit_fallback_summary` (field `cascade_kind`, NOT `kind` — `kind` is `record_event`'s own positional param; passing `kind=kind` raises `TypeError` which the summary's blanket `except` swallows → silently no event. GOTCHA.) |
 
-**Endpoint** (`api/events.py`, route `POST /api/plugins/_model_fallback/events`):
+**Endpoint** (`api/events.py`, route `POST /api/plugins/model_fallback/events`):
 returns `{"version", "kinds", "count", "events": [...]}` newest-first.
 Optional filters: `limit` (1..500, default 100), `kind`, `context`,
 `label`. Auth+CSRF inherited defaults (same as `/stats`). Runtime only —
@@ -406,7 +495,7 @@ Full suite 222/222 (+9 new tests in `test_v286_flagged_fixes.py`).
   utility's sentinel before checking chat — a partial state (utility
   patched, chat not) is now repairable, and each method re-installs
   independently when its `_fallback_patched_version` stamp differs from
-  `get_plugin_meta("_model_fallback").version` (same `_plugin_version()`
+  `get_plugin_meta("model_fallback").version` (same `_plugin_version()`
   pattern as the v2.8.5 AD fix in `_10`). `install_chat_turn_patch` takes
   an optional `version=`: a stale turn cascade is re-assigned WITHOUT
   overwriting the captured original (module global
@@ -480,7 +569,7 @@ before fixing; full suite 213/213 after):
   strips agent.data keys starting with `_` (:194/:223, restore at :311), so
   cooldown seeding / extended-retry phase / cascade position never actually
   persisted. All DATA_KEY_* constants renamed to a non-underscore
-  `mfb_*` prefix; `_70` and hooks use the constants instead of literals.
+  `_mfb_*` prefix; `_70` and hooks use the constants instead of literals.
 - **Utility timeout guard toggle-off** — `_install` returned False on
   `enabled: false` BEFORE refreshing the resolved config, so a live wrapper
   kept guarding until restart. Refresh now happens in the disabled branch.
@@ -791,7 +880,7 @@ The same phantom-class bug existed in `memory_hardening` v0.5.2
 
 This plugin also owns six **LLM-error-handling** extensions on top of the
 cascade. They live here (not in separate plugins) so a single
-`usr/plugins/_model_fallback/.toggle-0` disables everything and a single
+`usr/plugins/model_fallback/.toggle-0` disables everything and a single
 `default_config.yaml` holds the knobs:
 
 * v2.2 Piece 1 — outer timeout guard on `call_utility_model` (catches
@@ -899,7 +988,7 @@ recovery with provider dashboards (look for the cyan line in the log).
 
 ## Configuration knobs
 
-`usr/plugins/_model_fallback/config.json`:
+`usr/plugins/model_fallback/config.json`:
 
 | Key | Default | Effect |
 |---|---|---|
@@ -1000,18 +1089,18 @@ we can never accidentally close a framework coroutine.
 
 The plumbing lives in
 `usr.plugins.memory_hardening.helpers.coroutine_guard.close_inner_coro`.
-The `_model_fallback` plugin imports it lazily, so the cascade
+The `model_fallback` plugin imports it lazily, so the cascade
 continues to work when `memory_hardening` is disabled (the import
 catches `Exception` and no-ops).
 
 ## Cross-references
 
-- Plugin config: `usr/plugins/_model_fallback/config.json`
-- Patch entrypoint: `usr/plugins/_model_fallback/extensions/python/agent_init/_00_install_fallback_patches.py`
+- Plugin config: `usr/plugins/model_fallback/config.json`
+- Patch entrypoint: `usr/plugins/model_fallback/extensions/python/agent_init/_00_install_fallback_patches.py`
 - v2.2 timeout guard: `extensions/python/agent_init/_10_install_utility_timeout_patch.py` + `helpers/utility_timeout.py`
 - v2.3 context-size guard: `extensions/python/message_loop_prompts_after/_10_context_size_guard.py` (the `trim_history` function is pure and testable)
 - v2.4 langchain v1 shim: `extensions/python/agent_init/_00_install_langchain_shim.py` + `helpers/langchain_compat.py`
-- Stats endpoint: `api/stats.py` (`GET /api/plugins/_model_fallback/stats`)
+- Stats endpoint: `api/stats.py` (`GET /api/plugins/model_fallback/stats`)
 - Preset that triggers the most cycling: `usr/plugins/_model_config/presets.yaml:1-32` (Default preset, `utility: gemma4:31b` on `omniroute`)
 - Single-call timeout source: `usr/plugins/omniroute/default_config.yaml:32` (`timeout_seconds: 30`)
 - WebSocket heartbeat tuning (companion fix): `usr/.env:158-159`
@@ -1097,7 +1186,7 @@ sentinel prevents double-install during refactors.
 
 ### Stats endpoint
 
-`GET /api/plugins/_model_fallback/stats` returns:
+`GET /api/plugins/model_fallback/stats` returns:
 
 ```json
 {
@@ -1148,7 +1237,7 @@ Disabling any one piece does not affect the others. The framework
 re-reads the config on the next call (no restart required for
 `utility_timeout_guard`, `context_size_guard`, and `langchain_compat`).
 
-### Why this is in `_model_fallback` and not its own plugin
+### Why this is in `model_fallback` and not its own plugin
 
 The user preferred to keep all three pieces in the existing plugin so
 a single `.toggle-0` disables everything and a single config file
@@ -1173,16 +1262,16 @@ extension hook; nothing shares state across pieces.
 * `python scripts/scan_v22_to_v25.py` — must stay at 0 LIVE findings.
 * `python scripts/scan_plugin_structure.py` — must stay at 0 findings
   (or only the pre-existing non-fatal ones).
-* `usr/plugins/_model_fallback/tests/test_resilience_v22.py` —
+* `usr/plugins/model_fallback/tests/test_resilience_v22.py` —
   unit tests for the v2.2 layer (timeout guard's `close_inner_coro`
   lazy import; the cache circuit-breaker tests moved to
   `ui_loader_optimizer/tests/test_extension_cache.py` in v2.6.6).
   Housekeeping tests were removed in v2.5.
-* `usr/plugins/_model_fallback/tests/test_context_size_guard_v23.py` —
+* `usr/plugins/model_fallback/tests/test_context_size_guard_v23.py` —
   11 unit tests for the v2.3 context-size guard.
-* `usr/plugins/_model_fallback/tests/test_langchain_compat_v24.py` —
+* `usr/plugins/model_fallback/tests/test_langchain_compat_v24.py` —
   8 unit tests for the v2.4 langchain v0 -> v1 shim.
-* Manual: `/api/plugins/_model_fallback/stats` returns sensible
+* Manual: `/api/plugins/model_fallback/stats` returns sensible
   numbers after a 2-minute idle period; `langchain_compat.installed`
   is `true` on a v1-only docker image.
 
@@ -1255,7 +1344,7 @@ unchanged — the trim is purely additive.
 
 Merged from the now-deleted standalone `_langchain_compat`
 plugin. The user preferred to keep all LLM-error-handling fixes
-in `_model_fallback` so a single toggle disables everything.
+in `model_fallback` so a single toggle disables everything.
 
 The bug: LangChain v1 moved several submodules to `langchain_core`
 (`langchain.prompts` -> `langchain_core.prompts`,
@@ -1335,21 +1424,21 @@ import sys
 # either:
 assert "langchain.prompts" in sys.modules
 # or, more precisely:
-from usr.plugins._model_fallback.helpers import langchain_compat
+from usr.plugins.model_fallback.helpers import langchain_compat
 assert langchain_compat.already_installed_in_process()
 ```
 
 ### v2.3+v2.4 tests
 
-* `usr/plugins/_model_fallback/tests/test_context_size_guard_v23.py` —
+* `usr/plugins/model_fallback/tests/test_context_size_guard_v23.py` —
   11 tests for Piece A (config resolve, trim under/over budget,
   `min_messages` invariant, empty history, list/string content,
   counter snapshot, disabled-by-default contract).
-* `usr/plugins/_model_fallback/tests/test_langchain_compat_v24.py` —
+* `usr/plugins/model_fallback/tests/test_langchain_compat_v24.py` —
   8 tests for the langchain v0 -> v1 shim (install, idempotency,
   process marker, user-module protection, uninstall, status
-  shape, fallback target, location-in-_model_fallback invariant).
-* `usr/plugins/_model_fallback/tests/test_resilience_v22.py` —
+  shape, fallback target, location-in-model_fallback invariant).
+* `usr/plugins/model_fallback/tests/test_resilience_v22.py` —
   tests for the v2.2 layer (timeout guard's `close_inner_coro`
   lazy import; the cache circuit-breaker tests moved to
   `ui_loader_optimizer/tests/test_extension_cache.py` in v2.6.6).
@@ -1424,7 +1513,7 @@ the persisted form.
 
 ### Where the toggles live in the WebUI
 
-`usr/plugins/_model_fallback/webui/config.html` injects a new
+`usr/plugins/model_fallback/webui/config.html` injects a new
 "Resilience features" section between the existing "Fallback
 cycles" and "Quick presets" sections. Each toggle is a
 `text-input`-free checkbox with a `version-badge` (v2.2 / v2.3
@@ -1520,7 +1609,7 @@ summary:
 
 ### v2.5 tests
 
-* `usr/plugins/_model_fallback/tests/test_webui_toggles_v25.py` —
+* `usr/plugins/model_fallback/tests/test_webui_toggles_v25.py` —
   covers:
   * Per-piece top-level toggle resolution (top-level wins over
     nested; nested falls through to default; explicit default
