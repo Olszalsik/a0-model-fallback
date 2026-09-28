@@ -217,6 +217,15 @@ def uninstall():
         stats.reset()
     except Exception:  # noqa: BLE001
         pass
+    # v3.4.1: the sticky Responses-5xx set is process-global runtime state
+    # like the latency samples above -- a disable must not leave stale
+    # force-chat-completions marks behind for endpoints whose /v1/responses
+    # recovered (or whose config changed) between disable and re-enable.
+    try:
+        from usr.plugins.model_fallback import models_ext as _mx_reset
+        _mx_reset.reset_responses_5xx_seen()
+    except Exception:  # noqa: BLE001
+        pass
     # v3.1.0: per-label latency samples are process-global runtime state
     # -- drop them on disable so a re-enable starts fresh.
     try:
@@ -267,13 +276,40 @@ def get_fallback_settings(agent) -> dict:
         cfg = _fb._get_plugin_cfg(agent, use_cache=False)
     except Exception:  # noqa: BLE001
         cfg = {}
+
+    def _as_int(key: str, default: int) -> int:
+        # v3.4.1: coercions degrade instead of raising -- a string-typed
+        # value in config.json (hand-edited) used to raise ValueError out
+        # of the settings API. Display defaults mirror default_config.yaml
+        # (initial_cycle_attempts: 20 -- the old hardcoded 60 was masked by
+        # config.json and contradicted the shipped default).
+        try:
+            return int(cfg.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    def _as_float(key: str, default: float) -> float:
+        try:
+            return float(cfg.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    def _as_bool(key: str, default: bool) -> bool:
+        val = cfg.get(key, default)
+        if isinstance(val, bool):
+            return val
+        try:
+            return bool(int(val))
+        except (TypeError, ValueError):
+            return default
+
     return {
-        "max_cycles": int(cfg.get("fallback_max_cycles", 4)),
-        "cycle_delay": float(cfg.get("fallback_cycle_delay", 5.0)),
-        "extended_retry_enabled": bool(cfg.get("extended_retry_enabled", True)),
-        "phase_a_delay_s": float(cfg.get("phase_a_delay_s", 900.0)),
-        "phase_b_delay_s": float(cfg.get("phase_b_delay_s", 3600.0)),
-        "initial_cycle_attempts": int(cfg.get("initial_cycle_attempts", 60)),
+        "max_cycles": _as_int("fallback_max_cycles", 4),
+        "cycle_delay": _as_float("fallback_cycle_delay", 5.0),
+        "extended_retry_enabled": _as_bool("extended_retry_enabled", True),
+        "phase_a_delay_s": _as_float("phase_a_delay_s", 900.0),
+        "phase_b_delay_s": _as_float("phase_b_delay_s", 3600.0),
+        "initial_cycle_attempts": _as_int("initial_cycle_attempts", 20),
     }
 
 

@@ -73,12 +73,17 @@ export const store = createStore("modelFallback", {
   },
 
   getDefaults() {
+    // v3.4.1: the five cascade keys used the dead short names
+    // (max_cycles / cycle_delay / ...) that NOTHING reads -- the runtime
+    // and config.html both bind the ``fallback_*`` keys. A future
+    // applyDefaults() would have reset the panel to values the save
+    // flow then silently ignored.
     return {
-      max_cycles: 4,
-      cycle_delay: 5.0,
-      attempt_delay: 2.0,
-      timeout_s: 300,
-      utility_timeout_s: 300,
+      fallback_max_cycles: 4,
+      fallback_cycle_delay: 5.0,
+      fallback_attempt_delay: 2.0,
+      fallback_timeout_s: 300,
+      fallback_utility_timeout_s: 300,
       // Per-feature toggles (v2.5). The nested defaults below
       // are the ones the runtime reads when the top-level keys
       // are absent. They keep the existing hand-edited config

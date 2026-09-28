@@ -252,25 +252,16 @@ def reset_counter() -> None:
 
 def _resolve_runtime_config(agent) -> Dict[str, Any]:
     try:
-        from helpers import plugins as plugin_helpers  # type: ignore
-        cfg = plugin_helpers.get_plugin_config("model_fallback", agent) or {}
-        # v2.8.5 (wiring#7): get_plugin_config returns config.json WITHOUT
-        # merging default_config.yaml (same gap the utility guard hit --
-        # see _10_install_utility_timeout_patch._resolve_config v2.8.3).
-        # Merge the YAML defaults UNDER config.json so the YAML's
-        # ``context_size_guard:`` section (max_chars / min_messages /
-        # notice_text) is effective and user config.json values win.
-        try:
-            defaults = plugin_helpers.get_default_plugin_config(
-                "model_fallback"
-            ) or {}
-            if isinstance(defaults, dict):
-                merged = dict(defaults)
-                if isinstance(cfg, dict):
-                    merged.update(cfg)
-                cfg = merged
-        except Exception:  # noqa: BLE001
-            pass
+        # v3.4.1: route through helpers.config_defaults.resolve_config --
+        # the local SHALLOW merge dropped sibling defaults whenever
+        # config.json carried a partial nested section (same rationale
+        # as _10_install_utility_timeout_patch._resolve_config).
+        # use_cache=False keeps per-call test stubs authoritative.
+        from usr.plugins.model_fallback.helpers import config_defaults
+
+        cfg = config_defaults.resolve_config(
+            "model_fallback", agent, use_cache=False
+        )
     except Exception:  # noqa: BLE001
         cfg = {}
     # v2.5 WebUI: top-level ``context_size_guard_enabled`` wins

@@ -5,6 +5,47 @@ These are assigned onto the Agent class by the plugin's extension
 (extensions/python/agent_init/_00_install_fallback_patches.py) so
 they survive upstream updates that overwrite agent.py.
 
+NAVIGATION INDEX
+================
+This file is ~4,240 lines. The map below is a *navigation aid*, not a
+rewrite: splitting the file was evaluated and declined (see the P5-2
+note in `usr/plugins/moa/ROADMAP-2026.md` §7.5), because the two
+largest functions -- `_run_rotation_cascade` (913 lines) and
+`_patched_call_chat_model_turn` (583 lines) -- are 35% of the file
+between them and both are deeply entangled with the module-level
+stores below. Extracting either would mean passing a large amount of
+implicit state by hand, which is exactly where a subtle regression
+hides. Findability is worth capturing; relocation is not.
+
+    Config resolution      _get_merged_defaults, _get_plugin_cfg,
+                           invalidate_plugin_cfg_cache
+    Cooldown store         _get_cooldown_store, _save_cooldown_store,
+                           _restore_cooldowns, snapshot_cooldowns,
+                           clear_all_cooldowns
+    Dead / healthy labels  _mark_label_dead, _mark_label_healthy,
+                           _maybe_clear_cooldown_for_healthy_label
+    Timeouts               _resolve_per_call_timeout_base,
+                           _resolve_per_call_timeout, _evict_warm_on_timeout
+    Generation budgets     _gen_budget_cfg, _apply_gen_budget,
+                           _grow_gen_budget, _decay_gen_budget,
+                           reset_gen_budgets
+    Candidate building     _normalize_spec, _build_candidates, _build_model
+    Error classification  _is_timeout_shaped, _is_permanent_for_rotation,
+                           _is_format_error, _cooldown_seconds_for_status,
+                           _handle_error_cooldown_impl
+    THE ENGINE             _run_rotation_cascade   <- 913 lines, the core
+    The turn path          _patched_call_chat_model_turn  <- 583 lines
+    Thin adapters          _patched_call_utility_model,
+                           _patched_call_chat_model
+    Install / uninstall    install_chat_turn_patch, build_fallback_wrapper
+
+Module-level stores (all process-global, cleared together):
+    _INMEM_COOLDOWNS   {(context_id,): {label: monotonic_deadline}}
+    _INMEM_DEAD_LABELS {label: monotonic_deadline}
+    _INMEM_HEALTHY_LABELS {label: monotonic_deadline}
+    _WARM_LABELS       {label: last_success_monotonic}
+    _GEN_BUDGET_OVERRIDES {label: seconds}
+
 Fixes bundled here:
   #1  - DATA_NAME_*_IDX typo (was DATA_NAME_UTILITY_MODEL_IDX)
   #2  - Context overflow -> session cooldown instead of infinite retry
@@ -56,7 +97,9 @@ from usr.plugins.model_fallback.models_ext import (
     _is_context_overflow_error,
     _is_invalid_api_key_400,
     _is_permanently_failed_model,
+    _is_quota_exhaustion_error,
     _is_rate_limited_error,
+    detect_quota_scope,
     extract_retry_after_seconds,
     build_fallback_wrapper,
     resolve_callback,
@@ -167,6 +210,92 @@ _DEFAULT_COOLDOWNS_S = {
 # (Laci, 2026-07-27, v2.5.2) and exposed as a knob.
 _DEFAULT_RATE_LIMIT_NO_RETRY_AFTER_COOLDOWN_S = 30.0
 
+# ---------------------------------------------------------------------------
+# Quota-exhaustion cooldowns (v3.4.0)
+# ---------------------------------------------------------------------------
+#
+# The 30s default above is right for a TRANSIENT 429 (a shared-pool burst that
+# clears in seconds) and badly wrong for a QUOTA 429, where the account's
+# allowance for the window is spent and no amount of retrying will help before
+# the window resets. ollama.com is the concrete case: "you (...) have reached
+# your session usage limit" comes back as a 429 with NO Retry-After and NO
+# reset timestamp, so the old path booked 30s and the cascade re-paid the full
+# litellm round-trip (which itself retries twice) every 30 seconds against an
+# endpoint guaranteed to refuse until the window rolls over.
+#
+# The provider does not tell us when the window resets, so these are the
+# durations we BELIEVE, chosen to match each provider's documented window and
+# overridable per scope in plugin config (`quota_scope_cooldown_s`). They are
+# deliberately conservative-but-not-fatal: the label stays in the rotation and
+# is re-probed once the window is believed expired, so an over-long guess costs
+# latency on that one label while the other candidates keep serving the turn.
+# `quota_cooldown_max_s` bounds the damage of a wrong guess, and the ollama
+# 5-hour rolling session window is the worst case that has to fit under it.
+_DEFAULT_QUOTA_SCOPE_COOLDOWNS_S = {
+    "session": 900.0,    # 15 min -- ollama.com 5h rolling window; re-probed often
+    "daily": 3600.0,     # 1 h   -- daily free-tier resets
+    "weekly": 21600.0,   # 6 h   -- weekly plans (the user reported a Monday reset)
+    "monthly": 43200.0,  # 12 h  -- monthly billing cycles
+    "account": 3600.0,   # 1 h   -- window unnamed, assume daily
+}
+_DEFAULT_QUOTA_COOLDOWN_MAX_S = 43200.0  # 12 h ceiling on any single booking
+
+
+def _quota_cooldown_seconds(e, agent=None) -> Optional[float]:
+    """Cooldown for a quota-exhausted provider, in seconds.
+
+    Prefers the provider's own reset hint when one exists (an
+    ``x-ratelimit-reset-*`` duration or a ``Retry-After``); otherwise falls
+    back to the per-scope default from ``quota_scope_cooldown_s``. A hint is
+    still clamped to ``quota_cooldown_max_s`` so a nonsense header cannot park
+    a label for a week.
+
+    Returns None when `e` is not a quota exhaustion, so the caller can keep
+    its own transient-429 policy.
+    """
+    try:
+        scope = detect_quota_scope(e)
+        if not scope:
+            return None
+        cfg = _get_plugin_cfg(agent)
+        defaults = dict(_DEFAULT_QUOTA_SCOPE_COOLDOWNS_S)
+        overrides = cfg.get("quota_scope_cooldown_s")
+        if isinstance(overrides, dict):
+            for key, val in overrides.items():
+                try:
+                    defaults[str(key)] = float(val)
+                except (TypeError, ValueError):
+                    continue
+        try:
+            dur = float(defaults.get(scope, defaults["account"]))
+        except (TypeError, ValueError):
+            dur = _DEFAULT_QUOTA_SCOPE_COOLDOWNS_S["account"]
+        # A provider-supplied reset hint is more accurate than our guess
+        # (v3.4.1: the hint WINS, restoring the "provider hint always beats
+        # our guessed scope duration" invariant -- the old max() let the
+        # guess override an accurate SHORT hint, e.g. a session-scope 900s
+        # guess parking a label whose retry-after said 60s). Still clamped
+        # to [floor, quota_cooldown_max_s] below.
+        hint = extract_retry_after_seconds(e)
+        if hint and hint > 0:
+            dur = float(hint)
+        try:
+            cap = float(cfg.get("quota_cooldown_max_s", _DEFAULT_QUOTA_COOLDOWN_MAX_S))
+        except (TypeError, ValueError):
+            cap = _DEFAULT_QUOTA_COOLDOWN_MAX_S
+        # Floor: 60s by default, but never ABOVE the cap (v3.4.1: the old
+        # max(60.0, min(dur, cap)) silently violated a user cap below 60).
+        return max(min(60.0, cap), min(dur, cap))
+    except Exception:  # noqa: BLE001 - never let policy break a cascade
+        # v3.4.1: return None, per the contract ("Returns None when e is
+        # not a quota exhaustion"). The old blanket except returned the
+        # ACCOUNT-scope default (3600s), so an internal error on a plain
+        # transient 429 booked it for 1h instead of the 30s transient
+        # policy. Returning None hands the decision back to the caller's
+        # own transient handling -- the conservative direction for
+        # availability is the SHORTER booking here.
+        return None
+
 # Module-level state for the cross-agent healthy-label reset (v2.5.2).
 # Maps label -> monotonic deadline by which the next cascade iteration
 # should treat the label as "recently proven healthy". Other agents'
@@ -256,6 +385,24 @@ _DEFAULT_CYCLE_STAGNATION_THRESHOLD = 2
 _GEN_BUDGET_OVERRIDES: dict = {}
 
 _DEFAULT_GEN_BUDGET_MAX_S = 600.0
+
+
+def _gen_budget_max_s_from_cfg(cfg) -> float:
+    """Read ``gen_budget_max_s`` from cfg, honoring an explicit 0.
+
+    v3.4.1: the old ``cfg.get(...) or _DEFAULT...`` coerced an explicit 0
+    (and any falsy value) to the 600s default, making the three
+    ``max_s > 0 else <uncapped>`` branches unreachable dead code. Now an
+    explicit 0 means "uncapped"; a missing/null value falls back to the
+    default; a malformed value falls back to the default too.
+    """
+    try:
+        raw = cfg.get("gen_budget_max_s")
+        if raw is None:
+            return _DEFAULT_GEN_BUDGET_MAX_S
+        return max(0.0, float(raw))
+    except (TypeError, ValueError, AttributeError):
+        return _DEFAULT_GEN_BUDGET_MAX_S
 _DEFAULT_GEN_BUDGET_GROWTH_FACTOR = 1.5
 _DEFAULT_GEN_BUDGET_DECAY_FACTOR = 0.9
 _DEFAULT_GEN_BUDGET_SUCCESS_MARGIN = 1.3
@@ -458,7 +605,7 @@ def _grow_gen_budget(label, needed_s, agent=None, base_timeout_s=0.0):
     except (TypeError, ValueError):
         factor = _DEFAULT_GEN_BUDGET_GROWTH_FACTOR
     try:
-        max_s = max(0.0, float(cfg.get("gen_budget_max_s") or _DEFAULT_GEN_BUDGET_MAX_S))
+        max_s = _gen_budget_max_s_from_cfg(cfg)
     except (TypeError, ValueError):
         max_s = _DEFAULT_GEN_BUDGET_MAX_S
     try:
@@ -528,7 +675,7 @@ def _decay_gen_budget(label, elapsed_s, agent=None, base_timeout_s=0.0):
     except (TypeError, ValueError):
         margin = _DEFAULT_GEN_BUDGET_SUCCESS_MARGIN
     try:
-        max_s = max(0.0, float(cfg.get("gen_budget_max_s") or _DEFAULT_GEN_BUDGET_MAX_S))
+        max_s = _gen_budget_max_s_from_cfg(cfg)
     except (TypeError, ValueError):
         max_s = _DEFAULT_GEN_BUDGET_MAX_S
     try:
@@ -570,7 +717,7 @@ def _apply_gen_budget(label, budget_s, agent=None) -> float:
         cfg = _gen_budget_cfg(agent)
         if not bool(cfg.get("adaptive_gen_budget_enabled", True)):
             return budget
-        max_s = max(0.0, float(cfg.get("gen_budget_max_s") or _DEFAULT_GEN_BUDGET_MAX_S))
+        max_s = _gen_budget_max_s_from_cfg(cfg)
     except Exception:  # noqa: BLE001
         return budget
     try:
@@ -939,14 +1086,33 @@ def _is_format_error(exc) -> bool:
         pass
     if isinstance(exc, ValueError):
         msg = str(exc).lower()
-        return "json" in msg or "parse" in msg or "format" in msg
+        # v3.4.1: narrowed from the old bare-substring match ("format" or
+        # "parse" ANYWHERE in the message). That classified unrelated
+        # ValueErrors -- e.g. datetime "does not match format '%Y'" or
+        # "Unsupported format string" -- as model format slips and booked
+        # the 20s format cooldown instead of the 300s unknown default.
+        # Match parsing/output phrases instead; JSONDecodeError above still
+        # catches the common case.
+        return (
+            "json" in msg
+            or "parse error" in msg
+            or "parse the response" in msg
+            or "failed to parse" in msg
+            or "could not be parsed" in msg
+            or "could not parse" in msg
+            or "unparseable" in msg
+            or "misformat" in msg
+            or "malformed" in msg
+            or "invalid format" in msg
+            or "format error" in msg
+        )
     return False
 
 
 _DEFAULT_FORMAT_ERROR_COOLDOWN_S = 20.0
 
 
-def _cooldown_seconds_for_status(status_code, exc) -> float:
+def _cooldown_seconds_for_status(status_code, exc, agent=None) -> float:
     """Return the cooldown duration for a given exception, in seconds.
 
     Priority:
@@ -956,6 +1122,12 @@ def _cooldown_seconds_for_status(status_code, exc) -> float:
          broken model.
       3. Per-status default from _DEFAULT_COOLDOWNS_S
       4. 300.0 (5 min) -- conservative default for unknown errors
+
+    v3.4.1: `agent` is threaded through so the config reads resolve the
+    agent/project-scoped cache entry. The old call sites passed agent=None,
+    whose separate unscoped cache entry silently ignores project- or
+    profile-scoped overrides of ``timeout_cooldown_s`` /
+    ``format_error_cooldown_s`` in exactly these two policy paths.
     """
     retry_after = extract_retry_after_seconds(exc)
     if retry_after and retry_after > 0:
@@ -964,7 +1136,11 @@ def _cooldown_seconds_for_status(status_code, exc) -> float:
         return float(min(retry_after, 3600.0))
     if not isinstance(status_code, int) and _is_timeout_shaped(exc):
         try:
-            return float(_get_plugin_cfg(None).get("timeout_cooldown_s", _DEFAULT_TIMEOUT_COOLDOWN_S))
+            return float(
+                _get_plugin_cfg(agent).get(
+                    "timeout_cooldown_s", _DEFAULT_TIMEOUT_COOLDOWN_S
+                )
+            )
         except Exception:
             return _DEFAULT_TIMEOUT_COOLDOWN_S
     if isinstance(status_code, int):
@@ -974,7 +1150,7 @@ def _cooldown_seconds_for_status(status_code, exc) -> float:
     if _is_format_error(exc):
         try:
             return float(
-                _get_plugin_cfg(None).get(
+                _get_plugin_cfg(agent).get(
                     "format_error_cooldown_s",
                     _DEFAULT_FORMAT_ERROR_COOLDOWN_S,
                 )
@@ -1001,16 +1177,34 @@ class RetryAfterHours(Exception):
     The handle_exception extension will swallow this, sleep, and let the
     monologue loop retry. After the cooldown elapses, the loop's resume check
     passes and a fresh burst of attempts is allowed.
+
+    ``reason`` is an optional short tag (e.g. ``"quota_session"``) used to
+    pick a user-facing message. The distinction matters: a quota exhaustion is
+    an expected, self-healing condition with a known reset window, so the
+    message must NOT read like a hard failure ("All model candidates are
+    currently unavailable") or the operator sees a scary error for what is
+    really "your plan's window is spent, the agent will resume on its own".
     """
 
-    def __init__(self, retry_after: float, message: str = ""):
+    def __init__(self, retry_after: float, message: str = "", reason: str = ""):
         self.retry_after = float(retry_after)
+        self.reason = str(reason or "")
         if not message:
-            message = (
-                f"All model candidates are currently unavailable. "
-                f"Retrying in {int(self.retry_after)}s. "
-                f"The agent will keep working in the background."
-            )
+            if self.reason.startswith("quota_"):
+                scope = self.reason[len("quota_"):] or "account"
+                mins = max(1, int(round(self.retry_after / 60.0)))
+                message = (
+                    f"Model quota exhausted for the current {scope} window. "
+                    f"The agent will keep working in the background and "
+                    f"automatically resume in ~{mins} min when the window "
+                    f"resets. Add credits or upgrade to restore this model now."
+                )
+            else:
+                message = (
+                    f"All model candidates are currently unavailable. "
+                    f"Retrying in {int(self.retry_after)}s. "
+                    f"The agent will keep working in the background."
+                )
         super().__init__(message)
 
 
@@ -1139,16 +1333,57 @@ def _strip_a0_only_kwargs(model, is_primary: bool = False) -> None:
     real part of that provider's API contract -- stripping them silently
     degraded the primary (Venice lost its web-search/venice_parameters
     features) on every call. Fallback wrappers still get the full strip.
+
+    v3.4.1: the live primary's ``kwargs`` dict is PERSISTENT across
+    invocations. The strip used to erase ``TIMEOUT`` and ``fallbacks``/
+    ``fallback`` from it forever: the next invocation's ``_build_candidates``
+    (source #1) found no fallback list, and the user's TIMEOUT kwarg never
+    reached the timeout resolution again. The popped values are now stashed
+    ON the model object and re-added by
+    ``_restore_stripped_primary_kwargs`` at each invocation's entry, so the
+    next call's reads see the original user config while the request body
+    stays clean.
     """
     if model is None:
         return
     kwargs = getattr(model, "kwargs", None)
     if not isinstance(kwargs, dict):
         return
+    if is_primary:
+        stash = getattr(model, "_a0_stripped_kwargs_stash", None)
+        if not isinstance(stash, dict):
+            stash = {}
+            model._a0_stripped_kwargs_stash = stash
+        for k in _A0_ONLY_KWARGS:
+            if k in _PROVIDER_SPECIFIC_KWARGS:
+                continue
+            if k in kwargs:
+                stash[k] = kwargs.pop(k)
+        return
     for k in _A0_ONLY_KWARGS:
-        if is_primary and k in _PROVIDER_SPECIFIC_KWARGS:
-            continue
         kwargs.pop(k, None)
+
+
+def _restore_stripped_primary_kwargs(model_obj) -> None:
+    """Re-add the A0-only kwargs a previous invocation stripped from the
+    LIVE primary model object (see _strip_a0_only_kwargs, v3.4.1).
+
+    Called at the top of both cascade entry points, BEFORE the invocation
+    reads the kwargs (fallback source #1, TIMEOUT/cycle knobs, and the
+    user-kwarg timeout flag). setdefault semantics: a value re-set by user
+    code between calls wins over the stale stashed one.
+    """
+    if model_obj is None:
+        return
+    stash = getattr(model_obj, "_a0_stripped_kwargs_stash", None)
+    if not isinstance(stash, dict) or not stash:
+        return
+    kwargs = getattr(model_obj, "kwargs", None)
+    if not isinstance(kwargs, dict):
+        return
+    for k, v in stash.items():
+        kwargs.setdefault(k, v)
+    model_obj._a0_stripped_kwargs_stash = {}
 
 
 def _build_model(spec, model_obj):
@@ -1170,8 +1405,8 @@ def _build_candidates(primary, use_utility_models: bool, agent) -> list:
 
     Source priority (first non-empty wins):
       1. primary model kwargs: {"fallbacks": [...]} or {"fallback": [...]}
-      2. agent config: agent.config.get("fallback_models") or ("utility_fallback_models"
-         if use_utility_models else "fallback_models")
+      2. agent config: AgentConfig.additional.get("fallback_models") or
+         ("utility_fallback_models" if use_utility_models else "fallback_models")
       3. environment variables: A0_FALLBACK_MODELS / A0_UTILITY_FALLBACK_MODELS
          (comma-separated)
       4. plugin config: _model_fallback_plugin.config.fallbacks
@@ -1192,20 +1427,34 @@ def _build_candidates(primary, use_utility_models: bool, agent) -> list:
             fallbacks = [s.strip() for s in fb.split(",") if s.strip()]
 
     # 2. From agent config (multiple possible key names)
-    if not fallbacks and hasattr(agent, "config") and isinstance(agent.config, dict):
-        cfg_keys = (
-            ("utility_fallback_models", "fallback_models")
-            if use_utility_models
-            else ("fallback_models", "chat_model_fallbacks")
-        )
-        for ckey in cfg_keys:
-            cfg_fb = _coerce_to_list(agent.config.get(ckey))
-            if isinstance(cfg_fb, (list, tuple)) and cfg_fb:
-                fallbacks = [x for x in cfg_fb if x]
-                break
-            elif isinstance(cfg_fb, str) and cfg_fb.strip():
-                fallbacks = [s.strip() for s in cfg_fb.split(",") if s.strip()]
-                break
+    # v3.4.1: agent.config is an AgentConfig DATACLASS (agent.py:327-331),
+    # never a dict -- the old isinstance(agent.config, dict) guard made
+    # this entire source dead code. Extra settings land in the dataclass's
+    # `additional` dict field; a dict-shaped config (test doubles) is
+    # still honoured directly.
+    if not fallbacks and hasattr(agent, "config"):
+        cfg_obj = agent.config
+        cfg_lookup: dict = {}
+        if isinstance(cfg_obj, dict):
+            cfg_lookup = cfg_obj
+        else:
+            cfg_additional = getattr(cfg_obj, "additional", None)
+            if isinstance(cfg_additional, dict):
+                cfg_lookup = cfg_additional
+        if cfg_lookup:
+            cfg_keys = (
+                ("utility_fallback_models", "fallback_models")
+                if use_utility_models
+                else ("fallback_models", "chat_model_fallbacks")
+            )
+            for ckey in cfg_keys:
+                cfg_fb = _coerce_to_list(cfg_lookup.get(ckey))
+                if isinstance(cfg_fb, (list, tuple)) and cfg_fb:
+                    fallbacks = [x for x in cfg_fb if x]
+                    break
+                elif isinstance(cfg_fb, str) and cfg_fb.strip():
+                    fallbacks = [s.strip() for s in cfg_fb.split(",") if s.strip()]
+                    break
 
     # 3. From environment variables
     if not fallbacks:
@@ -1390,7 +1639,7 @@ def _validate_json_response(response: str, call_data: dict):
             raise ValueError("Utility model output is not valid JSON")
 
 
-def _record_last_status(agent, store: dict, label: str, status_code) -> None:
+def _record_last_status(agent, label: str, status_code) -> None:
     """Side-channel: remember the most recent status_code for `label` so
     the early-exit / summary-log code can report a breakdown (e.g. 2x 401,
     1x 403 quota) without having to re-run the model.
@@ -1543,7 +1792,7 @@ def _mark_label_dead(label: str, exc, agent=None, api_base: str = "") -> None:
     if _is_invalid_api_key_400(exc):
         dur = 86400.0
     else:
-        dur = _cooldown_seconds_for_status(status_code, exc)
+        dur = _cooldown_seconds_for_status(status_code, exc, agent)
     # Floor at 60s so a misconfigured Retry-After can't make the shared
     # dead-mark vanish before any other agent even sees it; cap at 24h.
     dur = max(60.0, min(dur, 86400.0))
@@ -1933,7 +2182,7 @@ def _handle_error_cooldown_impl(
     if _is_context_overflow_error(e):
         # Permanent for this prompt; needs a model with bigger context.
         store[label] = time.monotonic() + 86400.0
-        _record_last_status(agent, store, label, 400)  # synthetic: 400 overflow
+        _record_last_status(agent, label, 400)  # synthetic: 400 overflow
         _save_cooldown_store(agent, store)
         return True
 
@@ -1955,6 +2204,28 @@ def _handle_error_cooldown_impl(
         # rate-limit the "skipping" log line.
         if _capacity_skips_cooldown(label, agent, api_base):
             return False
+        # v3.4.0: a quota-exhausted account (ollama.com "session usage limit",
+        # OpenAI "insufficient_quota", ...) gets the scope-aware cooldown
+        # instead of the 30s transient default. A 30s booking here is what
+        # produced the reported symptom: the cascade re-attempted an endpoint
+        # that cannot answer until its window resets, once every 30s, each
+        # attempt paying litellm's own 2 retries. Must be checked BEFORE the
+        # Retry-After branch so a provider hint still wins when present.
+        quota_dur = _quota_cooldown_seconds(e, agent)
+        if quota_dur is not None:
+            store[label] = time.monotonic() + quota_dur
+            _record_last_status(agent, label, status_code)
+            _save_cooldown_store(agent, store)
+            scope = detect_quota_scope(e) or "account"
+            try:
+                agent.context.log.log(
+                    "info",
+                    f"Quota exhausted on [{label}] ({scope} window). "
+                    f"Cooldown {int(quota_dur)}s; rotating to other candidates.",
+                )
+            except Exception:
+                pass
+            return True
         retry_after = extract_retry_after_seconds(e)
         if retry_after and retry_after > 0:
             dur = float(min(retry_after, 3600.0))
@@ -1977,7 +2248,7 @@ def _handle_error_cooldown_impl(
             # typo doesn't lock out an endpoint for a day.
             dur = max(10.0, min(dur, 3600.0))
         store[label] = time.monotonic() + dur
-        _record_last_status(agent, store, label, status_code)
+        _record_last_status(agent, label, status_code)
         _save_cooldown_store(agent, store)
         try:
             agent.context.log.log(
@@ -1998,9 +2269,9 @@ def _handle_error_cooldown_impl(
         if status_code == 400 or _is_invalid_api_key_400(e):
             dur = 86400.0
         else:
-            dur = _cooldown_seconds_for_status(status_code, e)
+            dur = _cooldown_seconds_for_status(status_code, e, agent)
         store[label] = time.monotonic() + dur
-        _record_last_status(agent, store, label, status_code)
+        _record_last_status(agent, label, status_code)
         _save_cooldown_store(agent, store)
         # v2.6.8: share the permanent fail cross-agent so other agents
         # skip this label without re-paying the tax. Expiring (5 min for
@@ -2036,9 +2307,12 @@ def _handle_error_cooldown_impl(
     if _classify_capacity(label, agent, api_base) == "router":
         try:
             cfg = _get_plugin_cfg(agent)
-            is_pure_timeout = status_code is None and isinstance(
-                e, (asyncio.TimeoutError, TimeoutError)
-            )
+            # v3.4.1: use the shared timeout-shape check -- the raw
+            # asyncio/TimeoutError isinstance missed litellm.Timeout (which
+            # subclasses APITimeoutError -> APIConnectionError), so a
+            # router-side litellm.Timeout booked router_cooldown_s instead
+            # of the v2.6.7 self-healing 0s intent.
+            is_pure_timeout = status_code is None and _is_timeout_shaped(e)
             if is_pure_timeout and cfg.get("router_timeout_no_cooldown", True):
                 dur = float(cfg.get("router_timeout_cooldown_s", 0.0))
             else:
@@ -2050,7 +2324,7 @@ def _handle_error_cooldown_impl(
         dur = max(0.0, min(dur, 60.0))
         if dur > 0.0:
             store[label] = time.monotonic() + dur
-            _record_last_status(agent, store, label, status_code)
+            _record_last_status(agent, label, status_code)
             _save_cooldown_store(agent, store)
         # v2.7.0: routers are EXEMPT from the cross-agent dead-mark -- one
         # pooled upstream's 404/auth must not put a healthy GATEWAY into
@@ -2078,16 +2352,16 @@ def _handle_error_cooldown_impl(
         dur = max(0.0, min(dur, 300.0))
         if dur > 0.0:
             store[label] = time.monotonic() + dur
-            _record_last_status(agent, store, label, status_code)
+            _record_last_status(agent, label, status_code)
             _save_cooldown_store(agent, store)
         return True
 
-    dur = _cooldown_seconds_for_status(status_code, e)
+    dur = _cooldown_seconds_for_status(status_code, e, agent)
     # Don't apply cooldowns shorter than 30s -- they'd be cleared by the
     # attempt_delay anyway, and writing them just adds IO overhead.
     if dur >= 30.0:
         store[label] = time.monotonic() + dur
-        _record_last_status(agent, store, label, status_code)
+        _record_last_status(agent, label, status_code)
         _save_cooldown_store(agent, store)
     return True
 
@@ -2099,135 +2373,73 @@ def _format_exception(exc: Exception) -> str:
     return f"{name}: {msg}"
 
 
-_PLUGIN_DEFAULTS_CACHE: dict = {"mtime": None, "cfg": None}
-
-
-_PLUGIN_CFG_CACHE: dict = {}
-_PLUGIN_CFG_CACHE_TTL_S = 1.0
-_PLUGIN_CFG_CACHE_MAX = 64
-
-
-def _plugin_cfg_cache_key(agent) -> tuple:
-    """Stable per-scope cache key for the merged plugin config.
-
-    Uses the same project/profile resolution the framework uses for
-    scoped plugin config, falling back to the context id (and finally a
-    single global bucket) so an agent without a project still caches.
-    """
-    project_name = ""
-    agent_profile = ""
-    try:
-        if agent is not None:
-            from helpers import projects, subagents  # noqa: F401
-
-            try:
-                project_name = projects.get_context_project_name(agent.context) or ""
-            except Exception:  # noqa: BLE001
-                project_name = ""
-            agent_profile = getattr(getattr(agent, "config", None), "profile", "") or ""
-    except Exception:  # noqa: BLE001
-        pass
-    if project_name or agent_profile:
-        return (project_name, agent_profile)
-    context = getattr(agent, "context", None)
-    context_id = getattr(context, "id", None)
-    return ("__global__", str(context_id) if context_id else "")
-
-
 def _get_merged_defaults() -> dict:
-    """default_config.yaml contents, mtime-keyed cached (v2.8.4).
+    """default_config.yaml contents, mtime-keyed cached.
 
-    get_plugin_config does NOT merge default_config.yaml with config.json
-    (the gotcha that killed the v2.6.7 router detection, then the
-    force_chat_* lists in models_ext, and then this file's own
-    format_error_cooldown_s knob -- every YAML-only knob was dead unless
-    the user hand-copied it into config.json). Merging at _get_plugin_cfg
-    fixes every knob at once. The cache avoids a YAML parse per LLM call;
-    the mtime key means an edited YAML is picked up without a restart.
+    Thin delegation to ``helpers.config_defaults`` -- the single canonical
+    resolver. It used to be a private copy here, and ``models_ext.py`` carried
+    a second one, and the two drifted. See that module's docstring for the
+    framework gap that made any merge necessary at all.
     """
     try:
-        from helpers import files as _files
+        from usr.plugins.model_fallback.helpers import config_defaults
 
-        path = _files.get_abs_path(
-            "usr", "plugins", "model_fallback", "default_config.yaml"
-        )
-        mtime = os.path.getmtime(path) if os.path.exists(path) else None
+        return config_defaults.load_defaults("model_fallback")
     except Exception:  # noqa: BLE001
-        mtime = None
-    if mtime is not None and _PLUGIN_DEFAULTS_CACHE["mtime"] == mtime:
-        cached = _PLUGIN_DEFAULTS_CACHE["cfg"]
-        if isinstance(cached, dict):
-            return cached
-    try:
-        defaults = plugins.get_default_plugin_config("model_fallback")
-        if not isinstance(defaults, dict):
-            defaults = {}
-    except Exception:  # noqa: BLE001
-        defaults = {}
-    _PLUGIN_DEFAULTS_CACHE["mtime"] = mtime
-    _PLUGIN_DEFAULTS_CACHE["cfg"] = defaults
-    return defaults
+        return {}
 
 
 def _get_plugin_cfg(agent, use_cache: bool = True) -> dict:
-    """Safely load plugin config (handles None, bad types).
+    """Safely load plugin config with default_config.yaml merged UNDER it.
 
-    v2.8.4: default_config.yaml is merged UNDER the live config.json/scope
-    result, so every knob documented in the YAML is actually live without
-    being duplicated into config.json.
+    v2.8.4 introduced the merge because ``get_plugin_config`` returns
+    config.json WITHOUT merging default_config.yaml, so every YAML-only knob
+    was dead unless the user hand-copied it into config.json. That gap produced
+    three separate production incidents (v2.6.7 router detection, v2.8.3 F1 the
+    30s/60s guard regression, v2.8.4 force_chat_completions_providers).
 
-    v3.3.0 (perf): this was the plugin's hottest non-LLM path. It has ~24
-    call sites and the cascade re-enters it several times PER CANDIDATE
-    (``_resolve_per_call_timeout`` -> ``_gen_budget_cfg`` ->
-    ``_classify_capacity`` -> ``_compute_cycle_sleep`` ...), while
-    ``plugins.get_plugin_config`` is ``@extension.extensible`` -- so every
-    call dispatched the extension machinery, stat-ed the filesystem for
-    the scoped asset and re-parsed config.json. Measured at ~0.79 ms per
-    call, i.e. ~20 ms of pure overhead per cascade pass, repeated for the
-    whole cycle budget of a multi-hour outage. The cache brings that to
-    ~0.002 ms (measured, ~465x).
+    The merge itself now lives in ONE place,
+    ``helpers.config_defaults.resolve_config``, and it is **recursive**. The
+    two previous copies were shallow (``dict(defaults); update(cfg)``), so a
+    user who overrode a single key inside a NESTED section -- e.g.
+    ``utility_timeout_guard.default_timeout_s`` -- silently lost every sibling
+    default in that section, and a module constant took over instead. That is
+    the v2.8.3 F1 failure mode one level down.
 
-    The config cannot change mid-cascade in any way that matters, so we
-    memoise the MERGED result for ``_PLUGIN_CFG_CACHE_TTL_S`` seconds,
-    keyed by resolved project/profile. The TTL is deliberately short so a
-    WebUI save still lands within a second, and it is bounded so a long
-    session with many contexts cannot grow the map without limit.
-    ``invalidate_plugin_cfg_cache()`` drops it on reset / disable.
-
-    ``use_cache=False`` forces a fresh read. Anything that renders config
-    back to a user (the settings panel, the stats endpoint) must pass
-    False, or it can display a value that is up to one TTL stale.
+    Memoised for ``_PLUGIN_CFG_CACHE_TTL_S`` seconds and keyed by resolved
+    project/profile. The config cannot meaningfully change mid-cascade, and
+    this is the plugin's hottest non-LLM path (~24 call sites, re-entered
+    several times PER CANDIDATE). Anything that renders config back to a user
+    must pass ``use_cache=False``.
     """
-    key = _plugin_cfg_cache_key(agent)
-    now = time.monotonic()
-    if use_cache:
-        entry = _PLUGIN_CFG_CACHE.get(key)
-        if entry is not None:
-            expires_at, merged = entry
-            if now < expires_at:
-                return merged
+    try:
+        from usr.plugins.model_fallback.helpers import config_defaults
 
-    cfg = plugins.get_plugin_config("model_fallback", agent) or {}
-    if not isinstance(cfg, dict):
-        cfg = {}
-    defaults = _get_merged_defaults()
-    if defaults:
-        merged = dict(defaults)
-        merged.update(cfg)
-    else:
-        merged = dict(cfg)
-
-    if len(_PLUGIN_CFG_CACHE) >= _PLUGIN_CFG_CACHE_MAX:
-        # Drop the soonest-to-expire entry rather than growing forever.
-        oldest = min(_PLUGIN_CFG_CACHE, key=lambda k: _PLUGIN_CFG_CACHE[k][0])
-        _PLUGIN_CFG_CACHE.pop(oldest, None)
-    _PLUGIN_CFG_CACHE[key] = (now + _PLUGIN_CFG_CACHE_TTL_S, merged)
-    return merged
+        return config_defaults.resolve_config(
+            "model_fallback", agent, use_cache=use_cache
+        )
+    except Exception:  # noqa: BLE001 - never let config break a cascade
+        try:
+            cfg = plugins.get_plugin_config("model_fallback", agent) or {}
+            return dict(cfg) if isinstance(cfg, dict) else {}
+        except Exception:  # noqa: BLE001
+            return {}
 
 
 def invalidate_plugin_cfg_cache() -> None:
-    """Drop the memoised config (after a save, reset, or on disable)."""
-    _PLUGIN_CFG_CACHE.clear()
+    """Drop the memoised config (after a save, reset, or on disable).
+
+    Delegates to the single cache owner in ``helpers.config_defaults``. The
+    per-file ``_PLUGIN_CFG_CACHE`` that used to live here is gone; its TTL,
+    bound, scope key and invalidation are now that module's contract and are
+    tested there.
+    """
+    try:
+        from usr.plugins.model_fallback.helpers import config_defaults
+
+        config_defaults.invalidate_config_cache()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _clamp_delay(value: float, maximum: float, name: str) -> float:
@@ -2282,26 +2494,35 @@ async def _yielding_sleep(total_seconds: float) -> None:
     first = min(0.25, total_seconds)
     await asyncio.sleep(first)
     remaining = total_seconds - first
+    # v3.4.1: resolve the optional observability hook ONCE -- the old
+    # per-iteration import ran up to ~150 import-machinery lookups per
+    # 300s sleep. Missing module resolves to None, no hard dependency.
+    try:
+        from usr.plugins.memory_hardening.helpers.coroutine_guard import (  # type: ignore
+            on_long_sleep_tick as _on_long_sleep_tick,
+        )
+    except Exception:
+        _on_long_sleep_tick = None
     while remaining > 0:
-        await asyncio.sleep(min(_YIELDING_SLEEP_SLICE_S, remaining))
-        remaining -= _YIELDING_SLEEP_SLICE_S
-        # Optional observability: if memory_hardening registered an
-        # ``on_long_sleep_tick`` callback, fire it. Imported lazily so
-        # the plugin doesn't take a hard dependency on memory_hardening.
-        try:
-            from usr.plugins.memory_hardening.helpers.coroutine_guard import (  # type: ignore
-                on_long_sleep_tick,
-            )
-            on_long_sleep_tick(remaining)
-        except Exception:
-            pass
+        # v3.4.1: clamp the final slice to what actually remains -- the
+        # old code decremented by the full slice first, so the tick
+        # callback could observe a negative remaining value on the last
+        # slice of an odd-length sleep.
+        slice_s = min(_YIELDING_SLEEP_SLICE_S, remaining)
+        await asyncio.sleep(slice_s)
+        remaining -= slice_s
+        if _on_long_sleep_tick is not None:
+            try:
+                _on_long_sleep_tick(remaining)
+            except Exception:
+                pass
 
 
 
 
 
 def _maybe_raise_retry_after_hours(
-    agent, cycle_count: int, n: int, total_attempts: int,
+    agent, cycle_count: int,
     max_cycles: int | None = None,
 ) -> None:
     """Check extended-retry conditions and raise RetryAfterHours if appropriate.
@@ -2549,6 +2770,14 @@ async def _run_rotation_cascade(self, spec: _CascadeSpec, model_obj):
         "cascade_warm_window_s", _DEFAULT_CASCADE_WARM_WINDOW_S,
     ))
     model_kwargs = getattr(model_obj, "kwargs", {}) or {}
+    # v3.4.1: restore what a PREVIOUS invocation stripped from the live
+    # primary, then compute the user-kwarg timeout flag ONCE here -- the
+    # per-candidate strip below pops TIMEOUT from this same live dict, so
+    # the old per-iteration `user_kwarg_set` recheck (after the strip)
+    # was always False on idx==0 and the user's TIMEOUT kwarg silently
+    # lost to the warm/cold/latency resolution.
+    _restore_stripped_primary_kwargs(model_obj)
+    user_kwarg_set = "TIMEOUT" in model_kwargs or "timeout" in model_kwargs
     timeout_s: float = float(
         model_kwargs.get("TIMEOUT", model_kwargs.get("timeout", default_timeout))
     )
@@ -2939,13 +3168,16 @@ async def _run_rotation_cascade(self, spec: _CascadeSpec, model_obj):
                 if not continuous_mode and empty_passes >= 3:
                     cycle_count += 1
                     _emit_fallback_summary(self, spec.kind, candidates)
-                    _maybe_raise_retry_after_hours(self, cycle_count, n, attempt, max_cycles=max_cycles)
+                    _maybe_raise_retry_after_hours(self, cycle_count, max_cycles=max_cycles)
                     raise RuntimeError(
                         f"All {spec.kind} model candidates skipped "
                         f"(cooldown/dead) for {empty_passes} consecutive "
                         f"passes; exhausted."
                     )
-                await asyncio.sleep(spin_s)
+                # v3.4.1: yielding sleep -- a plain asyncio.sleep here is a
+                # sync-only tight-ish loop that can starve the event loop
+                # between ticks; _yielding_sleep interleaves awaits.
+                await _yielding_sleep(spin_s)
                 attempt = 0
                 tried_this_cycle = 0
                 cycle_permanent_count = 0
@@ -2965,12 +3197,15 @@ async def _run_rotation_cascade(self, spec: _CascadeSpec, model_obj):
                 and cycle_permanent_count == tried_this_cycle
             ):
                 cycle_count += 1
-                _emit_fallback_summary(self, "utility", candidates)
+                # v3.4.1: kind comes from the cascade spec -- the hardcoded
+                # "utility" mislabelled chat/utility cascades in the event
+                # timeline and dashboard.
+                _emit_fallback_summary(self, spec.kind, candidates)
                 # Continuous mode: never raise RetryAfterHours; the cascade
                 # must keep cycling so the agent stays alive across multi-hour
                 # rate-limit windows. In legacy mode, raise if applicable.
                 if not continuous_mode:
-                    _maybe_raise_retry_after_hours(self, cycle_count, n, attempt, max_cycles=max_cycles)
+                    _maybe_raise_retry_after_hours(self, cycle_count, max_cycles=max_cycles)
                 # If extended-retry is disabled, fall through to the
                 # normal cycle log + sleep. In continuous mode, the sleep is
                 # the backoff envelope, not the flat cycle_delay.
@@ -2995,8 +3230,12 @@ async def _run_rotation_cascade(self, spec: _CascadeSpec, model_obj):
             # designed to run forever so a multi-hour provider outage does
             # not kill the agent. See AGENTS.md.
             if not continuous_mode and max_cycles > 0 and cycle_count >= max_cycles:
-                # Try extended retry before giving up
-                _maybe_raise_retry_after_hours(self, cycle_count, n, attempt, max_cycles=max_cycles)
+                # Extended retry is attempted by the single post-loop
+                # _maybe_raise_retry_after_hours below. v3.4.1: the old
+                # call here DOUBLE-fired the extended-retry budget -- the
+                # break falls straight through to that post-loop call with
+                # the same cycle_count, so ext_attempts was incremented
+                # twice per exhaustion (phase A burned twice as fast).
                 break
             consecutive_full_cycles += 1
             # v2.6: Phase 3 — stagnation counter increments on every
@@ -3119,7 +3358,11 @@ async def _run_rotation_cascade(self, spec: _CascadeSpec, model_obj):
                 events.record_event(
                     "cooldown_cleared_by_success", agent=self, label=label
                 )
-            _save_cooldown_store(self, model_cooldowns)
+                # v3.4.1: persist only when the pop actually removed an
+                # entry -- a no-op pop leaves the dict byte-identical, and
+                # re-saving it re-serialized the whole store on every
+                # successful call for nothing.
+                _save_cooldown_store(self, model_cooldowns)
             # v2.5.2: cross-agent healthy-label reset. Mark this label
             # healthy for `health_horizon_s` so other agents' cooldowns
             # for the same label can be cleared on their next cascade
@@ -3199,7 +3442,10 @@ async def _run_rotation_cascade(self, spec: _CascadeSpec, model_obj):
         # overrides everything). Resolved at the per-iteration site so
         # `effective_timeout_s` is in scope for both the inner call and
         # the timeout-warning log line.
-        user_kwarg_set = "TIMEOUT" in model_kwargs or "timeout" in model_kwargs
+        # v3.4.1: user_kwarg_set is computed ONCE at the cascade top --
+        # this live kwargs dict has already had TIMEOUT popped by the
+        # per-candidate strip, so the old recheck here was always False
+        # on idx==0.
         if user_kwarg_set:
             effective_timeout_s = timeout_s
         else:
@@ -3415,8 +3661,9 @@ async def _run_rotation_cascade(self, spec: _CascadeSpec, model_obj):
         attempt += 1
 
     # Last-ditch extended-retry check (if cycle_count was below max when we broke)
-    _emit_fallback_summary(self, "utility", candidates)
-    _maybe_raise_retry_after_hours(self, cycle_count, n, attempt, max_cycles=max_cycles)
+    # v3.4.1: kind comes from the cascade spec (was hardcoded "utility").
+    _emit_fallback_summary(self, spec.kind, candidates)
+    _maybe_raise_retry_after_hours(self, cycle_count, max_cycles=max_cycles)
 
     exhausted = (
         f"All {spec.kind} model candidates exhausted after {cycle_count} cycle(s) "
@@ -3704,6 +3951,13 @@ async def _patched_call_chat_model_turn(
             explicit_caching=explicit_caching,
         )
 
+    # v3.4.1: restore what a PREVIOUS invocation stripped from the live
+    # primary BEFORE _build_candidates -- its kwargs source (#1) reads
+    # ``fallbacks``/``fallback`` from this same live dict, so a restore
+    # after the build would miss kwarg-configured fallbacks on the first
+    # turn after a stripped invocation.
+    _restore_stripped_primary_kwargs(model_obj)
+
     candidates = _build_candidates(model_obj, use_utility_models=False, agent=self)
     n = len(candidates)
     if n <= 1:
@@ -3756,13 +4010,26 @@ async def _patched_call_chat_model_turn(
             store0 = _get_cooldown_store(self)
             if not isinstance(store0, dict):
                 store0 = {}
-            _evict_warm_on_timeout(e, label0)
+            # v3.4.1: gate on timeout shape (parity with the n>1 turn path) --
+            # a 429/5xx must not discard the healthy warm budget.
+            if _is_timeout_shaped(e):
+                _evict_warm_on_timeout(e, label0)
             _handle_error_cooldown(
                 e, label0, store0, self, api0, probe_model=model_obj
             )
             if streamed_any0:
                 # Partial output reached the UI -- never auto-retry.
                 raise
+            # v3.4.1: Option-D parity on the n<=1 path -- a Responses-5xx
+            # here books a cooldown and raises, but without the sticky mark
+            # every later turn re-pays the same 5xx before the forcing
+            # block in the n>1 path ever sees it.
+            if (
+                is_responses_server_error(e)
+                and not should_force_chat_completions(model_obj, self)
+            ):
+                mark_responses_5xx_seen(model_obj)
+                force_chat_completions_mode(model_obj)
             # v2.8.6 (X): rotation-permanent check. A 429 here used to hit
             # _is_permanently_failed_model (True for rate-limited) and
             # re-raise the RAW RateLimitError, bypassing the structured
@@ -3773,24 +4040,67 @@ async def _patched_call_chat_model_turn(
                 label0, self, api0
             ) != "router":
                 raise
+            cfg0: dict = {}
             try:
                 cfg0 = _get_plugin_cfg(self)
                 extended_on = bool(cfg0.get("extended_retry_enabled", True))
                 continuous_on = bool(cfg0.get("continuous_fallback", False))
             except Exception:
                 extended_on, continuous_on = True, False
+                cfg0 = {}
             if not (extended_on or continuous_on):
                 # Legacy contract: extended retry disabled -> surface the
                 # error instead of looping (matches the chat/utility gate).
                 raise
+            # v3.4.0: a quota exhaustion is not a 60s problem. When the
+            # account's window is spent there is nothing to rotate to (n<=1)
+            # and nothing that will succeed before the window resets, so wait
+            # out the scope-aware cooldown the booking above just wrote
+            # instead of re-paying the call every minute.
+            quota_dur = _quota_cooldown_seconds(e, self)
+            if quota_dur is not None:
+                # Clamp here as well as inside _quota_cooldown_seconds: that
+                # helper reads its OWN cfg, which may differ from cfg0 (and is
+                # the empty dict if the read above failed), so the ceiling has
+                # to be enforced against the value actually used.
+                try:
+                    cap = float(
+                        cfg0.get("quota_cooldown_max_s", _DEFAULT_QUOTA_COOLDOWN_MAX_S)
+                    )
+                except Exception:  # noqa: BLE001
+                    cap = _DEFAULT_QUOTA_COOLDOWN_MAX_S
+                delay = max(60.0, min(quota_dur, cap))
+                raise RetryAfterHours(
+                    retry_after=delay,
+                    reason=f"quota_{detect_quota_scope(e) or 'account'}",
+                )
             hint = extract_retry_after_seconds(e)
             delay = max(10.0, min(float(hint) if hint and hint > 0 else 60.0, 3600.0))
+            # v3.4.1: the booking above may have written a longer scope-aware
+            # cooldown into store0 than the hint suggests. The raise must
+            # carry at least the store's remaining time -- otherwise _70's
+            # sleeper wakes the turn BEFORE the cooldown expires and the
+            # next turn re-pays the failing call only to be skipped again.
+            try:
+                _remaining = float(store0.get(label0) or 0.0) - time.monotonic()
+                if _remaining > 0:
+                    delay = max(delay, _remaining)
+            except Exception:  # noqa: BLE001
+                pass
             raise RetryAfterHours(retry_after=delay)
 
     # --- Config knobs (same keys as the chat cascade) ----------------------
     plugin_cfg = _get_plugin_cfg(self)
     default_timeout = float(plugin_cfg.get("fallback_timeout_s", 300))
     model_kwargs = getattr(model_obj, "kwargs", {}) or {}
+    # v3.4.1: restore what a PREVIOUS invocation stripped from the live
+    # primary (finding 2/4), then compute the user-kwarg timeout flag ONCE
+    # here -- the per-candidate strip below pops TIMEOUT from this same
+    # live dict, so the old per-iteration `user_kwarg_set` recheck was
+    # always False on idx==0 and the user's TIMEOUT kwarg lost to the
+    # warm/cold resolution.
+    _restore_stripped_primary_kwargs(model_obj)
+    user_kwarg_set = "TIMEOUT" in model_kwargs or "timeout" in model_kwargs
     timeout_s = float(
         model_kwargs.get("TIMEOUT", model_kwargs.get("timeout", default_timeout))
     )
@@ -4039,23 +4349,21 @@ async def _patched_call_chat_model_turn(
         # bodies. Apply the same sticky force here so an ollama-cloud
         # primary that 500s on /v1/responses gets chat-completions on the
         # main loop too, not just on utility/chat-cascade calls.
-        try:
-            from usr.plugins.model_fallback.models_ext import (
-                force_chat_completions_mode,
-                should_force_chat_completions,
-            )
-
-            if should_force_chat_completions(current_model, self):
-                force_chat_completions_mode(current_model)
-        except Exception:
-            pass
+        # v3.4.1: the redundant local import is gone -- both helpers are
+        # module-level imports (finding 34); the shadowing import made
+        # static analysis report the names as possibly-unbound.
+        if should_force_chat_completions(current_model, self):
+            force_chat_completions_mode(current_model)
 
         # Per-candidate warm/cold timeout. A user TIMEOUT= model kwarg was
         # already folded into ``timeout_s`` above. v2.8.5: the warm
         # fast-path is DISABLED on the turn path (allow_warm=False) -- the
         # main loop legitimately streams for tens of seconds, and the 20s
         # warm ceiling killed every other long turn mid-stream.
-        user_kwarg_set = "TIMEOUT" in model_kwargs or "timeout" in model_kwargs
+        # v3.4.1: user_kwarg_set is computed ONCE at the cascade top --
+        # this live kwargs dict has already had TIMEOUT popped by the
+        # per-candidate strip, so the old recheck here was always False
+        # on idx==0.
         if user_kwarg_set:
             effective_timeout_s = timeout_s
         else:
@@ -4102,7 +4410,12 @@ async def _patched_call_chat_model_turn(
                 raise
             # Timeout handling: evict the warm label (fix A) so the retry
             # uses the cold timeout, and book the error cooldown.
-            _evict_warm_on_timeout(e, label)
+            # v3.4.1: gate on timeout shape -- this block fires for every
+            # non-code error (429/5xx) too, and evicting the warm label on
+            # those discarded a healthy warm budget the next turn then
+            # paid back at the cold ceiling.
+            if _is_timeout_shaped(e):
+                _evict_warm_on_timeout(e, label)
             # v3.1.0: clear the label's latency samples ONLY on a genuine
             # timeout -- this except block fires for every non-code error
             # (429s, 5xx), and clearing samples on those would discard
@@ -4127,6 +4440,24 @@ async def _patched_call_chat_model_turn(
                 e, label, model_cooldowns, self, cand_api_base,
                 probe_model=current_model,
             )
+            # v3.4.1: Option-D parity with the engine. The turn path cannot
+            # retry once (a stream may already be running), but it MUST
+            # record the sticky mark -- without it a Responses-5xx endpoint
+            # keeps paying that 5xx on every turn, because the pre-call
+            # forcing block above only acts on marks something else wrote.
+            if (
+                is_responses_server_error(e)
+                and not should_force_chat_completions(current_model, self)
+            ):
+                mark_responses_5xx_seen(current_model)
+                force_chat_completions_mode(current_model)
+                self.context.log.log(
+                    "warning",
+                    content=(
+                        f"Chat model (turn) [{idx}] Responses 5xx on {label}; "
+                        f"forcing chat-completions for later turns."
+                    ),
+                )
             if idx == 0:
                 # v2.8.6 (Z): decay stale strikes. The counter persists
                 # across turns (DATA_KEY_TURN_PRIMARY_FAILS); without a
@@ -4188,7 +4519,9 @@ async def _patched_call_chat_model_turn(
             events.record_event(
                 "cooldown_cleared_by_success", agent=self, label=label
             )
-        _save_cooldown_store(self, model_cooldowns)
+            # v3.4.1: persist only when the pop actually removed an entry
+            # (a no-op pop leaves the dict byte-identical).
+            _save_cooldown_store(self, model_cooldowns)
         _mark_label_healthy(self, label)
         _WARM_LABELS[label] = time.monotonic()
         # v3.1.0: record the real call duration (stamped above) so the
@@ -4229,9 +4562,21 @@ async def _patched_call_chat_model_turn(
     # were already written by _handle_error_cooldown.
     retry_after = 60.0
     if last_error is not None:
-        hint = extract_retry_after_seconds(last_error)
-        if hint and 0 < hint <= 300.0:
-            retry_after = max(retry_after, float(hint))
+        # v3.4.0: quota exhaustion dominates the 60s default. This is the path
+        # in the reported traceback (fallback.py, all candidates exhausted):
+        # every candidate was already rotated through, and the reason they all
+        # failed is typically one account's spent window. The 60s floor woke
+        # the loop once a minute to re-pay a call that cannot succeed. Wait
+        # the scope-aware quota cooldown instead, and tag the exception so
+        # _70 prints the "quota exhausted, resumes automatically" message
+        # rather than the "all candidates unavailable" hard-failure wording.
+        quota_dur = _quota_cooldown_seconds(last_error, self)
+        if quota_dur is not None:
+            retry_after = max(retry_after, quota_dur)
+        else:
+            hint = extract_retry_after_seconds(last_error)
+            if hint and 0 < hint <= 300.0:
+                retry_after = max(retry_after, float(hint))
     # v2.8.5: last_error is None when every candidate was skipped
     # (cooldown/dead) -- the old message printed "last failure: NoneType".
     if last_error is not None:
@@ -4261,7 +4606,14 @@ async def _patched_call_chat_model_turn(
         # Legacy contract: extended retry disabled -> raise RuntimeError so
         # handle_exception surfaces it (same as the chat/utility cascades).
         raise RuntimeError(exhausted + " (extended retry disabled)")
-    raise RetryAfterHours(retry_after=retry_after)
+    # v3.4.0: carry the quota tag through so the _70 handler can distinguish
+    # "your window is spent, this self-heals" from "every model is broken".
+    _reason = ""
+    if last_error is not None:
+        _scope = detect_quota_scope(last_error)
+        if _scope:
+            _reason = f"quota_{_scope}"
+    raise RetryAfterHours(retry_after=retry_after, reason=_reason)
 
 
 def install_chat_turn_patch(agent_cls, version: str | None = None) -> bool:

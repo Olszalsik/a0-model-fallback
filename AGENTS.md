@@ -10,6 +10,117 @@ provider going dark for hours is normal operating conditions, not a failure.
 
 ---
 
+## v3.4.0 — quota exhaustion is not a hard stopper
+
+Production report: ollama.com returned
+`RateLimitError: ... you (olszalsik) have reached your session usage limit,
+upgrade for higher limits ... or add usage credits ...` and the agent died
+with `RetryAfterHours: All model candidates are currently unavailable.
+Retrying in 60s.` plus a Chat Shepherd `Internal Server Error`.
+
+**The provider never said when the window resets.** ollama.com sends that 429
+with no `Retry-After` and no reset timestamp. There is nothing to parse, so
+the plugin must supply the policy — that is the whole point of this section.
+
+### The three bugs that produced the report
+
+1. **No distinction between a transient 429 and a spent quota.** Both matched
+   `_is_rate_limited_error`, so an exhausted *plan* took the transient path
+   and booked `rate_limit_no_retry_after_cooldown_s` (30s). The cascade then
+   re-paid the full round-trip — litellm retries twice on its own — once a
+   minute against an endpoint guaranteed to refuse until the window rolled
+   over. New: `models_ext.detect_quota_scope` / `_is_quota_exhaustion_error`
+   classify the window (`session`/`daily`/`weekly`/`monthly`/`account`) from
+   the message text; `_quota_cooldown_seconds` (fallback.py) turns that into
+   a duration, preferring any provider reset hint over the guess.
+2. **Reset headers were nearly invisible.** `extract_retry_after_seconds`
+   checked a hardcoded 4-tuple of capitalisations on `exc.headers` only, and
+   did `float(val)`. It therefore missed `x-ratelimit-reset-requests: 8.64s`
+   (a *duration with a unit*, not a number), every other capitalisation, and
+   every header present only on `exc.response.headers`. It also had no
+   HTTP-date support. Now: case-insensitive walk of both header dicts, unit
+   parsing, HTTP-date, and `x-ratelimit-reset` disambiguated epoch-vs-delta by
+   magnitude (>1e9 s cannot be a plausible delta).
+3. **The message read as a hard failure.** A quota window is a self-healing
+   condition, but the raise sites emitted the "All model candidates are
+   currently unavailable" wording. `RetryAfterHours` now takes a `reason`;
+   `reason="quota_<scope>"` produces "quota exhausted … will resume in ~N min
+   when the window resets". `_70` also raises its sleep ceiling from 7200s to
+   43200s **for quota reasons only** — the old clamp silently truncated the
+   longer quota waits.
+
+### Invariants — do not regress these
+
+- **Quota exhaustion is a COOLDOWN policy, never a "dead model" verdict.** The
+  label stays in the rotation and is re-probed once its window is believed
+  expired. It must never be classified permanent-for-rotation
+  (`_is_permanent_for_rotation` stays False for it) and must never
+  dead-mark (`_mark_label_dead`).
+- **A provider reset hint always beats our guessed scope duration**, and
+  `quota_cooldown_max_s` always caps the result. An over-long guess costs
+  latency on that one label; an unbounded one would park it for a week.
+- **The 30s transient default is unchanged** for genuine throttles
+  ("Too many Requests", "server is busy"). A shared-pool burst that clears in
+  seconds must not be locked out for 15 minutes.
+- **Both `RetryAfterHours` raise sites are quota-aware** — the turn path's
+  `n <= 1` branch and the all-candidates-exhausted branch. They are the two
+  frames in the reported traceback.
+
+Config: `quota_scope_cooldown_s` (per-scope overrides) and
+`quota_cooldown_max_s`. Tests: `tests/test_quota_exhaustion_v340.py`.
+
+> Note: `tests/test_capacity_v26.py::test_handle_error_cooldown_30s_for_unlimited_paid`
+> used the message `"Quota exhausted"`, which is a genuine quota phrase and is
+> now (correctly) routed to the quota cooldown. Its fixture was changed to
+> `"Too many requests"` so it tests the transient path it documents.
+
+### Review finding — the `cfg0` NameError (fixed, do not reintroduce)
+
+The first cut of the `n <= 1` quota branch read plugin config inside a
+`try/except` and then dereferenced `cfg0` **outside** it:
+
+```python
+try:
+    cfg0 = _get_plugin_cfg(self)
+    ...
+except Exception:
+    extended_on, continuous_on = True, False   # cfg0 never bound
+...
+float(cfg0.get("quota_cooldown_max_s", ...))   # NameError
+```
+
+A config-read failure therefore raised `NameError` inside the one code path
+whose entire purpose is to keep the agent alive. Confirmed by execution, not
+inspection. `cfg0` is now pre-initialised (`cfg0: dict = {}`) and the cap read
+has its own `try/except`. Pinned by
+`test_quota_branch_survives_config_read_failure` +
+`test_quota_delay_is_defined_when_config_is_unavailable`.
+
+**Generalisation for this file:** a `try/except` that assigns a config dict and
+falls back to a literal must bind the literal *before* the `try`, and every
+later use of that name needs its own guard. The plugin already carries
+several `except: cfg = {}` shapes — each one is a latent `NameError` if a
+later line assumes success.
+
+### Classification matrix (verified, not assumed)
+
+| case | status | rate-limited | quota | scope | dead-marked |
+| --- | --- | --- | --- | --- | --- |
+| ollama session limit | 429 | yes | yes | `session` | no |
+| OpenAI insufficient_quota | 429 | yes | yes | `account` | no |
+| generic quota text | 403 | yes | yes | `account` | yes (pre-existing) |
+| credit balance low | 402 | no | yes | `account` | yes (pre-existing) |
+| model gone | 404 | no | no | `""` | yes (pre-existing) |
+| transient throttle | 429 | yes | no | `""` | no |
+| server error | 500 | no | no | `""` | no |
+
+The 403/402 rows are pre-existing behaviour and are deliberately left alone:
+`_is_dead_for_all_agents` treats 401/402/403 as shared, expiring dead-marks,
+which is correct because the credentials are shared across agents. Only the
+429 rows (your actual case) are guaranteed to stay in rotation.
+
+---
+
 ## v3.3.0 — merged guards (`asyncio_guard`, `import_guard`)
 
 Two standalone plugins were folded in as `helpers/asyncio_guard.py` and
@@ -2294,3 +2405,406 @@ label prefix; to revert Phase 4, restore the legacy cleanup-on-cancel branch.
   paid endpoint then falls back to `free_per_minute` (the original
   drop-off symptom returns). Add a host substring here for any other paid
   endpoint that runs through an `openai`-aliased `litellm_provider`.
+
+---
+
+## v3.4.1 (audit) — comprehensive technical audit, 2026-09-28
+
+READ-ONLY audit of the whole plugin (fallback.py 4,437 lines in two halves,
+models_ext.py, hooks.py, helpers/, extensions/, api/, webui/, config) against
+framework `helpers/api.py`, `agent.py`, `models.py`, `helpers/plugins.py`.
+Method: four parallel audit passes, then every high/medium finding re-verified
+by direct code inspection (several against the live framework classes). All
+line numbers are against the v3.4.0 working tree (uncommitted at audit time).
+**Fix pass: every actionable finding below was FIXED the same day (see the
+"v3.4.1 fix pass" ledger at the end of this section); 355/355 tests re-run
+green after the fix pass.** Deferred items are marked in the ledger.
+Verified-clean areas are listed at the end.
+
+### Critical / high
+
+1. **Retry-After header walk is dead for real litellm exceptions** —
+   `models_ext.py:612-615`. `_header_candidates` does
+   `if not isinstance(headers, dict): continue`, but `httpx.Headers`
+   subclasses `collections.abc.Mapping`, NOT `dict` (verified: MRO
+   `Headers → MutableMapping → Mapping → Collection`; `isinstance(h, dict)`
+   is False). litellm/openai exceptions carry `.headers` /
+   `.response.headers` as `httpx.Headers`, so for exactly the exceptions the
+   helper was written for it yields nothing. Silently disabled: the
+   Retry-After priority in `_cooldown_seconds_for_status` (fallback.py:1075),
+   the provider-hint-wins contract of `_quota_cooldown_seconds`
+   (fallback.py:274), and the extended-retry hint path. Only the message-text
+   regex scrape (models_ext.py:692+) still works. Fix: `isinstance(headers,
+   Mapping)` or `dict(headers)`. **Fixing this one first also improves
+   finding 3 below (hints currently never arrive at all).**
+
+2. **User `TIMEOUT=` kwarg is voided — strip-before-check ordering, and the
+   strip is persistent** — `fallback.py:3186→3295` (engine), `4150→4175`
+   (turn). `model_kwargs = getattr(model_obj, "kwargs", {})` (2644/3910) is
+   the LIVE `ModelConfig.kwargs` dict (plain dataclass field, models.py).
+   `_strip_a0_only_kwargs(current_model, is_primary=(idx == 0))` pops
+   `"TIMEOUT"` from that shared dict, then `user_kwarg_set` is computed
+   AFTER the strip — always False on idx==0, so the warm/cold/latency
+   resolution overrides the user's kwarg on every attempt, reinstating the
+   20s warm-ceiling failure mode fix A (v2.6.4) was for. Worse: because the
+   strip persists across invocations, the kwarg is erased from the model
+   config entirely after the first call. Fix: snapshot the kwargs flag once
+   at the top of the cascade, before any strip.
+
+3. **Provider reset hint LOSES to the scope guess (`max` instead of
+   hint-wins)** — `fallback.py:274-276`. `dur = max(dur, float(hint))`
+   contradicts the v3.4.0 invariant ("a provider reset hint always beats our
+   guessed scope duration") and both the docstring (:247-252) and
+   default_config.yaml. A `retry-after: 60` on a `session` scope (900s
+   default) parks a healthy-again label 900s. Fix: `dur = float(hint)` when
+   hint > 0 (keep the `quota_cooldown_max_s` clamp). Compounded by the
+   greedy phrase list: Groq's free-tier transient 429 ("... Usage limit ...
+   Please try again in 2m3.16s", models_ext.py:199) classifies as quota
+   `account` → 3600s for a ~2-min throttle; with the header walk fixed, the
+   hint would at least be visible to `max()`.
+
+4. **kwargs-configured `fallbacks` are erased after the first invocation**
+   — `fallback.py:1224` ("fallbacks"/"fallback" in `_A0_ONLY_KWARGS`) +
+   `1281-1288` (strip pops them, even `is_primary=True` — the
+   `_PROVIDER_SPECIFIC_KWARGS` keep-list only exempts
+   venice_parameters/extra_body) + `3186` (strip on the live primary dict).
+   `_build_candidates` source #1 (documented "most common", 1318-1326) reads
+   that same live dict, so on the next call the list is gone; source #2 is
+   dead (finding 5), so rotation silently falls through to env/plugin
+   config — or to a single candidate. Latent today (candidates come from
+   plugin config here), high impact for any kwargs-based setup. Fix: never
+   strip from the live primary's dict, or rebuild/restore after the read.
+
+5. **Agent-config fallback source #2 is dead code** — `fallback.py:1328-1341`.
+   `isinstance(agent.config, dict)` is always False: `AgentConfig` is a
+   dataclass (agent.py:327-331: mcp_servers/profile/knowledge_subdirs/
+   additional). Any preset defining `fallback_models` /
+   `utility_fallback_models` / `chat_model_fallbacks` at agent-config level
+   is silently ignored. Fix: read from `agent.config.additional` (or the
+   framework's serialized config) or drop source #2 from the docs.
+
+### Medium
+
+6. **Blanket `except` in `_quota_cooldown_seconds` converts an internal
+   error into a 1-hour account-scope booking** — `fallback.py:282-283`.
+   Contract says "Returns None when e is not a quota exhaustion", but any
+   internal exception returns `_DEFAULT_QUOTA_SCOPE_COOLDOWNS_S["account"]`
+   (3600s) — a plain transient 429 that trips an internal error is parked
+   1h instead of 30s. Same `except: return literal` class as the documented
+   `cfg0` NameError lesson: bind the fallback BEFORE the try, and make the
+   except return `None` here.
+
+7. **Turn path never sets the Responses-5xx sticky mark** — the engine books
+   it at `fallback.py:3463-3465` (the ONLY `mark_responses_5xx_seen` call
+   site in the repo); the turn path (4150-4300) only READS
+   `should_force_chat_completions` (4165). A main-loop model 5xxing on
+   `/v1/responses` is never marked sticky, never switched to
+   chat-completions, and re-pays the 5xx every turn. The comment at
+   4152-4158 describes an intent the code does not implement.
+
+8. **Router pure-timeout check misses litellm.Timeout** — `fallback.py:2194`.
+   Raw `isinstance(e, (asyncio.TimeoutError, TimeoutError))` while
+   `_is_timeout_shaped` (994-1011, used at 1080/3432/4227) exists precisely
+   for litellm's `Timeout → APITimeoutError → APIConnectionError` family. A
+   litellm.Timeout on a router label books `router_cooldown_s` (5s→60s)
+   instead of the `router_timeout_cooldown_s=0` self-healing intent (v2.6.7
+   Fix B). Fix: `status_code is None and _is_timeout_shaped(e)`.
+
+9. **`_get_plugin_cfg(None)` reads an unscoped cache entry** —
+   `fallback.py:1080, 1089-1098` (`_cooldown_seconds_for_status`). The
+   config resolver's cache key includes project/agent-profile/context id
+   only when agent is not None (helpers/config_defaults.py:134-159), so
+   project- or profile-scoped overrides of `timeout_cooldown_s` and
+   `format_error_cooldown_s` are silently ignored in these two policy paths.
+   Fix: thread the agent down from `_handle_error_cooldown_impl` (which has
+   it).
+
+10. **Recovery-probe sweep never drops expired-but-present entries** —
+    `helpers/recovery_probe.py:208-215`. `until` is a monotonic deadline;
+    once it passes with no cascade having popped the entry,
+    `(until - now) < min_cooldown` is true with a negative remainder →
+    `continue` forever: never popped, never probed, registry grows for the
+    process lifetime. `registered_at` (recorded at :133) is never read —
+    the intended TTL is missing. Fix: treat `until <= now` as not-in-cooldown.
+
+11. **Recovery probes: no per-target backoff → head-of-line blocking** —
+    `recovery_probe.py:225-253`. A failing label is re-probed every 45s
+    sweep, max 2 targets/cycle; a quota-exhausted label with a 12h
+    cooldown eats both probe slots for 12h, starving shorter-cooldown
+    labels that would actually recover. Fix: exponential per-target
+    backoff or order targets by remaining cooldown.
+
+12. **Third config call site still shallow-merges** —
+    `extensions/python/agent_init/_10_install_utility_timeout_patch.py:56-66`
+    (and the context-size guard extension, :268-270). `dict(defaults) +
+    update(cfg)` replaces a whole nested section: a config.json carrying a
+    partial `utility_timeout_guard:` section silently drops the YAML
+    siblings (`enabled`/`max_wait_s`/`close_inner_on_timeout`). This is the
+    exact bug class `helpers/config_defaults.py` (v3.4.0 WIP) documents and
+    solves — route both call sites through `resolve_config`. The
+    `utility_timeout` guard also has stale literals 30/120 instead of
+    DEFAULTS 60/180 (helpers/utility_timeout.py:96-97), which makes an
+    explicit `0` unusable.
+
+13. **`/stats` is documented GET but the handler is POST-only** —
+    `api/stats.py:3` says `GET .../stats` (help.html §10 too), but `Stats`
+    never overrides `get_methods()` and the framework default is
+    `["POST"]` with a hard 405 at dispatch (helpers/api.py:51-52, 255).
+    Any GET consumer (curl, dashboard tile, uptime probe) gets 405. Fix:
+    `def get_methods(self): return ["GET", "POST"]` (and consider Events),
+    or correct both docs.
+
+14. **Hardcoded `"utility"` cascade kind in the shared engine** —
+    `fallback.py:3061` (all-permanent early-exit) and `3511` (post-break
+    exhaustion). When the CHAT cascade hits these paths the summary reads
+    "Utility fallbacks exhausted" and the event is recorded with
+    `cascade_kind="utility"`, corrupting the event timeline's kind filter.
+    The adjacent exhausted message correctly uses `spec.kind` (3513).
+    Fix: pass `spec.kind` at both sites.
+
+### Low
+
+15. `fallback.py:281` — `max(60.0, min(dur, cap))`: a user
+    `quota_cooldown_max_s` below 60 is silently overridden by the floor.
+    Clamp to `[min(60, cap), cap]`.
+16. `fallback.py:1055-1057` — `_is_format_error` substring match
+    ("format"/"parse"/"json" anywhere in the message) misclassifies
+    unrelated ValueErrors (e.g. datetime format errors) as model format
+    slips → 20s cooldown instead of 300s unknown. Restrict to the
+    response-parse path's exception types.
+17. `fallback.py:576-578` (+ 587/659/697) — `cfg.get("gen_budget_max_s")
+    or _DEFAULT...` coerces an explicit 0 to the 600s default; the three
+    `if max_s > 0 else <uncapped>` branches are dead code. Use
+    `is not None` semantics; document whether 0 means uncapped.
+18. `fallback.py:3815-3905` — the turn cascade's n≤1 path calls `original`
+    with NO cooldown-skip check and NO chat-completions forcing: a booked
+    cooldown is re-paid on every RetryAfterHours wake, and a Responses-5xx
+    primary with no fallbacks configured keeps 5xxing forever.
+19. `fallback.py:4222` — the turn path's except block calls
+    `_evict_warm_on_timeout(e, label)` UNCONDITIONALLY (the helper itself
+    only gates CancelledError, 742-765), while the engine keeps the warm
+    entry for router/concurrent_paid 429s (2063-2064 rationale). One
+    router 429 on the main loop forces the next turn onto the full cold
+    budget. Gate it behind `_is_timeout_shaped(e)`.
+20. `fallback.py:3041` — the all-skipped spin path uses a raw
+    `asyncio.sleep(spin_s)` up to 300s, the one long sleep that defeats
+    `_yielding_sleep`'s event-loop starvation protection — precisely the
+    multi-minute all-dead-outage case in continuous mode.
+21. `models_ext.py:401` — `_RESPONSES_5XX_SEEN` has no disable-time reset
+    (hooks.uninstall resets cooldowns/warm/budgets/latency/stats but not
+    this sticky set); after plugin disable/re-enable, stale force-mode
+    marks survive for process lifetime. Add `reset()` + call from
+    uninstall.
+22. `models_ext.py:366-368` — `_is_permanently_failed_model` still returns
+    True for ANY rate-limited error, contradicting the module's own v3.4.0
+    contract comment (161-164). No live bug today (the cooldown branch
+    returns first; rotation uses `_is_permanent_for_rotation`), but any new
+    caller re-introduces raw-429-permanent. Fold 429 out of that helper.
+23. `models_ext.py:592-598` — `_parse_duration_seconds` digit-sums ISO
+    reset timestamps: `"2026-09-28T10:00:00Z"` → 2026+09+28+10 ≈ 2064s of
+    plausible-looking garbage cooldown. Reject values containing
+    `-`/`:`/`T` or parse ISO dates explicitly.
+24. `hooks.py:270-277` — display default `initial_cycle_attempts: 60`
+    contradicts default_config.yaml's 20 (config.json masks it); the six
+    int/float/bool coercions run OUTSIDE the try (a string-typed
+    config.json value raises out of the settings API). Align + move inside.
+25. `fallback.py:775-777` — `("__global__",)` store key is unreachable
+    (`or id(agent)` makes agent_id never None; agent=None callers share one
+    store keyed `id(None)`), and `id(agent)` can alias a GC-reused agent
+    instance.
+26. `fallback.py:3090-3093` vs `3511-3519` — with the default config
+    (extended retry on), standard exhaustion raises RetryAfterHours at
+    3092 and the summary/`cascade_exhausted` event at 3511 is only
+    reachable in the degraded no-extended-retry path: the default-config
+    exhaustion never emits the event the timeline keys on. Emit before the
+    raise (the early-exit branch already does).
+27. `fallback.py:1526-1541` — `_record_last_status`'s `store` parameter is
+    dead (never read by the body; all 4 call sites pass it). Drop it.
+28. Config/docs drift: config.json:26 `webui_extensions_cache_enabled` is
+    dead (nothing reads it since the v2.6.6 migration); README.md:16 says
+    "Version: 2.7.0" vs plugin.yaml 3.4.0 and omits the turn-path cascade +
+    v3.4.0 work; help.html/webui/config.json disagree on `max_wait_s`
+    defaults (180 prose vs 120 webui vs 420 config); webui/fallback-store.js
+    `getDefaults()` returns dead key names (`max_cycles`, `timeout_s` —
+    real keys are `fallback_max_cycles` etc.; latent because applyDefaults()
+    is never called — delete before anyone wires it up).
+
+### Optimization
+
+29. `fallback.py:1301-1379` — candidate list is rebuilt from scratch (4
+    sources + normalize) on every patched call; memoize keyed on
+    (primary model_name, kwargs-fallbacks identity, config mtime).
+30. `api/events.py:49-50` — double `events.snapshot(...)` per request
+    (once for count, once for payload); snapshot once.
+31. `extensions/python/message_loop_prompts_after/_10_context_size_guard.py:253-273`
+    — per-tick uncached `get_plugin_config` + `get_default_plugin_config`
+    reads, bypassing the plugin's 1s-TTL `config_defaults.resolve_config`;
+    per-turn stat/read work on this host's fragile 9p mount. Same class:
+    `monologue_start/_10_memory_recall_patches.py:223-257` re-reads both
+    framework memorize files EVERY monologue with no version-stamp
+    short-circuit (its sibling patches all short-circuit).
+32. `fallback.py:3208-3215, 4301-4308` — unconditional
+    `_save_cooldown_store` (two `agent.set_data` writes) on every success
+    even when nothing was popped. Skip when `_popped_until is None`.
+33. `fallback.py:3942-3943, 4121-4144, 4343-4388` — turn-path log dedupe
+    maps (`_last_skip_log_until` etc.) are per-invocation, so a 60s-cadence
+    overnight RetryAfterHours wake re-logs every candidate's skip line +
+    error-level summary each pass (~n+2 lines/min for hours). Key the
+    dedupe on agent data like the cooldown store.
+34. `fallback.py:4160-4163` — redundant per-candidate local import of
+    `force_chat_completions_mode` / `should_force_chat_completions`
+    (already module-level at 107-108). Also `2396-2455`: unused
+    `n`/`total_attempts` params on `_maybe_raise_retry_after_hours`; the
+    second call at 3512 is unreachable in practice.
+35. `fallback.py:2378-2390` — `_yielding_sleep` re-imports
+    `on_long_sleep_tick` every 2s slice (hoist once per sleep) and can pass
+    a negative `remaining` on the final tick (clamp to 0).
+36. `helpers/config_defaults.py:189-210` — `resolve_config` returns the
+    SHARED cached dict by reference within its TTL; one mutating caller
+    poisons the cache for all readers (latent; no current mutators). Return
+    a copy or document the read-only contract. Also `load_defaults`
+    (113-117): when the YAML is absent the cache-hit condition forces a
+    re-parse every resolve — add a miss sentinel.
+37. `helpers/recovery_probe.py:247-254` — probes run
+    `model.unified_call` which applies the rate limiter unconditionally
+    (models.py:332-352), contradicting "a probe must not touch the agent's
+    rate limiter"; at 2 probes/45s small, but during a multi-label outage
+    probes compete with real traffic for the shared budget.
+38. `models_ext.py:810-820` — `build_fallback_wrapper` mutates the
+    caller's `spec` dict in place (bakes parent api_key/api_base in);
+    safe today only because `_normalize_spec` rebuilds the dict. Add
+    `spec = dict(spec)` at the top.
+
+### Cross-checks resolved
+
+- **Cooldown-store identity** (wrapper-vs-impl): the cascade passes the live
+  `_get_cooldown_store(self)` dict (2695/3939) and the impl books into the
+  same object (2041) — the `cooldown_booked` comparison is sound. Only the
+  corrupt-state `{}` substitution path (2696-2697/3940-3941) diverges; not a
+  live bug.
+- **Strip ordering vs `_build_candidates`**: candidates are built BEFORE the
+  first strip, so a single invocation is unaffected — but see finding 4 for
+  the cross-invocation erasure.
+
+### Verified clean
+
+No empty-POST config-wipe exposure (webui uses the framework save flow);
+API handlers follow the `class X(ApiHandler): async process` contract; the
+synthetic-module gotcha is handled correctly (no sys.modules assumptions);
+the v2.8.1 `or {}` store-wipe guards are in place (2695-2697, 3939-3941);
+`clear_all_cooldowns` mutates in place; v3.3.0 cooldown persist/restore
+round-trips monotonic↔wall clock correctly; `_quota_cooldown_seconds`
+clamps internally so the turn path's `max(60, quota_dur)` cannot exceed the
+cap; the engine's fresh-coroutine retry is real (v2.8.5 fix); config keys
+used by the engine all exist in default_config.yaml; the `_70`
+handle_exception extension clamps `retry_after` to [30, 7200]s; quota
+errors are never classified permanent-for-rotation; wrapper builder
+isolates parent credentials cross-provider; all `DATA_KEY_*` names match
+between hooks.py and fallback.py; probe store comparisons are consistently
+monotonic-based including the v3.3.0 persist/restore.
+
+### v3.4.1 fix pass — ledger (2026-09-28, same day as the audit)
+
+Findings above were numbered against the v3.4.0 tree; this ledger maps each
+number to its disposition. `models_ext.py` + `hooks.py` + `recovery_probe.py`
++ `config_defaults.py` + `utility_timeout.py` + `events.py` + the api/ +
+extensions/ + webui/ files are hot-loaded where the framework allows, but
+`fallback.py` is imported once per process — **the fallback.py fixes below
+require a container restart to go live** (deferred: non-interference with the
+running instance). plugin.yaml bumped 3.4.0 → 3.4.1.
+
+**Fixed:**
+
+- #1 — `models_ext._header_candidates`: `isinstance(headers, dict)` →
+  `collections.abc.Mapping` (httpx.Headers subclasses Mapping, not dict).
+  Regression surface: `test_retry_after_header_variants` only ever tested
+  plain dicts — a httpx.Headers case would have caught this dead subsystem.
+- #2/#4 — strip erasing user kwargs: `_strip_a0_only_kwargs(is_primary=True)`
+  now STASHES the popped A0-only kwargs on the live primary
+  (`model._a0_stripped_kwargs_stash`); `_restore_stripped_primary_kwargs()`
+  re-adds them at the top of `_run_rotation_cascade` and
+  `_patched_call_chat_model_turn` (before the `model_kwargs` read). The
+  `user_kwarg_set` timeout flag is computed once at each cascade top and the
+  two per-iteration recomputes (engine + turn) are gone.
+- #5 — `_build_candidates` source #2 (dead `isinstance(agent.config, dict)`):
+  reads `AgentConfig.additional` now (dict-shaped configs still honoured).
+- #6 — `_quota_cooldown_seconds` blanket except returns None (was 3600s).
+- #7 — turn path now records the Responses-5xx sticky mark +
+  `force_chat_completions_mode` (no one-shot retry — streams may be running —
+  but later turns stop re-paying the 5xx); same mark added to the n≤1 path.
+- #8 — router pure-timeout check uses `_is_timeout_shaped(e)` (litellm.Timeout
+  was missed by the raw asyncio/TimeoutError isinstance).
+- #9 — `_cooldown_seconds_for_status` takes `agent`; both `_get_plugin_cfg`
+  reads are scoped (all 3 call sites updated).
+- #10/#11 — recovery probe sweep pops expired (`until <= now`) targets and
+  applies per-target exponential backoff (60s→2^n, cap 15min) on failed
+  probes (reset when the target is re-registered).
+- #12 — both extension `_resolve_config` sites (utility-timeout patch +
+  context-size guard) route through `helpers.config_defaults.resolve_config`
+  (deep merge, `use_cache=False` to keep per-call test stubs authoritative);
+  `utility_timeout.resolve_config` uses `is not None` semantics against the
+  DEFAULTS (the stale 30/120 literals are gone from `resolve_config` AND from
+  `guarded_call`'s re-read).
+- #13 — `api/stats.py` overrides `get_methods()` → `["GET", "POST"]` (the
+  docstring promised GET; the framework default is POST-only → 405).
+- #14 — both hardcoded `"utility"` `_emit_fallback_summary` calls in the
+  engine use `spec.kind`.
+- #15 — `_quota_cooldown_seconds` floor clamps to `[min(60, cap), cap]`.
+- #16 — `_is_format_error` narrowed to response-parse-shaped substrings.
+- #17 — `gen_budget_max_s` reads honour explicit 0 via `is not None`
+  (`_gen_budget_max_s_from_cfg` helper; 3 read sites).
+- #18 — turn n≤1 path: RetryAfterHours carries at least the booked
+  cooldown's remaining time; Responses-5xx marks sticky (see #7).
+- #19 — `_evict_warm_on_timeout` gated behind `_is_timeout_shaped(e)` on all
+  three formerly-unconditional sites (turn idx-loop, turn n≤1, engine
+  litellm.Timeout branch was already gated).
+- #20 — the all-skipped spin path uses `_yielding_sleep` (was raw
+  `asyncio.sleep` up to 300s — the one long sleep defeating the yielding
+  protection).
+- #21 — `models_ext.reset_responses_5xx_seen()` + called from
+  `hooks.uninstall`.
+- #22 — behavior UNCHANGED (pinned by design): `test_quota_exhaustion_v340`
+  pins 429 = cooldown-permanent but NOT rotation-permanent; added a NOTE
+  docstring on `_is_permanently_failed_model` warning new callers to use
+  `_is_permanent_for_rotation`.
+- #23 — `_parse_duration_seconds` rejects ISO timestamps / clock-like text.
+- #24 — `hooks.get_fallback_settings` coercions degrade instead of raising;
+  display default aligned to the YAML (20).
+- #26 — verified already-correct: the engine break path falls through to the
+  post-loop summary + `_maybe_raise_retry_after_hours` (3645ff) and the turn
+  exhaustion emits summary + exhausted message before its raise.
+- #27 — `_record_last_status` dead `store` param dropped (8 call sites).
+- #28 — config.json dead `webui_extensions_cache_enabled` removed; README
+  version header 2.7.0 → 3.4.1; `fallback-store.js getDefaults()` keys fixed
+  to the real `fallback_*` names. `max_wait_s` prose verified CONSISTENT
+  (help.html 180 == default_config.yaml 180; config.json 420 is a user
+  value, not a doc bug).
+- #30 — api/events.py snapshots once (count and payload from one read).
+- #31 (first half) — context-size guard per-tick reads now go through the
+  cached resolver (see #12).
+- #32 — success paths skip `_save_cooldown_store` when the pop was a no-op.
+- #34 — redundant per-candidate local import removed (turn path); unused
+  `n`/`total_attempts` params dropped from `_maybe_raise_retry_after_hours`
+  (4 call sites updated); the max_cycles `break` no longer double-fires the
+  extended-retry budget before the post-loop call (ext_attempts was
+  incremented twice per exhaustion).
+- #35 — `_yielding_sleep` resolves the `on_long_sleep_tick` hook once per
+  sleep and clamps the final tick to the actual remainder.
+- #36 — `resolve_config` returns a copy (cache-hit + fresh paths) and
+  `load_defaults` caches the absent-YAML miss via a sentinel flag.
+- #38 — `build_fallback_wrapper` defensive-copies the caller's spec dict.
+- plugin.yaml version 3.4.0 → 3.4.1.
+
+**Deferred (deliberate, not forgotten):**
+
+- #29 (candidate-list memoization) — risky for the rotation-index semantics;
+  needs its own design pass.
+- #33 (turn-path per-invocation log dedupe maps) — needs an agent-data key
+  design like the cooldown store; behavior is noisy but correct.
+- #31 (second half) — `monologue_start/_10_memory_recall_patches.py` still
+  re-reads the framework memorize files every monologue (no version-stamp
+  short-circuit); same fix shape as its siblings, separate pass.
+- #37 (probe rate-limiter bypass) — needs a framework `models.py` change;
+  the plugin must not modify framework files.
+- #25 (`("__global__",)` store key unreachable + `id(agent)` GC aliasing) —
+  latent; the aliasing risk needs an agent-id scheme decision, not a patch.

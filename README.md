@@ -13,7 +13,7 @@ of hard-stopping. It also hardens the surrounding pieces that break under load:
 the utility-model outer timeout, the memory plugin's recall task, and the
 langchain v0→v1 import gap.
 
-**Version:** 2.7.0 · **Self-contained:** no official agent-zero file is modified ·
+**Version:** 3.4.1 · **Self-contained:** no official agent-zero file is modified ·
 **Configurable:** per-project and per-agent
 
 ---

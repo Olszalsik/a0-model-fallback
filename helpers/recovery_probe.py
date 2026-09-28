@@ -206,6 +206,21 @@ async def sweep() -> int:
             # the user, or popped by a live cascade) -- nothing to probe.
             _TARGETS.pop(key, None)
             continue
+        if until <= now:
+            # v3.4.1: expired-but-still-stored cooldown -- real traffic
+            # can use the label again; probing it here only pays for a
+            # call no cascade is routing to, and the target would
+            # otherwise linger for the rest of the sweep's life.
+            _TARGETS.pop(key, None)
+            continue
+        # v3.4.1: per-target probe backoff. A failed probe used to be
+        # retried on EVERY sweep (45s), so a still-down label burned a
+        # probe + timeout per sweep for the whole cooldown. Escalate
+        # 60s -> 120s -> ... capped at 15min; reset implicitly when the
+        # target is re-registered (a fresh booking makes a fresh entry).
+        next_probe_at = float(tgt.get("next_probe_at") or 0.0)
+        if now < next_probe_at:
+            continue
         if (until - now) < cfg["recovery_probe_min_cooldown_s"]:
             # Short cooldown: real traffic re-probes soon anyway.
             continue
@@ -231,6 +246,9 @@ async def sweep() -> int:
         else:
             _counters["probes_failed"] = _counters["probes_failed"] + 1
             _counters["last_probe_result"] = "fail"
+            streak = int(tgt.get("fail_streak") or 0) + 1
+            tgt["fail_streak"] = streak
+            tgt["next_probe_at"] = time.monotonic() + min(60.0 * (2 ** min(streak, 4)), 900.0)
     return attempted
 
 

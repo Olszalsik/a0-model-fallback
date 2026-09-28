@@ -87,13 +87,23 @@ class HandleRetryAfterHours(Extension):
         # hammering exhausted providers. Clamped to [30, 7200]s so a bogus
         # header can't wedge the loop for hours; sliced so cancellation
         # (user intervention) is honored promptly.
+        #
+        # v3.4.0: quota exhaustion gets a RAISED ceiling. The cascade now
+        # books a scope-aware quota cooldown (ollama's session window is
+        # ~15 min, a weekly plan 6h, a monthly cycle 12h) and the old 7200s
+        # clamp silently truncated those, so the loop still woke every 2h
+        # against an account that had said "no" until its window rolled over.
+        # The ceiling is still bounded so a nonsense header cannot wedge the
+        # agent indefinitely.
         try:
             delay = float(getattr(exc, "retry_after", 0) or 0)
         except Exception:
             delay = 0.0
         if delay <= 0:
             delay = 60.0
-        delay = max(30.0, min(delay, 7200.0))
+        is_quota = str(getattr(exc, "reason", "") or "").startswith("quota_")
+        ceiling = 43200.0 if is_quota else 7200.0
+        delay = max(30.0, min(delay, ceiling))
         remaining = delay
         while remaining > 0:
             try:

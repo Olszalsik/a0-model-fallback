@@ -93,9 +93,23 @@ def resolve_config(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
         for k, v in overrides.items():
             if v is not None:
                 cfg[k] = v
-    cfg["default_timeout_s"] = float(cfg.get("default_timeout_s") or 30.0)
-    cfg["max_wait_s"] = float(cfg.get("max_wait_s") or 120.0)
-    cfg["jitter_s"] = float(cfg.get("jitter_s") or 0.0)
+    # v3.4.1: the stale 30/120 literals here silently overrode the
+    # synced DEFAULTS (60/180) whenever a value arrived as 0/""/None --
+    # an explicit `or` treats a CONFIGURED 0 as "use the stale literal"
+    # instead of "use the default". `is not None` semantics: a real
+    # value (including 0 -> clamped by max_wait_s logic below) wins;
+    # only absent/None falls back to DEFAULTS. Non-numeric junk
+    # degrades to the default via the except.
+    for key, fallback in (
+        ("default_timeout_s", DEFAULTS["default_timeout_s"]),
+        ("max_wait_s", DEFAULTS["max_wait_s"]),
+        ("jitter_s", 0.0),
+    ):
+        raw = cfg.get(key)
+        try:
+            cfg[key] = float(raw) if raw is not None else float(fallback)
+        except (TypeError, ValueError):
+            cfg[key] = float(fallback)
     cfg["enabled"] = bool(cfg.get("enabled", True))
     cfg["close_inner_on_timeout"] = bool(cfg.get("close_inner_on_timeout", True))
     return cfg
@@ -172,8 +186,13 @@ async def guarded_call(
     if not cfg.get("enabled", True):
         return await inner_coro_factory()
 
-    max_wait = float(cfg.get("max_wait_s") or 120.0)
-    default_to = float(cfg.get("default_timeout_s") or 30.0)
+    # v3.4.1: the stale 120/30 literals here silently re-overrode the
+    # resolved values behind resolve_config's back (a resolved 0 fell
+    # back to the literal, not the DEFAULT). resolve_config guarantees
+    # non-None floats, so use them verbatim (tests drive sub-second
+    # budgets through this path; no floor).
+    max_wait = float(cfg.get("max_wait_s") or 0.0)
+    default_to = float(cfg.get("default_timeout_s") or 0.0)
     # v2.8.5: raise the budget to cover the inner cascade's largest
     # legitimate per-call timeout. A cold router call gets up to
     # router_cold_call_timeout_s (150s, v2.7.0), injected here as the

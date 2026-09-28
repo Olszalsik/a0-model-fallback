@@ -13,6 +13,8 @@ Contents:
 """
 
 import re
+import time
+from collections.abc import Mapping
 from typing import Any, Optional
 
 
@@ -128,6 +130,122 @@ def _is_invalid_api_key_400(exc: Exception) -> bool:
     return any(phrase in msg for phrase in _INVALID_KEY_400_PHRASES)
 
 
+# ---------------------------------------------------------------------------
+# Quota EXHAUSTION -- distinct from transient throttling
+# ---------------------------------------------------------------------------
+#
+# A transient 429 ("too many requests", a shared-pool burst) clears in seconds
+# and wants a SHORT cooldown so the cascade rotates away and comes straight
+# back. A quota-exhaustion 429 means the ACCOUNT's allowance for its current
+# window is spent:
+#
+#   ollama.com: "you (olszalsik) have reached your session usage limit,
+#                upgrade for higher limits: ... or add usage credits: ..."
+#   OpenAI:     "You exceeded your current quota" / "insufficient_quota"
+#   Google:     "RESOURCE_EXHAUSTED: Quota exceeded for quota metric"
+#
+# Retrying that in 30s cannot succeed -- the window has to expire first -- and
+# every retry is a real paid round-trip, because litellm re-tries each call
+# twice before it surfaces the error. A 30s cooldown therefore becomes a
+# request storm against an endpoint that is guaranteed to answer "no" until
+# the window resets, which is exactly the "agent is stuck and I get spammed"
+# symptom this classification exists to prevent.
+#
+# The window is provider-specific: ollama.com uses a ~5h rolling session window
+# plus daily/weekly/monthly plans, OpenAI's billing cycle is monthly,
+# Anthropic's is 5h. Crucially the provider usually does NOT say when the
+# window resets -- ollama.com returns no Retry-After and no reset timestamp at
+# all -- so the plugin has to supply the policy. That is what
+# ``detect_quota_scope`` (which window?) and ``_quota_cooldown_seconds`` in
+# fallback.py (how long to believe it?) are for.
+#
+# This is a COOLDOWN policy, never a "dead model" verdict. The label stays in
+# the rotation and is re-probed once its window is believed expired, and the
+# cascade keeps serving the turn from the other candidates meanwhile. Nothing
+# here may classify a quota error as permanent-for-rotation.
+
+# Ordered most-specific first: "you have reached your WEEKLY limit" must be
+# classified as weekly, not fall through to the catch-all account scope.
+_QUOTA_SCOPE_PATTERNS: tuple = (
+    ("session", (
+        "session usage limit",
+        "session limit",
+        "session quota",
+        "rolling window",
+    )),
+    ("weekly", (
+        "weekly limit",
+        "weekly plan",
+        "weekly usage",
+        "week limit",
+    )),
+    ("monthly", (
+        "monthly limit",
+        "monthly plan",
+        "monthly usage",
+        "month limit",
+        "billing cycle",
+        "billing period",
+    )),
+    ("daily", (
+        "daily limit",
+        "daily plan",
+        "daily usage",
+        "day limit",
+    )),
+)
+
+# Phrases that mean "the account is out of allowance" without naming a window.
+_QUOTA_EXHAUSTION_PHRASES: tuple = (
+    "usage limit",
+    "usage credits",
+    "add usage credits",
+    "upgrade for higher limits",
+    "quota exceeded",
+    "quota exhausted",
+    "exceeded your current quota",
+    "insufficient_quota",
+    "insufficient credits",
+    "insufficient credit",
+    "credit balance is too low",
+    "out of credits",
+    "exceeded your credit",
+    "hard limit reached",
+)
+
+
+def detect_quota_scope(exc: Exception) -> str:
+    """Return the exhausted-quota WINDOW for `exc`, or "" if not a quota error.
+
+    One of "session" / "daily" / "weekly" / "monthly" / "account", selected by
+    ``quota_scope_cooldown_s``. Window names are matched before the generic
+    phrase list so a named window wins over the catch-all.
+
+    Returns "" for a plain transient 429 -- the caller then keeps the short
+    rate-limit cooldown.
+    """
+    try:
+        msg = str(exc).lower()
+    except Exception:  # noqa: BLE001
+        return ""
+    for scope, phrases in _QUOTA_SCOPE_PATTERNS:
+        if any(phrase in msg for phrase in phrases):
+            return scope
+    if any(phrase in msg for phrase in _QUOTA_EXHAUSTION_PHRASES):
+        return "account"
+    return ""
+
+
+def _is_quota_exhaustion_error(exc: Exception) -> bool:
+    """True when the account's allowance for its current window is spent.
+
+    Contrast with ``_is_rate_limited_error``, which is true for BOTH shapes.
+    The distinction drives cooldown LENGTH only, never rotation eligibility:
+    both stay in the fallback roster and both get re-probed.
+    """
+    return bool(detect_quota_scope(exc))
+
+
 def _is_rate_limited_error(exc: Exception) -> bool:
     """True when the provider is explicitly throttling / rate-limiting us.
 
@@ -155,6 +273,19 @@ def _is_rate_limited_error(exc: Exception) -> bool:
         "try again later",
         "overloaded",
         "server is busy",
+        # Quota-exhaustion phrasings. These normally arrive WITH a 429
+        # status_code, but litellm re-wraps 429s in OpenAIError /
+        # MidStreamFallbackError / APIConnectionError and the wrapper does not
+        # always carry `status_code`. Without these phrases such a 429 fell
+        # through to the 300s "unknown error" default and then to the
+        # permanent-failure blocklist -- the ollama.com "session usage limit"
+        # error is the concrete case that motivated this.
+        "usage limit",
+        "session usage limit",
+        "insufficient_quota",
+        "insufficient credit",
+        "resource_exhausted",
+        "resource exhausted",
     )
     if any(phrase in msg for phrase in rate_limit_phrases):
         return True
@@ -233,6 +364,13 @@ def _is_permanently_failed_model(exc: Exception) -> bool:
     if _is_invalid_api_key_400(exc):
         return True
 
+    # NOTE (v3.4.1 audit): a rate-limited error is deliberately included
+    # here. This helper answers the COOLDOWN-policy question "book the
+    # label and move on?" -- for which a quota 429 behaves like a permanent
+    # one. ROTATION decisions must use `_is_permanent_for_rotation`
+    # (fallback.py), which excludes rate-limited errors first. A 429 must
+    # never be treated as permanent-for-rotation, never dead-marked, and
+    # never re-raised past the structured RetryAfterHours handling.
     if _is_rate_limited_error(exc):
         return True
 
@@ -305,25 +443,14 @@ def _force_chat_config(agent) -> tuple:
     wrappers, and uniquely identifies the upstream that 500s on /v1/responses.
     """
     try:
-        from helpers import plugins as _plugins
+        from usr.plugins.model_fallback.helpers import config_defaults
 
-        cfg = _plugins.get_plugin_config("model_fallback", agent) or {}
-        if not isinstance(cfg, dict):
-            cfg = {}
-        # v2.8.4: get_plugin_config does NOT merge default_config.yaml with
-        # config.json (same gotcha the v2.6.7 router-detection fix hit). All
-        # three force-chat lists live ONLY in default_config.yaml, so without
-        # this merge the static option-B matcher was dead at runtime -- the
-        # lists never reached this code unless the user duplicated them into
-        # config.json by hand. Default YAML first, live config.json on top.
-        try:
-            defaults = _plugins.get_default_plugin_config("model_fallback")
-            if isinstance(defaults, dict):
-                merged = dict(defaults)
-                merged.update(cfg)
-                cfg = merged
-        except Exception:  # noqa: BLE001
-            pass
+        # One canonical resolver. get_plugin_config returns config.json
+        # WITHOUT merging default_config.yaml, so all three force-chat lists --
+        # which live only in the YAML -- were dead at runtime without this
+        # merge (v2.8.4). The merge is recursive, so a partial nested override
+        # keeps its sibling defaults.
+        cfg = config_defaults.resolve_config("model_fallback", agent)
         providers = cfg.get("force_chat_completions_providers") or []
         patterns = cfg.get("force_chat_completions_patterns") or []
         api_bases = cfg.get("force_chat_completions_api_bases") or []
@@ -408,6 +535,18 @@ def responses_5xx_seen(model) -> bool:
     return model_cache_key(model) in _RESPONSES_5XX_SEEN
 
 
+def reset_responses_5xx_seen() -> None:
+    """v3.4.1: clear the sticky Responses-5xx set.
+
+    hooks.uninstall() resets every other process-global (cooldowns, warm
+    labels, gen budgets, latency samples, stats) but used to skip this set,
+    so after a plugin disable/re-enable -- without a process restart -- stale
+    force-chat-completions marks survived for the life of the process even
+    for endpoints whose /v1/responses had recovered.
+    """
+    _RESPONSES_5XX_SEEN.clear()
+
+
 # ---------------------------------------------------------------------------
 # Retry-After parsing
 # ---------------------------------------------------------------------------
@@ -417,42 +556,188 @@ _RETRY_AFTER_HEADER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# v3.4.1: several gateways embed the reset window in prose instead of a
+# header ("Rate limit reached ... Please try again in 2m3.16s" -- Groq and
+# several OpenRouter free tiers). Parsing it gives the cooldown policy an
+# accurate hint even when no header survives, and pairs with the
+# hint-wins rule in `_quota_cooldown_seconds`.
+_RETRY_AGAIN_RE = re.compile(
+    r"try\s+again\s+in\s+((?:\d+(?:\.\d+)?\s*"
+    r"(?:ms|milliseconds?|s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?|d|days?)"
+    r"[\s,]*)+)",
+    re.IGNORECASE,
+)
 
-def extract_retry_after_seconds(exc: Exception) -> Optional[float]:
-    """Best-effort parse of a Retry-After hint from a LiteLLM / provider exception.
+# Header names carrying a RESET TIME rather than a plain delta. OpenAI and most
+# OpenAI-compatible gateways (ollama.com among them) send
+# `x-ratelimit-reset-requests: 8.64s` / `x-ratelimit-reset-tokens: 1m12s`
+# -- a DURATION with a unit suffix, not a bare number. The old code only
+# checked a hardcoded ("retry-after", "Retry-After", "RETRY-AFTER",
+# "x-ratelimit-reset") tuple on `.headers`, so every other spelling -- and
+# every header set only on `.response.headers` -- was invisible.
+_RATE_LIMIT_RESET_HEADERS = (
+    "x-ratelimit-reset-requests",
+    "x-ratelimit-reset-tokens",
+    "x-ratelimit-reset-requests-duration",
+    "x-ratelimit-reset-tokens-duration",
+    "ratelimit-reset",
+    "x-rate-limit-reset",
+)
 
-    Returns a non-negative float (seconds) or None if no hint is present.
-    Handles both dict-shaped `exc.headers` and string message bodies.
+_DURATION_UNIT_S = {
+    "ms": 0.001, "millisecond": 0.001, "milliseconds": 0.001,
+    "s": 1.0, "sec": 1.0, "secs": 1.0, "second": 1.0, "seconds": 1.0,
+    "m": 60.0, "min": 60.0, "mins": 60.0, "minute": 60.0, "minutes": 60.0,
+    "h": 3600.0, "hr": 3600.0, "hrs": 3600.0, "hour": 3600.0, "hours": 3600.0,
+    "d": 86400.0, "day": 86400.0, "days": 86400.0,
+}
+
+_DURATION_VALUE_RE = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(ms|milliseconds?|s|secs?|seconds?|m|mins?|minutes?|"
+    r"h|hrs?|hours?|d|days?)?",
+    re.IGNORECASE,
+)
+
+
+def _parse_duration_seconds(raw) -> Optional[float]:
+    """Parse ``"8.64s"`` / ``"1m12s"`` / ``"90"`` into seconds, or None.
+
+    A bare number is returned as-is -- the caller decides whether it is a
+    delta or an epoch.
+
+    v3.4.1 audit fix: an ISO-8601 reset timestamp (``2026-09-28T10:00:00Z``)
+    used to be digit-summed by the unit-duration fallback below
+    (2026+09+28+10 ≈ 2064s) into a plausible-looking but meaningless
+    cooldown. Timestamp-shaped values are rejected here; ``_parse_http_date``
+    in the caller handles RFC 7231 dates, and an ISO epoch would need an
+    explicit parser added deliberately, not a digit sum by accident.
     """
-    # 1. Direct header attribute (some LiteLLM exceptions expose this)
-    headers = getattr(exc, "headers", None)
-    if isinstance(headers, dict):
-        for key in ("retry-after", "Retry-After", "RETRY-AFTER", "x-ratelimit-reset"):
-            val = headers.get(key)
-            if val is None:
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    # Reject timestamp-shaped strings: an ISO date/datetime is not a duration
+    # and summing its digit runs produces garbage.
+    if re.search(r"\d{1,4}[-/]\d{1,2}[-/]\d{1,4}|\d{1,2}:\d{2}", text):
+        return None
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        pass
+    total = 0.0
+    matched = False
+    for match in _DURATION_VALUE_RE.finditer(text):
+        num, unit = match.group(1), (match.group(2) or "").lower()
+        if not num:
+            continue
+        total += float(num) * _DURATION_UNIT_S.get(unit, 1.0)
+        matched = True
+    return total if matched else None
+
+
+def _parse_http_date(raw) -> Optional[float]:
+    """Parse an HTTP-date (RFC 7231) into a POSIX timestamp, or None."""
+    try:
+        from email.utils import parsedate_to_datetime
+
+        dt = parsedate_to_datetime(str(raw))
+        return None if dt is None else dt.timestamp()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _header_candidates(exc: Exception):
+    """Yield (lowercased_name, raw_value) from every header mapping on `exc`.
+
+    Both `.headers` and `.response.headers` are walked and names are
+    lowercased: HTTP header names are case-insensitive, plain dicts are not.
+
+    v3.4.1 audit fix: litellm / openai-SDK exceptions carry their headers as
+    ``httpx.Headers``, which subclasses ``collections.abc.Mapping`` -- NOT
+    ``dict``. The old ``isinstance(headers, dict)`` check silently yielded
+    nothing for exactly the exceptions this helper was written for, so real
+    ``Retry-After`` / ``x-ratelimit-reset-*`` headers were never seen and
+    only the message-body scrape ever fired. Accept any Mapping instead.
+    """
+    for container in (getattr(exc, "headers", None), getattr(exc, "response", None)):
+        if container is None:
+            continue
+        headers = getattr(container, "headers", container)
+        if not isinstance(headers, Mapping):
+            continue
+        for key, value in headers.items():
+            if value is None:
                 continue
             try:
-                seconds = float(val)
-                if seconds >= 0:
-                    return seconds
-            except (TypeError, ValueError):
-                pass
+                yield str(key).strip().lower(), value
+            except Exception:  # noqa: BLE001
+                continue
 
-    # 2. response attribute (litellm often nests the original response here)
-    response = getattr(exc, "response", None)
-    if response is not None:
-        resp_headers = getattr(response, "headers", None)
-        if isinstance(resp_headers, dict):
-            for key in ("retry-after", "Retry-After", "RETRY-AFTER"):
-                val = resp_headers.get(key)
-                if val is None:
+
+def extract_retry_after_seconds(exc: Exception) -> Optional[float]:
+    """Best-effort parse of a Retry-After / rate-limit-reset hint (seconds).
+
+    Returns a non-negative float (seconds), or None if no hint is present.
+
+    Resolution order:
+      1. ``retry-after`` -- delta-seconds, or an HTTP-date converted to a
+         delta (RFC 9110 allows both).
+      2. ``x-ratelimit-reset-requests`` / ``-tokens`` -- a duration with a
+         unit suffix (``8.64s``, ``1m12s``).
+      3. ``x-ratelimit-reset`` -- an epoch on some providers, a delta on
+         others; disambiguated by magnitude (>1e9 s ~ 31.7 years cannot be a
+         plausible delta).
+      4. ``retry-after: N`` scraped from the message body.
+
+    Headers are read case-insensitively from BOTH ``exc.headers`` and
+    ``exc.response.headers``.
+    """
+    now = time.time()
+
+    def _as_delta(seconds: Optional[float]) -> Optional[float]:
+        if seconds is None or seconds < 0:
+            return None
+        if seconds > 1_000_000_000:
+            return max(0.0, seconds - now)
+        return float(seconds)
+
+    # 1-3: header walk. `epoch_hint` holds an ambiguous x-ratelimit-reset so a
+    # genuine `retry-after` still wins over it regardless of dict ordering.
+    epoch_hint: Optional[float] = None
+    for name, raw in _header_candidates(exc):
+        try:
+            if name == "retry-after":
+                as_epoch = _parse_http_date(raw)
+                got = _as_delta(
+                    as_epoch if as_epoch is not None
+                    else _parse_duration_seconds(raw)
+                )
+                if got is not None:
+                    return got
+            elif name in _RATE_LIMIT_RESET_HEADERS:
+                got = _as_delta(_parse_duration_seconds(raw))
+                if got is not None:
+                    return got
+            elif name == "x-ratelimit-reset":
+                candidate = _parse_duration_seconds(raw)
+                if candidate is None:
                     continue
-                try:
-                    seconds = float(val)
-                    if seconds >= 0:
-                        return seconds
-                except (TypeError, ValueError):
-                    pass
+                if candidate > 1_000_000_000:
+                    got = _as_delta(candidate)
+                    if got is not None:
+                        return got
+                else:
+                    epoch_hint = candidate
+        except Exception:  # noqa: BLE001
+            continue
+    if epoch_hint is not None:
+        return _as_delta(epoch_hint)
 
     # 3. Fallback: scrape the message body for `retry-after: N` style
     msg = str(exc)
@@ -463,6 +748,16 @@ def extract_retry_after_seconds(exc: Exception) -> Optional[float]:
             if seconds >= 0:
                 return seconds
         except (TypeError, ValueError):
+            pass
+
+    # 4. Prose scrape: "Please try again in 2m3.16s" (unit-duration form).
+    match = _RETRY_AGAIN_RE.search(msg)
+    if match:
+        try:
+            got = _parse_duration_seconds(match.group(1))
+            if got is not None and got >= 0:
+                return got
+        except Exception:  # noqa: BLE001
             pass
 
     return None
@@ -491,6 +786,14 @@ def build_fallback_wrapper(spec: Any, parent_config: dict):
     """
     # Lazy import to avoid module-load order issues with models.py
     import models
+
+    # v3.4.1: defensive copy. This function mutates `spec` in place below
+    # ("provider" inference, inherited api_key/api_base). Callers normally
+    # pass a spec rebuilt by fallback._normalize_spec, so today this is
+    # harmless -- but any future caller passing a config-owned dict would get
+    # the parent's credentials permanently baked into it.
+    if isinstance(spec, dict):
+        spec = dict(spec)
 
     if isinstance(spec, str):
         spec = {"model": spec}

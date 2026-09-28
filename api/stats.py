@@ -37,6 +37,14 @@ from usr.plugins.model_fallback.helpers import stats
 
 
 class Stats(ApiHandler):
+    # v3.4.1: the docstring says "Route: GET /stats" but the handler
+    # inherited the framework default (["POST"]) -- a documented GET got a
+    # 405 while POST worked against the docs. Allow both (read-only
+    # either way).
+    @classmethod
+    def get_methods(cls) -> list:
+        return ["GET", "POST"]
+
     async def process(self, input: Dict[str, Any], request: Request) -> Dict[str, Any]:
         ut = stats.utility_timeout_snapshot()
 

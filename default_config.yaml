@@ -23,6 +23,33 @@ phase_a_delay_s: 900        # 15 min — covers short rate-limit windows
 phase_b_delay_s: 3600       # 60 min (1 hour cap) — covers daily credit resets / weekly limits
 initial_cycle_attempts: 20  # how many attempts in each extended cycle (3-4 normal cycles worth)
 
+# --- v3.4.0 Quota-exhaustion awareness ---------------------------------------
+# A TRANSIENT 429 (shared-pool burst) clears in seconds and only needs the
+# short `rate_limit_no_retry_after_cooldown_s` backoff. A QUOTA 429 means the
+# account's allowance for its window is SPENT and nothing will succeed until
+# that window resets -- ollama.com answers "you (...) have reached your session
+# usage limit" with no Retry-After and no reset timestamp at all.
+#
+# Left unhandled, that second shape booked 30s and the cascade re-paid the
+# full round-trip (litellm retries twice on its own) once a minute against an
+# endpoint guaranteed to refuse, surfacing a hard "all candidates unavailable"
+# error for what is really a self-healing condition. These knobs make the
+# plugin WAIT OUT THE WINDOW instead, and the label stays in the rotation so it
+# is re-probed automatically once the window is believed expired.
+#
+# The scope is detected from the provider's message text (see
+# `detect_quota_scope`); a provider-supplied reset header always wins over
+# these guesses.
+quota_scope_cooldown_s:
+  session: 900      # 15 min — ollama.com 5h rolling window, re-probed often
+  daily: 3600       # 1 h   — daily free-tier resets
+  weekly: 21600     # 6 h   — weekly plans (e.g. a Monday reset)
+  monthly: 43200    # 12 h  — monthly billing cycles
+  account: 3600     # 1 h   — window unnamed in the message, assume daily
+# Ceiling on any single quota booking, so a wrong guess or a nonsense header
+# cannot park a model for longer than this.
+quota_cooldown_max_s: 43200
+
 # --- Responses -> chat-completions fallback (options B + D) -------------------
 # The transport defaults to /v1/responses. Some OpenAI-compatible providers
 # (notably ollama.com for ":cloud" models) 500 on /v1/responses while their

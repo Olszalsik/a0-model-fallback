@@ -262,6 +262,9 @@ def test_probe_clear_records_cleared_early_event():
 
 
 def test_kinds_constant_matches_documented_set():
+    # v3.4.1: "gen_budget_grown" added -- _grow_gen_budget has recorded it
+    # since v3.2.0 but the registry (and the api/events kind filter)
+    # omitted it, so a kind-filtered query returned nothing.
     assert set(events.KINDS) == {
         "cooldown_booked",
         "cooldown_cleared_early",
@@ -270,6 +273,7 @@ def test_kinds_constant_matches_documented_set():
         "label_dead",
         "cooldowns_cleared",
         "cascade_exhausted",
+        "gen_budget_grown",
     }
 
 

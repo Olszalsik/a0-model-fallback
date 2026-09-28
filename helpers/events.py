@@ -52,6 +52,9 @@ KINDS = (
     "label_dead",
     "cooldowns_cleared",
     "cascade_exhausted",
+    # v3.4.1: recorded by _grow_gen_budget since v3.2.0 but missing from
+    # this registry -- a kind-filtered query for it returned nothing.
+    "gen_budget_grown",
 )
 
 

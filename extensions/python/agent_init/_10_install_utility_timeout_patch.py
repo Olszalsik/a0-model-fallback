@@ -45,25 +45,18 @@ _log = logging.getLogger("model_fallback.utility_timeout.patch")
 
 def _resolve_config(agent) -> Dict[str, Any]:
     try:
-        from helpers import plugins as plugin_helpers  # type: ignore
-        cfg = plugin_helpers.get_plugin_config("model_fallback", agent) or {}
-        # v2.8.3: get_plugin_config returns config.json WITHOUT merging
-        # default_config.yaml, so the YAML's ``utility_timeout_guard:``
-        # section (60s/180s, raised 2026-07-23) never reached the
-        # runtime and DEFAULTS' stale 30s/120s won instead. Merge the
-        # YAML defaults UNDER config.json so YAML edits are effective
-        # and user config.json values still win.
-        try:
-            defaults = plugin_helpers.get_default_plugin_config(
-                "model_fallback"
-            ) or {}
-            if isinstance(defaults, dict):
-                merged = dict(defaults)
-                if isinstance(cfg, dict):
-                    merged.update(cfg)
-                cfg = merged
-        except Exception:  # noqa: BLE001
-            pass
+        # v3.4.1: route through helpers.config_defaults.resolve_config --
+        # the local SHALLOW merge (dict(defaults); update(cfg)) dropped
+        # sibling defaults whenever config.json carried a partial nested
+        # section, exactly the drift this resolver exists to prevent.
+        # use_cache=False: this runs at agent_init and tests stub
+        # get_plugin_config per call; a cached merge could serve a
+        # previous stub's result.
+        from usr.plugins.model_fallback.helpers import config_defaults
+
+        cfg = config_defaults.resolve_config(
+            "model_fallback", agent, use_cache=False
+        )
     except Exception:  # noqa: BLE001
         cfg = {}
     # v2.5 WebUI: top-level ``utility_timeout_guard_enabled`` wins

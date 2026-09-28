@@ -10,6 +10,8 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from usr.plugins.model_fallback import fallback as fb  # noqa: E402
+from usr.plugins.model_fallback import models_ext  # noqa: E402
+from usr.plugins.model_fallback.helpers import config_defaults  # noqa: E402
 
 
 class _FakeAgent:
@@ -116,25 +118,26 @@ def test_plugin_cfg_cache_returns_equal_merged_config():
 def test_plugin_cfg_use_cache_false_bypasses_memo():
     fb.invalidate_plugin_cfg_cache()
     first = fb._get_plugin_cfg(None, use_cache=True)
-    assert fb._PLUGIN_CFG_CACHE, "first call should populate the cache"
+    assert config_defaults._merge_cache, "first call should populate the cache"
     fresh = fb._get_plugin_cfg(None, use_cache=False)
     assert fresh == first
     fb.invalidate_plugin_cfg_cache()
-    assert fb._PLUGIN_CFG_CACHE == {}
+    assert config_defaults._merge_cache == {}
 
 
 def test_plugin_cfg_cache_is_bounded():
     """A long session with many contexts must not grow the map forever."""
     fb.invalidate_plugin_cfg_cache()
-    assert fb._PLUGIN_CFG_CACHE_MAX >= 8
-    for i in range(fb._PLUGIN_CFG_CACHE_MAX + 20):
-        fb._PLUGIN_CFG_CACHE[("p", str(i))] = (time.monotonic() + 1.0, {})
-        if len(fb._PLUGIN_CFG_CACHE) >= fb._PLUGIN_CFG_CACHE_MAX:
+    assert config_defaults._MERGE_CACHE_MAX >= 8
+    for i in range(config_defaults._MERGE_CACHE_MAX + 20):
+        config_defaults._merge_cache[f"p::ctx-{i}"] = (time.monotonic() + 1.0, {})
+        if len(config_defaults._merge_cache) >= config_defaults._MERGE_CACHE_MAX:
             oldest = min(
-                fb._PLUGIN_CFG_CACHE, key=lambda k: fb._PLUGIN_CFG_CACHE[k][0]
+                config_defaults._merge_cache,
+                key=lambda k: config_defaults._merge_cache[k][0],
             )
-            fb._PLUGIN_CFG_CACHE.pop(oldest, None)
-    assert len(fb._PLUGIN_CFG_CACHE) <= fb._PLUGIN_CFG_CACHE_MAX
+            config_defaults._merge_cache.pop(oldest, None)
+    assert len(config_defaults._merge_cache) <= config_defaults._MERGE_CACHE_MAX
     fb.invalidate_plugin_cfg_cache()
 
 
@@ -142,26 +145,100 @@ def test_plugin_cfg_cache_expires():
     fb.invalidate_plugin_cfg_cache()
     fb._get_plugin_cfg(None)
     # force expiry rather than sleeping
-    for k in list(fb._PLUGIN_CFG_CACHE):
-        _, cfg = fb._PLUGIN_CFG_CACHE[k]
-        fb._PLUGIN_CFG_CACHE[k] = (time.monotonic() - 1.0, cfg)
+    for k in list(config_defaults._merge_cache):
+        _, cfg = config_defaults._merge_cache[k]
+        config_defaults._merge_cache[k] = (time.monotonic() - 1.0, cfg)
     assert fb._get_plugin_cfg(None) is not None
     fb.invalidate_plugin_cfg_cache()
 
 
 def test_reset_gen_budgets_also_drops_the_cache():
     fb._get_plugin_cfg(None)
-    assert fb._PLUGIN_CFG_CACHE
+    assert config_defaults._merge_cache
     fb.reset_gen_budgets()
-    assert fb._PLUGIN_CFG_CACHE == {}
+    assert config_defaults._merge_cache == {}
 
 
 def test_cache_key_is_stable_for_agentless_calls():
-    assert fb._plugin_cfg_cache_key(None) == fb._plugin_cfg_cache_key(None)
+    assert config_defaults._cache_key("model_fallback", None) == (
+        config_defaults._cache_key("model_fallback", None)
+    )
 
 
 def test_cache_key_distinguishes_contexts():
     a = _FakeAgent()
     b = _FakeAgent(ctx_id="ctx-other")
-    assert fb._plugin_cfg_cache_key(a) != fb._plugin_cfg_cache_key(b)
+    assert config_defaults._cache_key("model_fallback", a) != (
+        config_defaults._cache_key("model_fallback", b)
+    )
+
+
+# --------------------------------------------------------------------------
+# the single shared resolver (v3.4.0: the shallow-merge fix)
+# --------------------------------------------------------------------------
+
+
+def test_deep_merge_keeps_sibling_defaults_of_a_nested_section():
+    """The bug the two shallow copies shared.
+
+    default_config.yaml has NESTED sections. A user who overrode ONE key
+    inside one lost every sibling default in that section, and a module
+    constant took over -- the v2.8.3 F1 failure mode one level down.
+    """
+    defaults = {
+        "utility_timeout_guard": {
+            "enabled": True,
+            "default_timeout_s": 60,
+            "max_wait_s": 180,
+        }
+    }
+    override = {"utility_timeout_guard": {"default_timeout_s": 120}}
+    merged = config_defaults.deep_merge(defaults, override)
+
+    guard = merged["utility_timeout_guard"]
+    assert guard["default_timeout_s"] == 120, "the override must win"
+    assert guard["enabled"] is True, "sibling default was lost"
+    assert guard["max_wait_s"] == 180, "sibling default was lost"
+
+
+def test_deep_merge_replaces_lists_rather_than_appending():
+    defaults = {"force_chat_completions_api_bases": ["a", "b", "c"]}
+    override = {"force_chat_completions_api_bases": ["only-this"]}
+    merged = config_defaults.deep_merge(defaults, override)
+    assert merged["force_chat_completions_api_bases"] == ["only-this"], (
+        "a user listing three providers means those three, not defaults plus three"
+    )
+
+
+def test_both_call_sites_share_one_resolver():
+    """models_ext and fallback must not drift: one resolver, two callers."""
+    prov, pat, bases = models_ext._force_chat_config(None)
+    # Everything lives in default_config.yaml, which get_plugin_config alone
+    # would never return (the framework returns config.json XOR the YAML).
+    assert prov or pat or bases, "force-chat lists did not resolve from the YAML"
+    # And the same data must be visible through fallback's entry point.
+    cfg = fb._get_plugin_cfg(None)
+    assert "force_chat_completions_api_bases" in cfg
+
+
+def test_real_nested_sections_survive_a_partial_override(monkeypatch):
+    """End-to-end against the shipped default_config.yaml."""
+    defaults = config_defaults.load_defaults("model_fallback")
+    nested = [
+        k for k, v in defaults.items()
+        if isinstance(v, dict) and len(v) > 1
+    ]
+    if not nested:
+        # No multi-key nested section in the shipped YAML: the deep-merge
+        # contract is already covered by the synthetic test above.
+        return
+    section = nested[0]
+    first_key = sorted(defaults[section])[0]
+    merged = config_defaults.deep_merge(
+        defaults, {section: {first_key: "OVERRIDDEN"}}
+    )
+    assert merged[section][first_key] == "OVERRIDDEN"
+    for k in defaults[section]:
+        if k != first_key:
+            assert k in merged[section], f"sibling {k!r} was dropped from {section}"
 

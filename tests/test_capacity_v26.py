@@ -211,13 +211,21 @@ def test_handle_error_cooldown_no_op_for_concurrent_paid():
 
 
 def test_handle_error_cooldown_30s_for_unlimited_paid():
-    """For a Venice label, a 429 (no Retry-After) writes the configured
-    ``rate_limit_no_retry_after_cooldown_s`` cooldown (default 30s, NOT
-    24h, NOT the legacy 60s default)."""
+    """For a Venice label, a TRANSIENT 429 (no Retry-After) writes the
+    configured ``rate_limit_no_retry_after_cooldown_s`` cooldown (default
+    30s, NOT 24h, NOT the legacy 60s default).
+
+    v3.4.0: the message is deliberately a *transient* throttle phrase. The
+    original fixture said "Quota exhausted", which is a genuine
+    quota-exhaustion phrase and is now (correctly) routed to the scope-aware
+    quota cooldown instead of this transient one -- see
+    ``test_quota_exhaustion_uses_scope_cooldown`` below. A shared-pool Venice
+    burst is the case this test is about, so it now says so.
+    """
     agent = _FakeAgent("test-agent-2")
     store = _fb_mod._INMEM_COOLDOWNS
     store[("test-agent-2",)] = {}
-    e = _FakeRateLimitError("Quota exhausted")
+    e = _FakeRateLimitError("Too many requests")
 
     try:
         before = time.monotonic()

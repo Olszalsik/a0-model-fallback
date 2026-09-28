@@ -43,11 +43,15 @@ class Events(ApiHandler):
         context = input.get("context") or None
         label = input.get("label") or None
 
+        # v3.4.1: snapshot ONCE. The old double call raced the ring buffer
+        # between the count and the list (count could disagree with
+        # len(events)) and paid for the filter twice.
+        events_list = events.snapshot(limit=limit, kind=kind, context=context, label=label)
         return {
             "version": _version(),
             "kinds": list(events.KINDS),
-            "count": len(events.snapshot(limit=limit, kind=kind, context=context, label=label)),
-            "events": events.snapshot(limit=limit, kind=kind, context=context, label=label),
+            "count": len(events_list),
+            "events": events_list,
         }
 
 
